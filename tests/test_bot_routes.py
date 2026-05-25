@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -109,3 +109,66 @@ def test_bot_high_conviction_returns_filtered_candidates(db_session: Session) ->
     assert candidate["side"] == "BUY"
     assert candidate["outcome"] == "Knicks"
     assert candidate["total_tracked_size"] == 3420
+
+
+def test_bot_high_conviction_returns_near_misses_and_event_date_filter(db_session: Session) -> None:
+    now = datetime.utcnow()
+    old_market = Market(
+        slug="mlb-old-game-2026-05-24",
+        title="Old Game",
+        yes_price=0.5,
+        volume_24h_usd=30_000,
+    )
+    current_market = Market(
+        slug="mlb-current-game-2026-05-25",
+        title="Current Game",
+        yes_price=0.5,
+        volume_24h_usd=30_000,
+    )
+    trader = Trader(nickname="near-miss", wallet_address="0xabc", trust_score=70)
+    db_session.add_all([old_market, current_market, trader])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Signal(
+                market_id=old_market.id,
+                trader_id=trader.id,
+                signal_type="trusted_wallet_entry",
+                side="BUY",
+                outcome="Yes",
+                entry_price=0.5,
+                size_usd=500,
+                score=64,
+                source="Falcon",
+                created_at=now,
+            ),
+            Signal(
+                market_id=current_market.id,
+                trader_id=trader.id,
+                signal_type="trusted_wallet_entry",
+                side="BUY",
+                outcome="Yes",
+                entry_price=0.5,
+                size_usd=500,
+                score=64,
+                source="Falcon",
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    payload = bot_high_conviction(
+        db_session,
+        limit=5,
+        hours=24,
+        event_date_from=date(2026, 5, 25),
+    )
+
+    assert payload["count"] == 0
+    assert payload["event_date_from"] == "2026-05-25"
+    assert len(payload["near_misses"]) == 1
+    near_miss = payload["near_misses"][0]
+    assert near_miss["market"] == "Current Game"
+    assert near_miss["event_date"] == "2026-05-25"
+    assert near_miss["failed_reason"] == "score below hard alert floor"

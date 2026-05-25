@@ -17,6 +17,7 @@ quickly. Without it, Discord global command propagation can take longer.
 from __future__ import annotations
 
 import logging
+from datetime import date
 from typing import Any
 
 import discord
@@ -62,6 +63,8 @@ def _signal_embed(signal: dict[str, Any]) -> discord.Embed:
     )
     embed.add_field(name="Side", value=side, inline=True)
     embed.add_field(name="Score", value=str(signal.get("score", "n/a")), inline=True)
+    if signal.get("event_date"):
+        embed.add_field(name="Event date", value=str(signal.get("event_date")), inline=True)
     embed.add_field(name="Chase risk", value=str(signal.get("chase_risk", "n/a")), inline=True)
     embed.add_field(
         name="Smart money",
@@ -91,6 +94,19 @@ def _signal_embed(signal: dict[str, Any]) -> discord.Embed:
         links.append(f"[{signal['trader']}]({signal['trader_url']})")
     if links:
         embed.add_field(name="Links", value=" | ".join(links), inline=False)
+    return embed
+
+
+def _near_miss_embed(signal: dict[str, Any]) -> discord.Embed:
+    embed = _signal_embed(signal)
+    embed.title = f"NEAR MISS - {signal.get('market') or 'Unknown market'}"
+    embed.color = 0xF59E0B
+    embed.insert_field_at(
+        0,
+        name="Why it failed",
+        value=str(signal.get("failed_reason") or signal.get("reason") or "n/a")[:1024],
+        inline=False,
+    )
     return embed
 
 
@@ -163,18 +179,34 @@ async def sf_status(interaction: discord.Interaction) -> None:
     name="sf_high_conviction",
     description="Show recent high-conviction or possible-entry SignalForge bets.",
 )
-@app_commands.describe(limit="Number of signals to return, 1-10", hours="Lookback window in hours")
+@app_commands.describe(
+    limit="Number of signals to return, 1-10",
+    hours="Lookback window in hours",
+    event_date_from="Only include markets dated on/after YYYY-MM-DD",
+)
 async def sf_high_conviction(
     interaction: discord.Interaction,
     limit: app_commands.Range[int, 1, 10] = 5,
     hours: app_commands.Range[int, 1, 168] = 24,
+    event_date_from: str | None = None,
 ) -> None:
     await interaction.response.defer(thinking=True)
+    parsed_event_date: str | None = None
+    if event_date_from:
+        try:
+            parsed_event_date = date.fromisoformat(event_date_from).isoformat()
+        except ValueError:
+            await interaction.followup.send("`event_date_from` must be in `YYYY-MM-DD` format.")
+            return
+
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            params: dict[str, Any] = {"limit": limit, "hours": hours}
+            if parsed_event_date:
+                params["event_date_from"] = parsed_event_date
             response = await client.get(
                 f"{_api_base()}/bot/high-conviction",
-                params={"limit": limit, "hours": hours},
+                params=params,
             )
             response.raise_for_status()
             payload = response.json()
@@ -184,8 +216,20 @@ async def sf_high_conviction(
 
     signals = payload.get("signals", [])
     if not signals:
+        near_misses = payload.get("near_misses", [])
+        if not near_misses:
+            await interaction.followup.send(
+                f"No high-conviction or near-miss signals found in the last {hours}h."
+            )
+            return
+        embeds = [_near_miss_embed(signal) for signal in near_misses[:3]]
+        event_text = f" since event date {parsed_event_date}" if parsed_event_date else ""
         await interaction.followup.send(
-            f"No high-conviction or possible-entry signals found in the last {hours}h."
+            content=(
+                f"No high-conviction or possible-entry signals found in the last {hours}h"
+                f"{event_text}. Top near-misses:"
+            ),
+            embeds=embeds,
         )
         return
 

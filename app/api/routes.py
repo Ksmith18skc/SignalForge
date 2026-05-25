@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+import re
+from datetime import date, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import delete, desc, func, select
@@ -26,6 +27,8 @@ from app.services.scanner import run_scan_once
 from app.services.alerts import DISCORD_TIERS, evaluate_alert_decision
 
 router = APIRouter()
+
+_SLUG_DATE_RE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
 
 
 # ---------------------------- health ----------------------------------------
@@ -210,7 +213,19 @@ def _trader_url_for_signal(signal: Signal) -> str | None:
     return f"https://polymarketanalytics.com/traders/{trader.wallet_address}"
 
 
+def _event_date_for_signal(signal: Signal) -> date | None:
+    slug = signal.market.slug if signal.market else ""
+    match = _SLUG_DATE_RE.search(slug)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
 def _signal_bot_payload(signal: Signal, tier: str) -> dict[str, object]:
+    event_date = _event_date_for_signal(signal)
     return {
         "id": signal.id,
         "tier": tier,
@@ -219,6 +234,7 @@ def _signal_bot_payload(signal: Signal, tier: str) -> dict[str, object]:
         "market": signal.market.title if signal.market else f"market#{signal.market_id}",
         "market_slug": signal.market.slug if signal.market else None,
         "market_url": _market_url_for_signal(signal),
+        "event_date": event_date.isoformat() if event_date else None,
         "trader": signal.trader.nickname if signal.trader else None,
         "trader_url": _trader_url_for_signal(signal),
         "side": signal.side,
@@ -277,6 +293,7 @@ def bot_high_conviction(
     db: Session = Depends(get_db),
     limit: int = 5,
     hours: int = 24,
+    event_date_from: date | None = None,
 ) -> dict[str, object]:
     limit = max(1, min(limit, 10))
     hours = max(1, min(hours, 168))
@@ -291,7 +308,11 @@ def bot_high_conviction(
     )
 
     matches: list[dict[str, object]] = []
+    near_misses: list[dict[str, object]] = []
     for signal in candidates:
+        event_date = _event_date_for_signal(signal)
+        if event_date_from and event_date and event_date < event_date_from:
+            continue
         decision = evaluate_alert_decision(db, signal)
         if decision.tier in {"high_conviction", "possible_entry"}:
             payload = _signal_bot_payload(signal, decision.tier)
@@ -307,14 +328,31 @@ def bot_high_conviction(
                 }
             )
             matches.append(payload)
+        elif len(near_misses) < 3:
+            payload = _signal_bot_payload(signal, decision.tier)
+            payload.update(
+                {
+                    "failed_reason": decision.reason,
+                    "action": decision.action,
+                    "chase_risk": decision.chase_risk,
+                    "total_tracked_size": round(decision.context.total_tracked_size, 2),
+                    "trader_count": decision.context.trader_count,
+                    "current_price": decision.context.current_price,
+                    "entry_price_min": decision.context.entry_price_min,
+                    "entry_price_max": decision.context.entry_price_max,
+                }
+            )
+            near_misses.append(payload)
         if len(matches) >= limit:
             break
 
     return {
         "count": len(matches),
         "hours": hours,
+        "event_date_from": event_date_from.isoformat() if event_date_from else None,
         "discord_tiers": sorted(DISCORD_TIERS),
         "signals": matches,
+        "near_misses": near_misses,
         "timestamp": datetime.utcnow().isoformat(),
     }
 
