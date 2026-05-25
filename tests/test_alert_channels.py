@@ -7,6 +7,7 @@ import httpx
 from app.config import Settings
 from app.models import Alert, Market, Signal, Trade, Trader
 from app.services.alerts import (
+    AlertDispatcher,
     DiscordChannel,
     TelegramChannel,
     _discord_payload,
@@ -267,3 +268,247 @@ def test_alert_decision_suppresses_duplicate_discord_alert(db_session):
 
     assert decision.tier == "ignore"
     assert "duplicate" in decision.reason
+
+
+class _FakeChannel:
+    name = "discord"
+
+    def __init__(self) -> None:
+        self.sent = 0
+
+    def send(self, message):  # noqa: ANN001
+        self.sent += 1
+        return True, None
+
+    def send_payload(self, payload):  # noqa: ANN001
+        self.sent += 1
+        return True, None
+
+
+def _make_high_conviction_signal(db_session, *, outcome="Yes", score=82, created_at=None):
+    now = created_at or datetime.utcnow()
+    market = Market(
+        slug=f"market-{outcome.lower()}",
+        title=f"Market {outcome}",
+        yes_price=0.51,
+        no_price=0.49,
+        volume_24h_usd=30_000,
+        liquidity_usd=10_000,
+    )
+    trader = Trader(nickname=f"trader-{outcome}", wallet_address=f"0x{outcome.lower()}", trust_score=82)
+    aligned = Trader(
+        nickname=f"aligned-{outcome}",
+        wallet_address=f"0xaligned{outcome.lower()}",
+        trust_score=70,
+    )
+    db_session.add_all([market, trader, aligned])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Trade(
+                trader_id=trader.id,
+                market_id=market.id,
+                side="BUY",
+                outcome=outcome,
+                price=0.49,
+                size_usd=2_000,
+                source="Falcon",
+                timestamp=now - timedelta(minutes=10),
+            ),
+            Trade(
+                trader_id=aligned.id,
+                market_id=market.id,
+                side="BUY",
+                outcome=outcome,
+                price=0.50,
+                size_usd=1_500,
+                source="Falcon",
+                timestamp=now,
+            ),
+        ]
+    )
+    signal = Signal(
+        market_id=market.id,
+        trader_id=trader.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome=outcome,
+        entry_price=0.50,
+        size_usd=2_000,
+        score=score,
+        source="Falcon",
+        created_at=now,
+        reason="test",
+    )
+    signal.market = market
+    signal.trader = trader
+    db_session.add(signal)
+    db_session.flush()
+    return signal
+
+
+def _dispatcher_with_fake_discord():
+    dispatcher = AlertDispatcher()
+    fake = _FakeChannel()
+    dispatcher.channels = [fake]
+    return dispatcher, fake
+
+
+def test_dispatcher_skips_discord_when_action_is_avoid_chasing(db_session):
+    signal = _make_high_conviction_signal(db_session)
+    decision = evaluate_alert_decision(db_session, signal, Settings())
+    decision = type(decision)(
+        tier=decision.tier,
+        context=decision.context,
+        action="Avoid chasing",
+        chase_risk=decision.chase_risk,
+        reason=decision.reason,
+    )
+    import app.services.alerts as alerts_module
+    original = alerts_module.evaluate_alert_decision
+    alerts_module.evaluate_alert_decision = lambda db, sig, settings=None: decision
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+    try:
+        alerts = dispatcher.dispatch(db_session, signal)
+        assert fake.sent == 0
+        assert alerts[0].status == "skipped"
+        assert "avoid chasing" in alerts[0].error
+    finally:
+        alerts_module.evaluate_alert_decision = original
+
+
+def test_dispatcher_skips_same_market_side_outcome_in_last_hour(db_session):
+    signal = _make_high_conviction_signal(db_session)
+    previous = Signal(
+        market_id=signal.market_id,
+        trader_id=None,
+        signal_type="trusted_wallet_entry",
+        side=signal.side,
+        outcome=signal.outcome,
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+        created_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    db_session.add(previous)
+    db_session.flush()
+    db_session.add(
+        Alert(
+            signal_id=previous.id,
+            channel="discord",
+            status="sent",
+            message="[discord_alert] sent",
+            created_at=datetime.utcnow() - timedelta(minutes=30),
+        )
+    )
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+
+    alerts = dispatcher.dispatch(db_session, signal)
+
+    assert fake.sent == 0
+    assert "same market + side + outcome" in alerts[0].error
+
+
+def test_dispatcher_skips_opposite_binary_side(db_session):
+    signal = _make_high_conviction_signal(db_session, outcome="No")
+    previous = Signal(
+        market_id=signal.market_id,
+        trader_id=None,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Yes",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+        created_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    db_session.add(previous)
+    db_session.flush()
+    db_session.add(
+        Alert(
+            signal_id=previous.id,
+            channel="discord",
+            status="sent",
+            message="[discord_alert] sent",
+            created_at=datetime.utcnow() - timedelta(minutes=30),
+        )
+    )
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+
+    alerts = dispatcher.dispatch(db_session, signal)
+
+    assert fake.sent == 0
+    assert "opposite side" in alerts[0].error
+
+
+def test_dispatcher_allows_market_summary_when_tier_upgrades(db_session):
+    signal = _make_high_conviction_signal(db_session, score=90)
+    previous = Signal(
+        market_id=signal.market_id,
+        trader_id=None,
+        signal_type="trusted_wallet_entry",
+        side="SELL",
+        outcome="Other Team",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+        created_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    db_session.add(previous)
+    db_session.flush()
+    db_session.add(
+        Alert(
+            signal_id=previous.id,
+            channel="discord",
+            status="sent",
+            message="[discord_alert] sent",
+            created_at=datetime.utcnow() - timedelta(minutes=30),
+        )
+    )
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+
+    alerts = dispatcher.dispatch(db_session, signal)
+
+    assert fake.sent == 1
+    assert alerts[0].status == "sent"
+
+
+def test_dispatcher_skips_market_summary_without_tier_upgrade(db_session):
+    signal = _make_high_conviction_signal(db_session)
+    previous = Signal(
+        market_id=signal.market_id,
+        trader_id=None,
+        signal_type="trusted_wallet_entry",
+        side="SELL",
+        outcome="Other Team",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+        created_at=datetime.utcnow() - timedelta(minutes=30),
+    )
+    db_session.add(previous)
+    db_session.flush()
+    db_session.add(
+        Alert(
+            signal_id=previous.id,
+            channel="discord",
+            status="sent",
+            message="[high_conviction] sent",
+            created_at=datetime.utcnow() - timedelta(minutes=30),
+        )
+    )
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+
+    alerts = dispatcher.dispatch(db_session, signal)
+
+    assert fake.sent == 0
+    assert "market summary already sent" in alerts[0].error

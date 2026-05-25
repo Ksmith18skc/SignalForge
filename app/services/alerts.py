@@ -20,11 +20,20 @@ from app.models import Alert, Signal, Trade, Trader
 logger = logging.getLogger(__name__)
 
 AlertTier = Literal["ignore", "log_only", "discord_alert", "high_conviction", "possible_entry"]
-DISCORD_TIERS: set[AlertTier] = {"discord_alert", "high_conviction", "possible_entry"}
+DISCORD_TIERS: set[AlertTier] = {"high_conviction", "possible_entry"}
+TIER_RANK: dict[AlertTier, int] = {
+    "ignore": 0,
+    "log_only": 1,
+    "discord_alert": 2,
+    "high_conviction": 3,
+    "possible_entry": 4,
+}
 HARD_MIN_SCORE = 65.0
 ELITE_TRUST_SCORE = 75.0
 MIN_LIQUIDITY_USD = 5_000.0
 MARKET_CONTEXT_HOURS = 24
+MARKET_SIDE_OUTCOME_WINDOW_MINUTES = 60
+MARKET_SUMMARY_WINDOW_HOURS = 3
 
 
 @dataclass(frozen=True)
@@ -196,6 +205,110 @@ def _is_duplicate_discord_alert(db: Session, signal: Signal, window_minutes: int
 
     existing = db.scalar(select(Alert.id).join(Signal).where(*filters).limit(1))
     return existing is not None
+
+
+def _same_outcome_signal_filter(signal: Signal):
+    if signal.outcome:
+        return Signal.outcome == signal.outcome
+    return or_(Signal.outcome.is_(None), Signal.outcome == "")
+
+
+def _recent_sent_discord_signals(db: Session, signal: Signal, since: datetime) -> list[Signal]:
+    return list(
+        db.scalars(
+            select(Signal)
+            .join(Alert)
+            .where(
+                Alert.channel == "discord",
+                Alert.status == "sent",
+                Alert.created_at >= since,
+                Signal.id != signal.id,
+                Signal.market_id == signal.market_id,
+            )
+            .order_by(Alert.created_at.desc())
+        )
+    )
+
+
+def _has_recent_market_side_outcome_alert(db: Session, signal: Signal) -> bool:
+    if not signal.side:
+        return False
+    since = datetime.utcnow() - timedelta(minutes=MARKET_SIDE_OUTCOME_WINDOW_MINUTES)
+    existing = db.scalar(
+        select(Alert.id)
+        .join(Signal)
+        .where(
+            Alert.channel == "discord",
+            Alert.status == "sent",
+            Alert.created_at >= since,
+            Signal.id != signal.id,
+            Signal.market_id == signal.market_id,
+            Signal.side == signal.side,
+            _same_outcome_signal_filter(signal),
+        )
+        .limit(1)
+    )
+    return existing is not None
+
+
+def _binary_outcome_key(outcome: str | None) -> str | None:
+    normalized = (outcome or "").strip().lower()
+    if normalized in {"yes", "y", "over"}:
+        return "yes"
+    if normalized in {"no", "n", "under"}:
+        return "no"
+    return None
+
+
+def _is_opposite_binary_side(current: Signal, previous: Signal) -> bool:
+    current_key = _binary_outcome_key(current.outcome)
+    previous_key = _binary_outcome_key(previous.outcome)
+    if not current_key or not previous_key:
+        return False
+    return current_key != previous_key
+
+
+def _tier_from_alert_message(message: str | None) -> AlertTier:
+    message = message or ""
+    if "[possible_entry]" in message:
+        return "possible_entry"
+    if "[high_conviction]" in message:
+        return "high_conviction"
+    if "[discord_alert]" in message:
+        return "discord_alert"
+    if "[log_only]" in message:
+        return "log_only"
+    return "ignore"
+
+
+def _should_suppress_discord(db: Session, signal: Signal, decision: AlertDecision) -> str | None:
+    if decision.action == "Avoid chasing":
+        return "avoid chasing action"
+
+    if _has_recent_market_side_outcome_alert(db, signal):
+        return "same market + side + outcome alerted in last hour"
+
+    recent_market_signals = _recent_sent_discord_signals(
+        db,
+        signal,
+        datetime.utcnow() - timedelta(hours=MARKET_SUMMARY_WINDOW_HOURS),
+    )
+    for previous in recent_market_signals:
+        if _is_opposite_binary_side(signal, previous):
+            return "opposite side of same binary market already alerted"
+
+    if recent_market_signals:
+        highest_previous_rank = 0
+        for previous in recent_market_signals:
+            latest_alert = max(previous.alerts, key=lambda alert: alert.created_at, default=None)
+            highest_previous_rank = max(
+                highest_previous_rank,
+                TIER_RANK[_tier_from_alert_message(latest_alert.message if latest_alert else None)],
+            )
+        if TIER_RANK[decision.tier] <= highest_previous_rank:
+            return "market summary already sent in last 3 hours without tier upgrade"
+
+    return None
 
 
 def _has_category_match(signal: Signal) -> bool:
@@ -400,13 +513,19 @@ def _should_send_remote(ch: "AlertChannel", decision: AlertDecision) -> bool:
     return decision.tier in DISCORD_TIERS
 
 
-def _skipped_alert(signal: Signal, channel: str, message: str, decision: AlertDecision) -> Alert:
+def _skipped_alert(
+    signal: Signal,
+    channel: str,
+    message: str,
+    decision: AlertDecision,
+    reason: str | None = None,
+) -> Alert:
     return Alert(
         signal_id=signal.id,
         channel=channel,
         status="skipped",
         message=message,
-        error=f"{decision.tier}: {decision.reason}",
+        error=f"{decision.tier}: {reason or decision.reason}",
         created_at=datetime.utcnow(),
     )
 
@@ -525,6 +644,7 @@ class AlertDispatcher:
         decision = evaluate_alert_decision(db, signal, self.settings)
         message = _format_signal(signal, decision)
         alerts: list[Alert] = []
+        discord_suppression = _should_suppress_discord(db, signal, decision)
 
         for ch in self.channels:
             if not _should_send_remote(ch, decision):
@@ -533,6 +653,12 @@ class AlertDispatcher:
                 alerts.append(alert)
                 continue
 
+            if ch.name == "discord":
+                if discord_suppression:
+                    alert = _skipped_alert(signal, ch.name, message, decision, discord_suppression)
+                    db.add(alert)
+                    alerts.append(alert)
+                    continue
             if isinstance(ch, DiscordChannel):
                 ok, err = ch.send_payload(_discord_payload(signal, decision))
             else:
