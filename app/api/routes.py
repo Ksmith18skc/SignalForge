@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import delete, desc, func, select
@@ -23,6 +23,7 @@ from app.schemas import (
     WatchlistHealth,
 )
 from app.services.scanner import run_scan_once
+from app.services.alerts import DISCORD_TIERS, evaluate_alert_decision
 
 router = APIRouter()
 
@@ -188,6 +189,134 @@ def list_signals(db: Session = Depends(get_db), limit: int = 50) -> list[SignalO
 @router.get("/alerts", response_model=list[AlertOut])
 def list_alerts(db: Session = Depends(get_db), limit: int = 50) -> list[Alert]:
     return list(db.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(limit)))
+
+
+# ---------------------------- bot helpers -----------------------------------
+
+
+def _market_url_for_signal(signal: Signal) -> str | None:
+    market = signal.market
+    if not market or not market.slug:
+        return None
+    if market.platform and market.platform.lower() == "kalshi":
+        return f"https://kalshi.com/markets/{market.slug.upper()}"
+    return f"https://polymarket.com/event/{market.slug}"
+
+
+def _trader_url_for_signal(signal: Signal) -> str | None:
+    trader = signal.trader
+    if not (trader and trader.wallet_address):
+        return None
+    return f"https://polymarketanalytics.com/traders/{trader.wallet_address}"
+
+
+def _signal_bot_payload(signal: Signal, tier: str) -> dict[str, object]:
+    return {
+        "id": signal.id,
+        "tier": tier,
+        "score": round(signal.score, 2),
+        "confidence": round(signal.confidence, 4),
+        "market": signal.market.title if signal.market else f"market#{signal.market_id}",
+        "market_slug": signal.market.slug if signal.market else None,
+        "market_url": _market_url_for_signal(signal),
+        "trader": signal.trader.nickname if signal.trader else None,
+        "trader_url": _trader_url_for_signal(signal),
+        "side": signal.side,
+        "outcome": signal.outcome,
+        "entry_price": signal.entry_price,
+        "size_usd": signal.size_usd,
+        "reason": signal.reason,
+        "created_at": signal.created_at.isoformat() if signal.created_at else None,
+    }
+
+
+@router.get("/bot/status")
+def bot_status(db: Session = Depends(get_db)) -> dict[str, object]:
+    s = get_settings()
+    falcon_health = get_falcon_health()
+    recent_cutoff = datetime.utcnow() - timedelta(hours=24)
+    return {
+        "status": "ok",
+        "environment": s.environment,
+        "traders": db.scalar(select(func.count(Trader.id))) or 0,
+        "markets": db.scalar(select(func.count(Market.id))) or 0,
+        "signals_24h": db.scalar(select(func.count(Signal.id)).where(Signal.created_at >= recent_cutoff)) or 0,
+        "discord_sent_24h": db.scalar(
+            select(func.count(Alert.id)).where(
+                Alert.channel == "discord",
+                Alert.status == "sent",
+                Alert.created_at >= recent_cutoff,
+            )
+        ) or 0,
+        "discord_skipped_24h": db.scalar(
+            select(func.count(Alert.id)).where(
+                Alert.channel == "discord",
+                Alert.status == "skipped",
+                Alert.created_at >= recent_cutoff,
+            )
+        ) or 0,
+        "falcon": {
+            "configured": s.has_falcon_credentials(),
+            "healthy": falcon_health.healthy,
+            "success_rate": round(falcon_health.success_rate, 3),
+            "last_scan_calls": falcon_health.last_scan_calls,
+            "last_scan_successes": falcon_health.last_scan_successes,
+            "last_error": falcon_health.last_error,
+            "last_scan_at": (
+                falcon_health.last_scan_at.isoformat()
+                if falcon_health.last_scan_at
+                else None
+            ),
+        },
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/bot/high-conviction")
+def bot_high_conviction(
+    db: Session = Depends(get_db),
+    limit: int = 5,
+    hours: int = 24,
+) -> dict[str, object]:
+    limit = max(1, min(limit, 10))
+    hours = max(1, min(hours, 168))
+    since = datetime.utcnow() - timedelta(hours=hours)
+    candidates = list(
+        db.scalars(
+            select(Signal)
+            .where(Signal.created_at >= since)
+            .order_by(desc(Signal.score), desc(Signal.created_at))
+            .limit(100)
+        )
+    )
+
+    matches: list[dict[str, object]] = []
+    for signal in candidates:
+        decision = evaluate_alert_decision(db, signal)
+        if decision.tier in {"high_conviction", "possible_entry"}:
+            payload = _signal_bot_payload(signal, decision.tier)
+            payload.update(
+                {
+                    "action": decision.action,
+                    "chase_risk": decision.chase_risk,
+                    "total_tracked_size": round(decision.context.total_tracked_size, 2),
+                    "trader_count": decision.context.trader_count,
+                    "current_price": decision.context.current_price,
+                    "entry_price_min": decision.context.entry_price_min,
+                    "entry_price_max": decision.context.entry_price_max,
+                }
+            )
+            matches.append(payload)
+        if len(matches) >= limit:
+            break
+
+    return {
+        "count": len(matches),
+        "hours": hours,
+        "discord_tiers": sorted(DISCORD_TIERS),
+        "signals": matches,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 # ---------------------------- run-scan --------------------------------------
