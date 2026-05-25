@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# SignalForge data
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Editors / OS
+.claude/
+.vscode/
+.idea/
+.DS_Store
+
+# pytest
+.pytest_cache/
