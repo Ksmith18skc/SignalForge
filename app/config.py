@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     environment: Literal["dev", "staging", "prod"] = "dev"
     log_level: str = "INFO"
     cors_allow_origins: str = ""
+    api_url: str = "http://127.0.0.1:8000"
 
     # --- storage ---
     database_url: str = "sqlite:///./signalforge.db"

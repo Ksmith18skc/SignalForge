@@ -17,7 +17,6 @@ quickly. Without it, Discord global command propagation can take longer.
 from __future__ import annotations
 
 import logging
-import os
 from typing import Any
 
 import discord
@@ -29,8 +28,11 @@ from app.utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
-API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://127.0.0.1:8000").rstrip("/")
 REQUEST_TIMEOUT = 20.0
+
+
+def _api_base() -> str:
+    return get_settings().api_url.rstrip("/")
 
 
 def _money(value: Any) -> str:
@@ -118,7 +120,7 @@ async def sf_status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(f"{API_BASE}/bot/status")
+            response = await client.get(f"{_api_base()}/bot/status")
             response.raise_for_status()
             status = response.json()
     except httpx.HTTPError as exc:
@@ -128,7 +130,7 @@ async def sf_status(interaction: discord.Interaction) -> None:
     falcon = status.get("falcon", {})
     embed = discord.Embed(
         title="SignalForge Status",
-        description=f"Backend: `{API_BASE}`",
+        description=f"Backend: `{_api_base()}`",
         color=0x16A34A if status.get("status") == "ok" else 0xF59E0B,
     )
     embed.add_field(name="Environment", value=str(status.get("environment")), inline=True)
@@ -163,7 +165,7 @@ async def sf_high_conviction(
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
             response = await client.get(
-                f"{API_BASE}/bot/high-conviction",
+                f"{_api_base()}/bot/high-conviction",
                 params={"limit": limit, "hours": hours},
             )
             response.raise_for_status()
