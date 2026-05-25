@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 
 from sqlalchemy.orm import Session
 
-from app.api.routes import bot_high_conviction, bot_status
+from app.api.routes import bot_high_conviction, bot_search_market, bot_status
 from app.models import Alert, Market, Signal, Trade, Trader
 
 
@@ -172,3 +172,98 @@ def test_bot_high_conviction_returns_near_misses_and_event_date_filter(db_sessio
     assert near_miss["market"] == "Current Game"
     assert near_miss["event_date"] == "2026-05-25"
     assert near_miss["failed_reason"] == "score below hard alert floor"
+
+
+def test_bot_search_market_aggregates_positions_sorted_by_score(db_session: Session) -> None:
+    now = datetime.utcnow()
+    market = Market(
+        slug="nba-nyk-cle-2026-05-25-total-216pt5",
+        title="Knicks vs Cavs Total 216.5",
+        yes_price=0.51,
+        platform="polymarket",
+    )
+    high = Trader(nickname="high", wallet_address="0xhigh", trust_score=80)
+    low = Trader(nickname="low", wallet_address="0xlow", trust_score=70)
+    db_session.add_all([market, high, low])
+    db_session.flush()
+    db_session.add_all(
+        [
+            Trade(
+                trader_id=low.id,
+                market_id=market.id,
+                side="BUY",
+                outcome="Under",
+                price=0.44,
+                size_usd=500,
+                source="Falcon",
+                timestamp=now - timedelta(minutes=20),
+            ),
+            Trade(
+                trader_id=high.id,
+                market_id=market.id,
+                side="BUY",
+                outcome="Over",
+                price=0.48,
+                size_usd=1_000,
+                source="Falcon",
+                timestamp=now - timedelta(minutes=10),
+            ),
+            Trade(
+                trader_id=high.id,
+                market_id=market.id,
+                side="BUY",
+                outcome="Over",
+                price=0.52,
+                size_usd=1_000,
+                source="Falcon",
+                timestamp=now,
+            ),
+        ]
+    )
+    db_session.add_all(
+        [
+            Signal(
+                market_id=market.id,
+                trader_id=low.id,
+                signal_type="trusted_wallet_entry",
+                side="BUY",
+                outcome="Under",
+                entry_price=0.44,
+                size_usd=500,
+                score=65,
+                confidence=0.6,
+                source="Falcon",
+                created_at=now,
+            ),
+            Signal(
+                market_id=market.id,
+                trader_id=high.id,
+                signal_type="trusted_wallet_entry",
+                side="BUY",
+                outcome="Over",
+                entry_price=0.5,
+                size_usd=2_000,
+                score=85,
+                confidence=0.8,
+                source="Falcon",
+                created_at=now,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    payload = bot_search_market(
+        "https://polymarket.com/event/nba-nyk-cle-2026-05-25-total-216pt5",
+        db_session,
+        limit=10,
+    )
+
+    assert payload["market_slug"] == "nba-nyk-cle-2026-05-25-total-216pt5"
+    assert payload["event_date"] == "2026-05-25"
+    assert payload["count"] == 2
+    first = payload["positions"][0]
+    assert first["trader"] == "high"
+    assert first["outcome"] == "Over"
+    assert first["score"] == 85
+    assert first["avg_entry_price"] == 0.5
+    assert first["total_size_usd"] == 2000

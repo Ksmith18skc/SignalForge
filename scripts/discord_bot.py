@@ -110,6 +110,43 @@ def _near_miss_embed(signal: dict[str, Any]) -> discord.Embed:
     return embed
 
 
+def _position_embed(position: dict[str, Any]) -> discord.Embed:
+    market = position.get("market") or "Unknown market"
+    trader = position.get("trader") or "Unknown trader"
+    side = position.get("side") or "n/a"
+    outcome = position.get("outcome")
+    if outcome:
+        side = f"{side} / {outcome}"
+
+    embed = discord.Embed(
+        title=f"{trader} - {side}",
+        url=position.get("market_url"),
+        color=0x2563EB,
+    )
+    embed.add_field(name="Market", value=str(market)[:1024], inline=False)
+    if position.get("event_date"):
+        embed.add_field(name="Event date", value=str(position.get("event_date")), inline=True)
+    embed.add_field(name="Score", value=str(position.get("score", "n/a")), inline=True)
+    embed.add_field(name="Confidence", value=str(position.get("confidence", "n/a")), inline=True)
+    embed.add_field(name="Avg entry", value=_price(position.get("avg_entry_price")), inline=True)
+    embed.add_field(name="Total size", value=_money(position.get("total_size_usd")), inline=True)
+    embed.add_field(name="Trades", value=str(position.get("trade_count", "n/a")), inline=True)
+    if position.get("last_trade_at"):
+        embed.add_field(name="Last trade", value=str(position.get("last_trade_at")), inline=False)
+
+    reason = str(position.get("reason") or "No reason available")
+    embed.add_field(name="Reason", value=reason[:1024], inline=False)
+
+    links = []
+    if position.get("market_url"):
+        links.append(f"[Market]({position['market_url']})")
+    if position.get("trader_url") and trader:
+        links.append(f"[{trader}]({position['trader_url']})")
+    if links:
+        embed.add_field(name="Links", value=" | ".join(links), inline=False)
+    return embed
+
+
 class SignalForgeBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -236,6 +273,53 @@ async def sf_high_conviction(
     embeds = [_signal_embed(signal) for signal in signals[:10]]
     await interaction.followup.send(
         content=f"Found {len(embeds)} SignalForge candidate(s) in the last {hours}h.",
+        embeds=embeds,
+    )
+
+
+@bot.tree.command(
+    name="search",
+    description="Search tracked-wallet positions for a Polymarket or Kalshi market URL.",
+)
+@app_commands.describe(
+    market_url="Polymarket or Kalshi market URL",
+    limit="Number of positions to return, 1-10",
+)
+async def search(
+    interaction: discord.Interaction,
+    market_url: str,
+    limit: app_commands.Range[int, 1, 10] = 10,
+) -> None:
+    await interaction.response.defer(thinking=True)
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
+            response = await client.get(
+                f"{_api_base()}/bot/search",
+                params={"market_url": market_url, "limit": limit},
+            )
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.HTTPStatusError as exc:
+        detail = exc.response.text[:500]
+        await interaction.followup.send(f"Market search failed: HTTP {exc.response.status_code} `{detail}`")
+        return
+    except httpx.HTTPError as exc:
+        await interaction.followup.send(f"Market search failed: `{type(exc).__name__}: {exc}`")
+        return
+
+    positions = payload.get("positions", [])
+    if not positions:
+        await interaction.followup.send(
+            f"No tracked-wallet positions found for `{payload.get('market_slug') or market_url}`."
+        )
+        return
+
+    embeds = [_position_embed(position) for position in positions[:10]]
+    await interaction.followup.send(
+        content=(
+            f"Found {len(embeds)} tracked-wallet position(s) for "
+            f"{payload.get('market') or payload.get('market_slug')}."
+        ),
         embeds=embeds,
     )
 

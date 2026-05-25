@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from datetime import date, datetime, timedelta
+from urllib.parse import unquote, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import delete, desc, func, select
@@ -206,6 +207,40 @@ def _market_url_for_signal(signal: Signal) -> str | None:
     return f"https://polymarket.com/event/{market.slug}"
 
 
+def _market_url(market: Market) -> str:
+    if market.platform and market.platform.lower() == "kalshi":
+        return f"https://kalshi.com/markets/{market.slug.upper()}"
+    return f"https://polymarket.com/event/{market.slug}"
+
+
+def _extract_market_slug(market_url: str) -> str:
+    parsed = urlparse(market_url.strip())
+    path = parsed.path if parsed.scheme else market_url
+    parts = [unquote(part).strip() for part in path.split("/") if part.strip()]
+    if not parts:
+        raise HTTPException(status_code=400, detail="Could not parse market URL")
+
+    lowered = [part.lower() for part in parts]
+    for marker in ("event", "markets", "market"):
+        if marker in lowered:
+            idx = lowered.index(marker)
+            if idx + 1 < len(parts):
+                return parts[idx + 1].lower()
+
+    return parts[-1].lower()
+
+
+def _event_date_for_market(market: Market | None) -> date | None:
+    slug = market.slug if market else ""
+    match = _SLUG_DATE_RE.search(slug)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
 def _trader_url_for_signal(signal: Signal) -> str | None:
     trader = signal.trader
     if not (trader and trader.wallet_address):
@@ -214,14 +249,7 @@ def _trader_url_for_signal(signal: Signal) -> str | None:
 
 
 def _event_date_for_signal(signal: Signal) -> date | None:
-    slug = signal.market.slug if signal.market else ""
-    match = _SLUG_DATE_RE.search(slug)
-    if not match:
-        return None
-    try:
-        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    except ValueError:
-        return None
+    return _event_date_for_market(signal.market)
 
 
 def _signal_bot_payload(signal: Signal, tier: str) -> dict[str, object]:
@@ -353,6 +381,117 @@ def bot_high_conviction(
         "discord_tiers": sorted(DISCORD_TIERS),
         "signals": matches,
         "near_misses": near_misses,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@router.get("/bot/search")
+def bot_search_market(
+    market_url: str,
+    db: Session = Depends(get_db),
+    limit: int = 10,
+) -> dict[str, object]:
+    limit = max(1, min(limit, 25))
+    slug = _extract_market_slug(market_url)
+    market = db.scalar(
+        select(Market).where(func.lower(Market.slug) == slug.lower())
+    )
+    if market is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Market '{slug}' has not been seen by SignalForge yet",
+        )
+
+    trades = list(
+        db.scalars(
+            select(Trade)
+            .where(Trade.market_id == market.id)
+            .order_by(Trade.timestamp.desc())
+        )
+    )
+    signals = list(
+        db.scalars(
+            select(Signal)
+            .where(Signal.market_id == market.id)
+            .order_by(desc(Signal.score), desc(Signal.confidence), desc(Signal.created_at))
+        )
+    )
+    signals_by_key: dict[tuple[int | None, str | None, str | None], Signal] = {}
+    for signal in signals:
+        key = (signal.trader_id, signal.side, signal.outcome)
+        signals_by_key.setdefault(key, signal)
+
+    grouped: dict[tuple[int, str, str | None], list[Trade]] = {}
+    for trade in trades:
+        grouped.setdefault((trade.trader_id, trade.side, trade.outcome), []).append(trade)
+
+    positions: list[dict[str, object]] = []
+    for (trader_id, side, outcome), grouped_trades in grouped.items():
+        trader = grouped_trades[0].trader
+        total_size = sum(t.size_usd or 0 for t in grouped_trades)
+        weighted_price_sum = sum((t.price or 0) * (t.size_usd or 0) for t in grouped_trades)
+        avg_entry = weighted_price_sum / total_size if total_size > 0 else None
+        first_trade = min(grouped_trades, key=lambda t: t.timestamp)
+        last_trade = max(grouped_trades, key=lambda t: t.timestamp)
+        signal = signals_by_key.get((trader_id, side, outcome))
+        if signal is None:
+            signal = signals_by_key.get((trader_id, side, None))
+
+        score = signal.score if signal else trader.trust_score if trader else 0.0
+        confidence = signal.confidence if signal else 0.0
+        reason = signal.reason if signal else f"{len(grouped_trades)} trade(s) found for this market"
+        trader_url = (
+            f"https://polymarketanalytics.com/traders/{trader.wallet_address}"
+            if trader and trader.wallet_address
+            else None
+        )
+
+        positions.append(
+            {
+                "market": market.title,
+                "market_slug": market.slug,
+                "market_url": _market_url(market),
+                "event_date": (
+                    _event_date_for_market(market).isoformat()
+                    if _event_date_for_market(market)
+                    else None
+                ),
+                "trader": trader.nickname if trader else f"trader#{trader_id}",
+                "trader_url": trader_url,
+                "wallet": trader.wallet_address if trader else None,
+                "side": side,
+                "outcome": outcome,
+                "avg_entry_price": round(avg_entry, 4) if avg_entry is not None else None,
+                "total_size_usd": round(total_size, 2),
+                "trade_count": len(grouped_trades),
+                "first_trade_at": first_trade.timestamp.isoformat() if first_trade.timestamp else None,
+                "last_trade_at": last_trade.timestamp.isoformat() if last_trade.timestamp else None,
+                "score": round(score, 2),
+                "confidence": round(confidence, 4),
+                "reason": reason,
+            }
+        )
+
+    positions.sort(
+        key=lambda p: (
+            float(p.get("score") or 0),
+            float(p.get("confidence") or 0),
+            float(p.get("total_size_usd") or 0),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "market": market.title,
+        "market_slug": market.slug,
+        "market_url": _market_url(market),
+        "event_date": (
+            _event_date_for_market(market).isoformat()
+            if _event_date_for_market(market)
+            else None
+        ),
+        "count": len(positions[:limit]),
+        "positions": positions[:limit],
         "timestamp": datetime.utcnow().isoformat(),
     }
 
