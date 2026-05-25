@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     app_name: str = "SignalForge"
     environment: Literal["dev", "staging", "prod"] = "dev"
     log_level: str = "INFO"
+    cors_allow_origins: str = ""
 
     # --- storage ---
     database_url: str = "sqlite:///./signalforge.db"
