@@ -105,7 +105,15 @@ class SignalForgeBot(discord.Client):
         if settings.discord_guild_id:
             guild = discord.Object(id=settings.discord_guild_id)
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            try:
+                await self.tree.sync(guild=guild)
+            except discord.Forbidden as exc:
+                raise SystemExit(
+                    "Discord command sync failed: missing access to guild "
+                    f"{settings.discord_guild_id}. Invite the bot to that server "
+                    "with the 'bot' and 'applications.commands' scopes, or fix "
+                    "SIGNALFORGE_DISCORD_GUILD_ID."
+                ) from exc
             logger.info("Synced SignalForge commands to guild %s", settings.discord_guild_id)
         else:
             await self.tree.sync()
