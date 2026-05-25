@@ -11,6 +11,8 @@ from typing import Any
 
 from sqlalchemy import select
 
+from sqlalchemy.orm import Session
+
 from app.db import SessionLocal, init_db
 from app.models import Trader
 from app.utils.logging import configure_logging
@@ -178,29 +180,34 @@ SEED_TRADERS: list[dict[str, Any]] = [
 ]
 
 
+def seed_watchlist(db: Session) -> tuple[int, int]:
+    created = 0
+    updated = 0
+    for entry in SEED_TRADERS:
+        existing = db.scalar(
+            select(Trader).where(Trader.nickname == entry["nickname"])
+        )
+        if existing:
+            for key, value in entry.items():
+                setattr(existing, key, value)
+            updated += 1
+            logger.info("updated trader: %s", entry["nickname"])
+            continue
+
+        trader = Trader(**entry)
+        db.add(trader)
+        created += 1
+        logger.info("seeded trader: %s", entry["nickname"])
+    return created, updated
+
+
 def seed() -> int:
     configure_logging()
     init_db()
 
-    created = 0
-    updated = 0
     db = SessionLocal()
     try:
-        for entry in SEED_TRADERS:
-            existing = db.scalar(
-                select(Trader).where(Trader.nickname == entry["nickname"])
-            )
-            if existing:
-                for key, value in entry.items():
-                    setattr(existing, key, value)
-                updated += 1
-                logger.info("updated trader: %s", entry["nickname"])
-                continue
-
-            trader = Trader(**entry)
-            db.add(trader)
-            created += 1
-            logger.info("seeded trader: %s", entry["nickname"])
+        created, updated = seed_watchlist(db)
         db.commit()
     finally:
         db.close()

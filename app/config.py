@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     cors_allow_origins: str = ""
     api_url: str = "http://127.0.0.1:8000"
+    auto_seed_watchlist: bool = True
 
     # --- storage ---
     database_url: str = "sqlite:///./signalforge.db"

@@ -10,9 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes import router
 from app.config import get_settings
-from app.db import init_db
+from app.db import SessionLocal, init_db
 from app.services.scanner import get_background_scanner
 from app.utils.logging import configure_logging
+from scripts.seed import seed_watchlist
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,22 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
     init_db()
+    if settings.auto_seed_watchlist:
+        db = SessionLocal()
+        try:
+            created, updated = seed_watchlist(db)
+            db.commit()
+            logger.info(
+                "Watchlist seed complete: created=%d updated=%d",
+                created,
+                updated,
+            )
+        except Exception:
+            db.rollback()
+            logger.exception("Watchlist seed failed")
+            raise
+        finally:
+            db.close()
     logger.info(
         "%s starting in %s mode (auto_trading=%s, default_copy_mode=%s)",
         settings.app_name,
