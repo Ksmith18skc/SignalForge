@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+from itertools import count
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Iterable
@@ -25,6 +26,7 @@ API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip
 DEFAULT_TIMEOUT = 10.0
 SCAN_TIMEOUT = 60.0
 MLB_RUN_TIMEOUT = 180.0
+_EMPTY_STATE_COUNTER = count()
 
 
 # =============================================================================
@@ -970,6 +972,7 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
 def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callable]] | None = None) -> None:
     """Friendly empty state — title, body, optional action buttons."""
     checked = fmt_dt_mst(datetime.now(timezone.utc))
+    instance_id = next(_EMPTY_STATE_COUNTER)
     st.markdown(
         f"<div class='sf-card'><div class='sf-card-title'>{title}</div>"
         f"<div class='sf-card-row sf-meta'>{body}</div>"
@@ -979,9 +982,10 @@ def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callab
     if not actions:
         return
     cols = st.columns(len(actions))
-    for col, (label, fn) in zip(cols, actions):
+    for idx, (col, (label, fn)) in enumerate(zip(cols, actions)):
         with col:
-            if st.button(label, key=f"empty-{label}", use_container_width=True):
+            key_label = re.sub(r"[^a-zA-Z0-9_-]+", "-", label).strip("-").lower()
+            if st.button(label, key=f"empty-{instance_id}-{idx}-{key_label}", use_container_width=True):
                 fn()
 
 
