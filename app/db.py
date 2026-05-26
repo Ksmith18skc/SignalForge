@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Generator
 
 from sqlalchemy import create_engine, event, inspect, text
@@ -9,11 +10,14 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 _settings = get_settings()
 
 # check_same_thread=False is required for SQLite when sharing across the
 # FastAPI request handler thread and background scanner thread.
 _is_sqlite = _settings.database_url.startswith("sqlite")
+_is_postgres = _settings.database_url.startswith("postgres")
 _connect_args = {"check_same_thread": False, "timeout": 30.0} if _is_sqlite else {}
 
 engine = create_engine(
@@ -78,6 +82,8 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
+    if _is_postgres:
+        _ensure_postgres_trades_external_id_is_text()
 
 
 def _add_sqlite_column_if_missing(table: str, column: str, ddl: str) -> None:
@@ -88,3 +94,49 @@ def _add_sqlite_column_if_missing(table: str, column: str, ddl: str) -> None:
         return
     with engine.begin() as conn:
         conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+
+
+def _ensure_postgres_trades_external_id_is_text() -> None:
+    """Widen trades.external_id to TEXT on existing Postgres deployments.
+
+    Older deployments shipped with VARCHAR(128) and Falcon trade IDs can blow
+    past that, causing StringDataRightTruncation. ALTER TABLE ... TYPE TEXT
+    USING external_id::text is non-destructive: it preserves every existing
+    row's value because the cast is a no-op widen. We probe information_schema
+    first so this stays idempotent across restarts.
+    """
+    inspector = inspect(engine)
+    if "trades" not in inspector.get_table_names():
+        return
+    try:
+        with engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    """
+                    SELECT data_type, character_maximum_length
+                    FROM information_schema.columns
+                    WHERE table_name = 'trades' AND column_name = 'external_id'
+                    """
+                )
+            ).first()
+            if row is None:
+                return
+            data_type, max_len = row[0], row[1]
+            # Already TEXT (no length) — nothing to do.
+            if data_type == "text" and max_len is None:
+                return
+            logger.warning(
+                "Migrating trades.external_id from %s(%s) to TEXT to fit Falcon IDs",
+                data_type, max_len,
+            )
+            conn.execute(
+                text(
+                    "ALTER TABLE trades ALTER COLUMN external_id TYPE TEXT "
+                    "USING external_id::text"
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Don't crash app startup if the migration probe fails — log loudly and
+        # let the column stay as it is; ingestion guards still cap inserts to a
+        # safe length so the worst case is a truncation warning, not a crash.
+        logger.exception("trades.external_id migration probe failed: %s", exc)

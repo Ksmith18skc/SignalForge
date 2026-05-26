@@ -202,11 +202,68 @@ def delete_trader(trader_id: int) -> None:
         r.raise_for_status()
 
 
-def trigger_scan() -> dict[str, Any]:
+class ScanRequestError(RuntimeError):
+    """Backend scan request failed. Carries enough context for the UI to show
+    the operator exactly which endpoint blew up and how."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        method: str,
+        url: str,
+        status_code: int | None = None,
+        body: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.method = method
+        self.url = url
+        self.status_code = status_code
+        self.body = body
+
+    def short_body(self, limit: int = 800) -> str:
+        if not self.body:
+            return ""
+        return self.body if len(self.body) <= limit else f"{self.body[:limit]}…"
+
+
+def _post_scan(path: str, *, timeout: float) -> dict[str, Any]:
+    """POST to a backend scan endpoint and raise ScanRequestError with full
+    context (endpoint, status code, response body) on any failure mode —
+    HTTPStatusError, ConnectError, timeouts. Returns the parsed JSON on success.
+    """
+    full_url = f"{API_BASE}{path}"
     with _client() as c:
-        r = c.post("/run-scan", timeout=60.0)
-        r.raise_for_status()
-        return r.json()
+        try:
+            r = c.post(path, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise ScanRequestError(
+                f"{type(exc).__name__}: {exc}",
+                method="POST",
+                url=full_url,
+            ) from exc
+    if r.is_success:
+        try:
+            return r.json()
+        except ValueError as exc:
+            raise ScanRequestError(
+                f"Backend returned non-JSON on success: {exc}",
+                method="POST",
+                url=full_url,
+                status_code=r.status_code,
+                body=r.text,
+            ) from exc
+    raise ScanRequestError(
+        f"HTTP {r.status_code}",
+        method="POST",
+        url=full_url,
+        status_code=r.status_code,
+        body=r.text,
+    )
+
+
+def trigger_scan() -> dict[str, Any]:
+    return _post_scan("/run-scan", timeout=60.0)
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -267,10 +324,27 @@ def fetch_mlb_performance() -> dict[str, Any]:
 
 
 def trigger_mlb_edge_run() -> dict[str, Any]:
-    with _client() as c:
-        r = c.post("/mlb/edges/run", timeout=180.0)
-        r.raise_for_status()
-        return r.json()
+    return _post_scan("/mlb/edges/run", timeout=180.0)
+
+
+def _render_scan_error(prefix: str, exc: ScanRequestError) -> None:
+    """Render a structured scan failure: title line, endpoint chip, response body.
+
+    Streamlit's default `st.error(str(exc))` collapsed everything into a single
+    opaque line ("HTTP 500"). This surfaces the three things you need to triage
+    a scan failure: endpoint called, status code, and the response body.
+    """
+    status = (
+        f"HTTP {exc.status_code}"
+        if exc.status_code is not None
+        else "transport error"
+    )
+    st.error(f"{prefix}: {status} from `{exc.method} {exc.url}`")
+    body = exc.short_body()
+    if body:
+        st.code(body, language="json" if body.lstrip().startswith(("{", "[")) else "text")
+    else:
+        st.caption(str(exc))
 
 
 # ----------------------------------------------------------------------------
@@ -639,19 +713,19 @@ with hcol2:
         )
 
 with hcol3:
-    if st.button("Run scan now", width="stretch", type="primary"):
-        with st.spinner("Scanning..."):
+    if st.button("Run wallet scan", width="stretch", type="primary"):
+        with st.spinner("Scanning wallets..."):
             try:
                 result = trigger_scan()
                 st.toast(
-                    f"Scan complete: {result['new_signals']} signals, "
+                    f"Wallet scan complete: {result['new_signals']} signals, "
                     f"{result['new_alerts']} alerts, "
                     f"{result['duration_seconds']:.2f}s"
                 )
                 st.cache_data.clear()
                 st.rerun()
-            except httpx.HTTPError as exc:
-                st.error(f"Scan failed: {exc}")
+            except ScanRequestError as exc:
+                _render_scan_error("Wallet scan failed", exc)
 
 st.divider()
 
@@ -791,7 +865,7 @@ with tab_mlb:
         "High-value",
         sum(1 for e in mlb_edges_all if (e.get("score") or 0) >= 80),
     )
-    if col_c.button("Run MLB scan", type="primary", width="stretch"):
+    if col_c.button("Run MLB edge scan", type="primary", width="stretch"):
         with st.spinner("Running MLB edge engine..."):
             try:
                 result = trigger_mlb_edge_run()
@@ -801,8 +875,8 @@ with tab_mlb:
                 )
                 st.cache_data.clear()
                 st.rerun()
-            except httpx.HTTPError as exc:
-                st.error(f"MLB scan failed: {exc}")
+            except ScanRequestError as exc:
+                _render_scan_error("MLB edge scan failed", exc)
 
     st.markdown("#### Daily card")
     if mlb_daily_card:
@@ -945,16 +1019,6 @@ with tab_traders:
                 }
                 try:
                     created = create_trader(payload)
-                    if scan_after_add:
-                        result = trigger_scan()
-                        st.success(
-                            f"Added {created['nickname']} and scanned: "
-                            f"{result['new_signals']} new signals."
-                        )
-                    else:
-                        st.success(f"Added {created['nickname']}.")
-                    st.cache_data.clear()
-                    st.rerun()
                 except httpx.HTTPStatusError as exc:
                     detail = exc.response.text
                     if exc.response.status_code == 409:
@@ -963,6 +1027,21 @@ with tab_traders:
                         st.error(f"Could not add wallet: {detail}")
                 except httpx.HTTPError as exc:
                     st.error(f"Could not reach API: {exc}")
+                else:
+                    if scan_after_add:
+                        try:
+                            result = trigger_scan()
+                            st.success(
+                                f"Added {created['nickname']} and scanned: "
+                                f"{result['new_signals']} new signals."
+                            )
+                        except ScanRequestError as exc:
+                            st.success(f"Added {created['nickname']}.")
+                            _render_scan_error("Wallet scan after add failed", exc)
+                    else:
+                        st.success(f"Added {created['nickname']}.")
+                    st.cache_data.clear()
+                    st.rerun()
 
     st.divider()
 

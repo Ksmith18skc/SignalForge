@@ -31,6 +31,8 @@ from app.models import (
     Trader,
 )
 from app.providers.falcon import FalconProvider, get_falcon_health
+from app.services.ingestion_health import get_ingestion_health
+from app.services.odds_cache import get_odds_cache_health
 from app.providers.mlb_stats_api import MlbStatsApiError, MlbStatsApiProvider
 from app.providers.odds_api import OddsApiError, OddsApiProvider
 from app.providers.pybaseball_provider import PyBaseballError, PyBaseballProvider
@@ -80,6 +82,8 @@ _LIVE_PYBASEBALL_DISABLED_MESSAGE = (
 def health() -> dict[str, object]:
     s = get_settings()
     falcon_health = get_falcon_health()
+    ingest = get_ingestion_health()
+    odds_cache_health = get_odds_cache_health()
     # "Configured" means a key is set. "Healthy" means calls are actually
     # succeeding — these can disagree (wrong base URL, expired key, etc.).
     return {
@@ -89,6 +93,21 @@ def health() -> dict[str, object]:
         "default_copy_mode": s.default_copy_mode,
         "auto_trading_enabled": s.enable_auto_trading,
         "database": {"backend": _database_backend(s.database_url)},
+        "ingestion": {
+            "ingestion_failures": ingest.ingestion_failures,
+            "db_rollbacks": ingest.db_rollbacks,
+            "last_ingestion_error": ingest.last_ingestion_error,
+            "last_ingestion_error_at": (
+                ingest.last_ingestion_error_at.isoformat()
+                if ingest.last_ingestion_error_at
+                else None
+            ),
+            "last_rollback_at": (
+                ingest.last_rollback_at.isoformat() if ingest.last_rollback_at else None
+            ),
+            "trades_inserted": ingest.trades_inserted,
+            "trades_skipped_oversized": ingest.trades_skipped_oversized,
+        },
         "providers": {
             "falcon": {
                 "configured": s.has_falcon_credentials(),
@@ -114,6 +133,23 @@ def health() -> dict[str, object]:
                 "configured": s.has_odds_api_credentials(),
                 "base_url": s.odds_api_base_url,
                 "bookmakers": [b.strip() for b in s.odds_bookmakers.split(",") if b.strip()],
+                "cache": {
+                    "live_api_calls": odds_cache_health.live_api_calls,
+                    "cache_hits": odds_cache_health.cache_hits,
+                    "cache_misses": odds_cache_health.cache_misses,
+                    "avoided_api_calls": odds_cache_health.avoided_api_calls,
+                    "stale_fallbacks": odds_cache_health.stale_fallbacks,
+                    "rate_limited_count": odds_cache_health.rate_limited_count,
+                    "last_rate_limited_at": (
+                        odds_cache_health.last_rate_limited_at.isoformat()
+                        if odds_cache_health.last_rate_limited_at else None
+                    ),
+                    "last_refresh_at": (
+                        odds_cache_health.last_refresh_at.isoformat()
+                        if odds_cache_health.last_refresh_at else None
+                    ),
+                    "last_refresh_event_count": odds_cache_health.last_refresh_event_count,
+                },
             },
             "mlb_stats_api": {
                 "configured": s.mlb_stats_enabled,
@@ -978,6 +1014,190 @@ def mlb_debug_pitcher_props(
             for row in rows
         ],
     }
+
+
+# ---------------------------- MLB odds debug --------------------------------
+
+
+def _mlb_card_date(game_date: str | None) -> str:
+    return game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
+
+
+@router.get("/mlb/debug/odds/events")
+async def mlb_debug_odds_events(
+    game_date: str | None = None,
+    live: bool = False,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """MLB events for the slate. Cache-first; pass ?live=true to bypass.
+
+    The cache is populated by `refresh_mlb_odds_cache` (run via the edge
+    engine or the closing-line script). When ?live=true we still go through
+    the same refresh code path so the result is persisted for reuse.
+    """
+    from app.services import odds_cache
+    from app.services.mlb_edge_engine import ODDS_MLB_LEAGUE, ODDS_MLB_SPORT
+
+    card_date = _mlb_card_date(game_date)
+
+    if not live:
+        events = odds_cache.get_cached_events_list(db, game_date=card_date)
+        if events is not None:
+            return {
+                "game_date": card_date,
+                "sport": ODDS_MLB_SPORT,
+                "league": ODDS_MLB_LEAGUE,
+                "source": "cache",
+                "count": len(events),
+                "events": events,
+            }
+
+    provider = _odds_provider()
+    try:
+        # Force=True so even a fresh cache row gets re-fetched on ?live=true.
+        refresh = await odds_cache.refresh_mlb_odds_cache(
+            db, provider, [], game_date=card_date, force=live,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+    events = odds_cache.get_cached_events_list(db, game_date=card_date) or []
+    return {
+        "game_date": card_date,
+        "sport": ODDS_MLB_SPORT,
+        "league": ODDS_MLB_LEAGUE,
+        "source": "live" if live else "cache (after refresh)",
+        "count": len(events),
+        "events": events,
+        "refresh": refresh.as_dict(),
+    }
+
+
+@router.get("/mlb/debug/odds/event-match")
+async def mlb_debug_odds_event_match(
+    game_pk: int | None = None,
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Show, per MLB game, which Odds-API event we matched (or why we didn't).
+
+    Cache-only — does not hit the upstream. Run a refresh first if the cache
+    is empty.
+    """
+    from app.services import odds_cache
+    from app.services.mlb_edge_engine import _load_games
+
+    card_date = _mlb_card_date(game_date)
+    mlb = _mlb_provider()
+
+    games = await _load_games(mlb, card_date)
+    if game_pk is not None:
+        games = [g for g in games if int(g.get("game_pk") or 0) == game_pk]
+        if not games:
+            raise HTTPException(status_code=404, detail=f"No MLB game for pk={game_pk} on {card_date}")
+
+    results, unmatched_events = odds_cache.matches_for_games(
+        db, games, game_date=card_date,
+    )
+    events = odds_cache.get_cached_events_list(db, game_date=card_date) or []
+    return {
+        "game_date": card_date,
+        "mlb_games": len(games),
+        "odds_events": len(events),
+        "matches": [r.as_dict() for r in results],
+        "unmatched_games": [r.as_dict() for r in results if not r.matched_event_id],
+        "unmatched_events": [
+            {"id": e.get("id"), "home": e.get("home"), "away": e.get("away")}
+            for e in unmatched_events
+        ],
+    }
+
+
+@router.get("/mlb/debug/odds/raw")
+async def mlb_debug_odds_raw(
+    event_id: str,
+    live: bool = False,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Raw `/odds` payload for a single event_id. Cache-first.
+
+    Pass ?live=true to force a single upstream fetch (counted against the
+    rate limit). Cache-only calls never hit the API.
+    """
+    from app.services import odds_cache
+
+    if not live:
+        payload = odds_cache.get_cached_event_odds(db, event_id)
+        if payload is not None:
+            return {"event_id": event_id, "source": "cache", "payload": payload}
+
+    provider = _odds_provider()
+    try:
+        payload = await provider.odds(event_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+    # Persist into the cache so subsequent debug calls reuse it.
+    odds_cache._upsert_snapshot(  # noqa: SLF001 — debug-only escape hatch
+        db,
+        sport=odds_cache.ODDS_MLB_SPORT,
+        event_id=event_id,
+        market_type=odds_cache.MARKET_TYPE_EVENT_ODDS,
+        payload=payload,
+        ttl=odds_cache.MLB_TOTALS_TTL,
+    )
+    db.commit()
+    return {"event_id": event_id, "source": "live", "payload": payload}
+
+
+@router.get("/mlb/debug/odds/markets")
+async def mlb_debug_odds_markets(
+    event_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Inventory the markets for one event_id (cache-only)."""
+    from app.services import odds_cache
+    from app.services.mlb_odds_analysis import summarize_markets
+
+    payload = odds_cache.get_cached_event_odds(db, event_id)
+    if payload is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"No cached odds for event_id={event_id!r}. Run POST "
+                f"/mlb/edges/run or GET /mlb/debug/odds/raw?event_id=...&live=true"
+            ),
+        )
+    return summarize_markets(payload)
+
+
+@router.get("/mlb/debug/odds-cache")
+def mlb_debug_odds_cache(db: Session = Depends(get_db)) -> dict[str, object]:
+    """Inventory + metrics for the centralized Odds-API cache.
+
+    Surfaces: row count, fresh vs. stale, by-market-type counts, live API
+    calls, cache hits/misses, avoided calls, 429s, and last refresh state.
+    """
+    from app.services import odds_cache
+
+    return odds_cache.cache_summary(db)
+
+
+@router.post("/mlb/debug/odds-cache/refresh")
+async def mlb_debug_odds_cache_refresh(
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Force a refresh of the centralized cache. Operator-triggered."""
+    from app.services import odds_cache
+    from app.services.mlb_edge_engine import _load_games
+
+    card_date = _mlb_card_date(game_date)
+    mlb = _mlb_provider()
+    provider = _odds_provider()
+    games = await _load_games(mlb, card_date)
+    result = await odds_cache.refresh_mlb_odds_cache(
+        db, provider, games, game_date=card_date, force=True,
+    )
+    return result.as_dict()
 
 
 @router.post("/mlb/edges/{edge_id}/grade")

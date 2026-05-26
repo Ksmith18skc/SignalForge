@@ -75,6 +75,9 @@ async def test_odds_provider_compare_lines(monkeypatch):
     calls = []
 
     class _Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
         def raise_for_status(self):
             return None
 

@@ -11,7 +11,20 @@ from statistics import mean
 from typing import Any
 
 SUPPORTED_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
-K_MARKET_HINTS = ("strikeout", "strikeouts", "pitcher strikeouts", "player strikeouts")
+# Substring hints; we lowercase the market name/label/key/type before checking.
+# Covers DK's "Pitcher Strikeouts", FD's "Player Strikeouts", BetMGM's
+# "Total Strikeouts", and Caesars' "Strikeouts (Pitcher)" variants.
+K_MARKET_HINTS = (
+    "strikeout",
+    "strikeouts",
+    "pitcher strikeouts",
+    "player strikeouts",
+    "pitcher total strikeouts",
+    "total strikeouts",
+    "strikeouts thrown",
+    "pitcher ks",
+    "ks thrown",
+)
 SUFFIXES = {"jr", "sr", "ii", "iii", "iv", "v"}
 
 

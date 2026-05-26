@@ -103,7 +103,9 @@ class Trade(Base):
     price: Mapped[float] = mapped_column(Float)
     size_usd: Mapped[float] = mapped_column(Float)
     source: Mapped[str] = mapped_column(String(32), default="mock")
-    external_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    # Falcon trade IDs can be long composite strings (wallet+market+timestamp).
+    # Use TEXT so we never truncate; the index is created with the column.
+    external_id: Mapped[str | None] = mapped_column(Text, nullable=True, index=True)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     trader: Mapped[Trader] = relationship(back_populates="trades")
@@ -374,6 +376,33 @@ class MlbEdgeFactor(Base):
     value: Mapped[float] = mapped_column(Float)
     weight: Mapped[float] = mapped_column(Float)
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class OddsSnapshot(Base):
+    """Single source of truth for raw Odds-API payloads.
+
+    One row per (sport, event_id, market_type[, sportsbook]). For the
+    centralized cache:
+      * market_type="events_list" → list payload of all events for a sport+date
+        (event_id is a synthetic key like "_events_2026-05-25")
+      * market_type="event_odds"  → full odds payload for one event_id
+        (contains every bookmaker × market the upstream returned)
+
+    Splitting per-sportsbook rows is supported (sportsbook column is the
+    distinguisher) but the MLB pipeline cache stores the whole payload as one
+    row because Odds-API returns all books in a single response.
+    """
+
+    __tablename__ = "odds_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sport: Mapped[str] = mapped_column(String(32), index=True)
+    event_id: Mapped[str] = mapped_column(String(128), index=True)
+    market_type: Mapped[str] = mapped_column(String(64), index=True)
+    sportsbook: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    payload: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, default=dict)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
 class MlbDailyCard(Base):

@@ -23,15 +23,23 @@ from app.models import (
 from app.providers.mlb_stats_api import MlbStatsApiProvider
 from app.providers.odds_api import OddsApiProvider
 from app.providers.weather_api import WeatherApiProvider
+from app.services import odds_cache
 from app.services.mlb_edge import statcast_context
 from app.services.mlb_edge_scoring import edge_to_dict
 from app.services.mlb_environment import score_environment
 from app.services.mlb_odds_analysis import analyze_game_totals
+from app.services.mlb_odds_matching import MatchResult
 from app.services.mlb_pitcher_k_model import pitcher_k_edges
 from app.services.mlb_prop_odds import consensus_for_pitcher, names_match, normalize_pitcher_strikeout_props
 from app.services.mlb_totals_model import total_edges
 
 logger = logging.getLogger(__name__)
+
+
+# Odds-API sport/league params for MLB. Kept here (not config) because they're
+# vendor identifiers, not user preferences.
+ODDS_MLB_SPORT = "baseball"
+ODDS_MLB_LEAGUE = "MLB"
 
 
 async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> dict[str, Any]:
@@ -45,16 +53,45 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
     db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
     db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
 
+    # Refresh the centralized odds cache ONCE for this slate. This is the only
+    # place we hit Odds-API live — every other consumer reads from
+    # odds_snapshots. Concurrent callers coalesce via odds_cache's lock.
+    refresh = await odds_cache.refresh_mlb_odds_cache(
+        db, odds, games, game_date=card_date, force=False,
+    )
+    match_results, unmatched_events = odds_cache.matches_for_games(
+        db, games, game_date=card_date,
+    )
+    matches_by_game: dict[int, MatchResult] = {m.game_pk: m for m in match_results}
+    logger.info(
+        "MLB scan summary: games=%d odds_events=%d matched=%d unmatched_games=%d "
+        "unmatched_events=%d refresh=%s",
+        len(games),
+        refresh.events_fetched,
+        sum(1 for m in match_results if m.matched_event_id),
+        sum(1 for m in match_results if not m.matched_event_id),
+        len(unmatched_events),
+        refresh.reason,
+    )
+
     created_edges: list[MlbEdge] = []
+    totals_count = 0
+    pitcher_k_count = 0
     for game in games:
         _upsert_game(db, game)
         env = await _environment_for_game(db, weather, game)
-        totals_analysis = await _odds_for_game(db, odds, game)
+        match = matches_by_game.get(int(game["game_pk"]))
+        payload = _resolve_cached_payload(db, match)
+        totals_analysis = await _odds_for_game(db, game, payload)
+        if totals_analysis.get("book_count"):
+            totals_count += 1
         for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
             created_edges.append(_persist_edge(db, edge_payload, card_date))
 
         for pitcher in _pitchers(game):
-            prop = await _pitcher_prop_for_game(db, odds, game, pitcher)
+            prop = await _pitcher_prop_for_game(db, game, pitcher, payload)
+            if prop.get("book_count"):
+                pitcher_k_count += 1
             if prop.get("line") is None or not prop.get("rows"):
                 logger.info(
                     "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
@@ -81,10 +118,21 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
 
     card = _build_daily_card(db, card_date)
     db.commit()
+    logger.info(
+        "MLB edge run: date=%s games=%d odds_events=%d events_with_totals=%d "
+        "events_with_pitcher_props=%d edges=%d odds_calls=%d cache_hits=%d",
+        card_date, len(games), refresh.events_fetched, totals_count, pitcher_k_count,
+        len(created_edges), refresh.odds_calls,
+        odds_cache.get_odds_cache_health().cache_hits,
+    )
     return {
         "date": card_date,
         "games": len(games),
+        "odds_events": refresh.events_fetched,
+        "events_with_totals": totals_count,
+        "events_with_pitcher_props": pitcher_k_count,
         "edges": len(created_edges),
+        "odds_refresh": refresh.as_dict(),
         "daily_card": _card_to_dict(card),
     }
 
@@ -199,8 +247,11 @@ async def _environment_for_game(
     return env
 
 
-async def _odds_for_game(db: Session, odds: OddsApiProvider, game: dict[str, Any]) -> dict[str, Any]:
-    payload = await _best_effort_odds_payload(odds, game)
+async def _odds_for_game(
+    db: Session,
+    game: dict[str, Any],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
     analysis = analyze_game_totals(payload)
     db.add(
         MlbOddsSnapshot(
@@ -225,11 +276,10 @@ async def _odds_for_game(db: Session, odds: OddsApiProvider, game: dict[str, Any
 
 async def _pitcher_prop_for_game(
     db: Session,
-    odds: OddsApiProvider,
     game: dict[str, Any],
     pitcher: dict[str, Any],
+    payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    payload = await _best_effort_odds_payload(odds, game)
     prop_lines = normalize_pitcher_strikeout_props(payload)
     for line in prop_lines:
         if pitcher.get("name") and not names_match(line.player_name, pitcher.get("name") or ""):
@@ -270,19 +320,24 @@ async def _pitcher_prop_for_game(
     return analysis
 
 
-async def _best_effort_odds_payload(odds: OddsApiProvider, game: dict[str, Any]) -> dict[str, Any] | None:
-    try:
-        query = f"{game['away_team']} {game['home_team']}"
-        events = await odds.search_events(query)
-        if not events:
-            return None
-        event_id = events[0].get("id")
-        if not event_id:
-            return None
-        return await odds.odds(event_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Odds lookup failed for %s: %s", game.get("game_pk"), exc)
+def _resolve_cached_payload(
+    db: Session,
+    match: MatchResult | None,
+) -> dict[str, Any] | None:
+    """Pure cache read — never touches the live API.
+
+    `refresh_mlb_odds_cache` should have populated the cache earlier in
+    `run_daily_mlb_edges`; if it didn't (rate-limited + no stale row), we
+    return None and the consumer emits a "missing odds" warning.
+    """
+    if match is None or not match.matched_event_id:
+        if match is not None:
+            logger.info(
+                "Skipping odds for game_pk=%s: %s",
+                match.game_pk, match.reason,
+            )
         return None
+    return odds_cache.get_cached_event_odds(db, match.matched_event_id)
 
 
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -15,7 +16,7 @@ from app.config import get_settings
 from app.db import SessionLocal, init_db
 from app.models import MlbEdge, MlbGame
 from app.providers.odds_api import OddsApiProvider
-from app.services.mlb_edge_engine import _best_effort_odds_payload
+from app.services import odds_cache
 from app.services.mlb_odds_analysis import analyze_game_totals
 from app.services.mlb_prop_odds import consensus_for_pitcher, normalize_pitcher_strikeout_props
 from app.services.mlb_performance import update_closing_line_fields
@@ -36,9 +37,19 @@ async def main_async(argv: list[str] | None = None) -> int:
     db = SessionLocal()
     counts = {"updated": 0, "skipped": 0, "failed": 0}
     try:
-        for edge, game in _candidate_edges(db, args.window_minutes):
+        candidates = _candidate_edges(db, args.window_minutes)
+
+        # Refresh the centralized odds cache once per game_date — never per
+        # edge. With ~10 edges/game and ~15 games/day this turns ~150 live
+        # calls into 1 events call + 15 odds calls.
+        for game_date, games in _games_by_date(candidates).items():
+            await odds_cache.refresh_mlb_odds_cache(
+                db, odds, games, game_date=game_date, force=True,
+            )
+
+        for edge, game in candidates:
             try:
-                payload = await _best_effort_odds_payload(odds, _game_dict(game))
+                payload = _cached_payload_for_game(db, game)
                 analysis = _analysis_for_edge(edge, payload)
                 closing_line, closing_price = _closing_values(edge, analysis)
                 if closing_line is None and closing_price is None:
@@ -88,9 +99,39 @@ def _closing_values(edge: MlbEdge, analysis: dict[str, Any]) -> tuple[float | No
 def _game_dict(game: MlbGame) -> dict[str, Any]:
     return {
         "game_pk": game.game_pk,
+        "game_date": game.game_date,
         "away_team": game.away_team,
         "home_team": game.home_team,
     }
+
+
+def _games_by_date(
+    candidates: list[tuple[MlbEdge, MlbGame]],
+) -> dict[str, list[dict[str, Any]]]:
+    by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, int]] = set()
+    for _edge, game in candidates:
+        key = (game.game_date, game.game_pk)
+        if key in seen:
+            continue
+        seen.add(key)
+        by_date[game.game_date].append(_game_dict(game))
+    return by_date
+
+
+def _cached_payload_for_game(db: Session, game: MlbGame) -> dict[str, Any] | None:
+    """Cache-only lookup. Closing-line passes reuse the events list cached
+    by the refresh above; if no match is found we serve None and the
+    consumer reports `skipped`."""
+    results, _ = odds_cache.matches_for_games(
+        db, [_game_dict(game)], game_date=game.game_date,
+    )
+    if not results:
+        return None
+    match = results[0]
+    if not match.matched_event_id:
+        return None
+    return odds_cache.get_cached_event_odds(db, match.matched_event_id)
 
 
 def _num(value: Any) -> float | None:

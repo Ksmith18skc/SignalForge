@@ -13,6 +13,7 @@ import time
 from datetime import datetime
 
 from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -20,7 +21,7 @@ from app.db import SessionLocal
 from app.models import Market, Trader
 from app.providers.falcon import begin_scan_window, end_scan_window, get_falcon_health
 from app.schemas import ScanResult
-from app.services import ingestion, signal_engine
+from app.services import ingestion, ingestion_health, signal_engine
 from app.services.alerts import AlertDispatcher
 
 logger = logging.getLogger(__name__)
@@ -43,23 +44,48 @@ async def run_scan_once() -> ScanResult:
         for trader in traders:
             try:
                 await ingestion.enrich_trader(db, trader, providers)
+            except SQLAlchemyError as exc:
+                ingestion_health.record_failure(f"enrich_trader: {exc}")
+                ingestion_health.safe_rollback(db)
+                logger.warning("enrich_trader(%s) DB failure, rolled back: %s", trader.nickname, exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("enrich_trader(%s) failed: %s", trader.nickname, exc)
 
-        # 2. Pull recent trades.
+        # 2. Pull recent trades. One trader's bad data must not abort the rest.
         for trader in traders:
             try:
                 await ingestion.fetch_recent_trades(db, trader, providers)
+            except SQLAlchemyError as exc:
+                ingestion_health.record_failure(f"fetch_recent_trades: {exc}")
+                ingestion_health.safe_rollback(db)
+                logger.warning(
+                    "fetch_recent_trades(%s) DB failure, rolled back: %s",
+                    trader.nickname, exc,
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("fetch_recent_trades(%s) failed: %s", trader.nickname, exc)
 
         # 3. Discover + refresh markets.
-        discovered = await ingestion.discover_markets(db, providers)
+        try:
+            discovered = await ingestion.discover_markets(db, providers)
+        except SQLAlchemyError as exc:
+            ingestion_health.record_failure(f"discover_markets: {exc}")
+            ingestion_health.safe_rollback(db)
+            logger.warning("discover_markets DB failure, rolled back: %s", exc)
+            discovered = []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("discover_markets failed: %s", exc)
+            discovered = []
+
         existing_markets = list(db.scalars(select(Market)))
         refresh_targets = {market.id: market for market in [*discovered, *existing_markets]}
         for market in refresh_targets.values():
             try:
                 await ingestion.refresh_market(db, market, providers)
+            except SQLAlchemyError as exc:
+                ingestion_health.record_failure(f"refresh_market: {exc}")
+                ingestion_health.safe_rollback(db)
+                logger.warning("refresh_market(%s) DB failure, rolled back: %s", market.slug, exc)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("refresh_market(%s) failed: %s", market.slug, exc)
 
@@ -67,15 +93,41 @@ async def run_scan_once() -> ScanResult:
         scanned_markets = len(existing_markets)
 
         # 4. Generate signals.
-        new_signals = await signal_engine.generate_signals(db, providers)
+        try:
+            new_signals = await signal_engine.generate_signals(db, providers)
+        except SQLAlchemyError as exc:
+            ingestion_health.record_failure(f"generate_signals: {exc}")
+            ingestion_health.safe_rollback(db)
+            logger.exception("generate_signals DB failure, rolled back")
+            new_signals = []
 
         # 5. Dispatch alerts for each new signal.
         new_alerts = 0
         for sig in new_signals:
-            alerts = dispatcher.dispatch(db, sig)
-            new_alerts += len(alerts)
+            try:
+                alerts = dispatcher.dispatch(db, sig)
+                new_alerts += len(alerts)
+            except SQLAlchemyError as exc:
+                ingestion_health.record_failure(f"dispatch_alert: {exc}")
+                ingestion_health.safe_rollback(db)
+                logger.warning("alert dispatch DB failure for signal=%s: %s", sig.id, exc)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("alert dispatch failed for signal=%s: %s", sig.id, exc)
 
-        db.commit()
+        try:
+            db.commit()
+        except SQLAlchemyError as exc:
+            ingestion_health.record_failure(f"scan_commit: {exc}")
+            ingestion_health.safe_rollback(db)
+            logger.exception("scan commit failed, rolled back")
+            # Return what we know — the scanner loop must not crash.
+            return ScanResult(
+                scanned_markets=scanned_markets,
+                scanned_traders=len(traders),
+                new_signals=0,
+                new_alerts=0,
+                duration_seconds=round(time.perf_counter() - started, 3),
+            )
 
         return ScanResult(
             scanned_markets=scanned_markets,
@@ -85,7 +137,7 @@ async def run_scan_once() -> ScanResult:
             duration_seconds=round(time.perf_counter() - started, 3),
         )
     except Exception:
-        db.rollback()
+        ingestion_health.safe_rollback(db)
         raise
     finally:
         db.close()

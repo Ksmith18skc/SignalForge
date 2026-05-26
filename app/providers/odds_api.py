@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 
 import httpx
 
+logger = logging.getLogger(__name__)
+
 
 class OddsApiError(RuntimeError):
     """Raised for Odds-API configuration or upstream failures."""
+
+
+class OddsApiRateLimited(OddsApiError):
+    """Raised when Odds-API returns HTTP 429.
+
+    Callers (especially the centralized cache) should fall back to stale
+    data rather than failing edge generation. The exception carries the
+    Retry-After header (seconds) when present so consumers can pace retries.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 class OddsApiProvider:
@@ -43,12 +60,46 @@ class OddsApiProvider:
         params: dict[str, Any] | None = None,
         *,
         auth: bool = True,
+        max_retries: int = 2,
     ) -> Any:
+        """GET with 429-aware exponential backoff.
+
+        On the free Odds-API plan, 429s are common. We retry up to `max_retries`
+        times with exponential delays (capped at 8s), preferring the upstream's
+        Retry-After header when present. After the final attempt we raise
+        OddsApiRateLimited so callers can serve stale cache instead of crashing.
+        """
         query = self._auth_params(params) if auth else params
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            response = await client.get(f"{self._base_url}{path}", params=query)
-            response.raise_for_status()
-            return response.json()
+        delay = 1.0
+        last_status: int | None = None
+        last_retry_after: float | None = None
+        for attempt in range(max_retries + 1):
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.get(f"{self._base_url}{path}", params=query)
+            if response.status_code != 429:
+                response.raise_for_status()
+                return response.json()
+            # 429 — back off.
+            last_status = 429
+            retry_after_raw = response.headers.get("Retry-After")
+            try:
+                retry_after = float(retry_after_raw) if retry_after_raw else None
+            except (TypeError, ValueError):
+                retry_after = None
+            last_retry_after = retry_after
+            if attempt >= max_retries:
+                break
+            sleep_for = min(retry_after or delay, 8.0)
+            logger.warning(
+                "Odds-API 429 on %s (attempt %d/%d) — sleeping %.1fs",
+                path, attempt + 1, max_retries + 1, sleep_for,
+            )
+            await asyncio.sleep(sleep_for)
+            delay *= 2
+        raise OddsApiRateLimited(
+            f"Odds-API returned 429 on {path} after {max_retries + 1} attempts",
+            retry_after=last_retry_after,
+        )
 
     async def sports(self) -> list[dict[str, Any]]:
         return await self._get("/sports", auth=False)
