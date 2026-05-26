@@ -189,6 +189,52 @@ If you don't want the HTTP server but still want signals generated on a loop:
 python -m scripts.run_worker
 ```
 
+### Statcast cache worker
+
+`pybaseball` is heavy. It can allocate large pandas DataFrames and make slow
+Statcast network pulls, so live pybaseball requests are disabled by default and
+should stay disabled on Render web services:
+
+```env
+SIGNALFORGE_ALLOW_LIVE_PYBASEBALL_REQUESTS=false
+SIGNALFORGE_STATCAST_CACHE_LAST_N_DAYS=14
+SIGNALFORGE_MAX_LIVE_STATCAST_DAYS=7
+SIGNALFORGE_MAX_LIVE_STATCAST_ROWS=500
+```
+
+The web service should only read cached Statcast summaries:
+
+```bash
+uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+```
+
+Run Statcast pulls outside the web process with a Render background worker,
+cron job, or local/manual worker:
+
+```bash
+python -m scripts.update_statcast_cache
+```
+
+The worker defaults to the last 14 days and targets probable pitchers. You can
+also pass explicit IDs:
+
+```bash
+python -m scripts.update_statcast_cache --pitcher-id 592789 --batter-id 592450
+```
+
+Safe API reads:
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/baseball/pitchers/{pitcher_id}/statcast-summary` | Cached pitcher Statcast summary |
+| GET | `/baseball/batters/{batter_id}/statcast-summary` | Cached batter Statcast summary |
+| GET | `/baseball/statcast-cache/status` | Cache row counts and latest update |
+
+If a future MLB edge/daily-card workflow needs Statcast, use
+`app.services.mlb_edge.statcast_context()`. It only reads cache rows; when a
+summary is missing it downgrades confidence and returns a warning instead of
+calling pybaseball from the web process.
+
 ---
 
 ## Tests

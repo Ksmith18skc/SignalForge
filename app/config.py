@@ -91,6 +91,11 @@ class Settings(BaseSettings):
     weather_api_key: str | None = None
     weather_api_base_url: str = "https://api.weatherapi.com/v1"
     pybaseball_enabled: bool = True
+    allow_live_pybaseball_requests: bool = False
+    statcast_cache_last_n_days: int = 14
+    statcast_cache_player_ids: str = ""
+    max_live_statcast_days: int = 7
+    max_live_statcast_rows: int = 500
 
     # --- alert channels ---
     discord_webhook_url: str | None = None

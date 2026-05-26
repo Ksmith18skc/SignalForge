@@ -182,3 +182,45 @@ class MarketSnapshot(Base):
     captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     market: Mapped[Market] = relationship(back_populates="snapshots")
+
+
+class PitcherStatcastSummary(Base):
+    __tablename__ = "pitcher_statcast_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    player_id: Mapped[int] = mapped_column(Integer, index=True)
+    player_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    season: Mapped[int] = mapped_column(Integer, index=True)
+    last_n_days: Mapped[int] = mapped_column(Integer, index=True)
+    games: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    innings_pitched: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strikeouts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    walks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitch_count_avg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strikeouts_per_start: Mapped[float | None] = mapped_column(Float, nullable=True)
+    whiff_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    chase_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    k_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    source: Mapped[str] = mapped_column(String(32), default="pybaseball")
+
+
+class BatterStatcastSummary(Base):
+    __tablename__ = "batter_statcast_summaries"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    player_id: Mapped[int] = mapped_column(Integer, index=True)
+    player_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    season: Mapped[int] = mapped_column(Integer, index=True)
+    last_n_days: Mapped[int] = mapped_column(Integer, index=True)
+    games: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    innings_pitched: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strikeouts: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    walks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pitch_count_avg: Mapped[float | None] = mapped_column(Float, nullable=True)
+    strikeouts_per_start: Mapped[float | None] = mapped_column(Float, nullable=True)
+    whiff_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    chase_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    k_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+    source: Mapped[str] = mapped_column(String(32), default="pybaseball")
