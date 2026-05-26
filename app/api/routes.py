@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.models import Alert, Market, Position, Signal, Trade, Trader
 from app.providers.falcon import FalconProvider, get_falcon_health
+from app.providers.mlb_stats_api import MlbStatsApiError, MlbStatsApiProvider
 from app.providers.odds_api import OddsApiError, OddsApiProvider
 from app.schemas import (
     AlertOut,
@@ -73,6 +74,10 @@ def health() -> dict[str, object]:
                 "configured": s.has_odds_api_credentials(),
                 "base_url": s.odds_api_base_url,
                 "bookmakers": [b.strip() for b in s.odds_bookmakers.split(",") if b.strip()],
+            },
+            "mlb_stats_api": {
+                "configured": s.mlb_stats_enabled,
+                "requires_api_key": False,
             },
         },
         "alerts": {
@@ -333,6 +338,157 @@ async def odds_movements(
         return await _odds_provider().odds_movements(event_id, bookmaker, market, market_line)
     except Exception as exc:  # noqa: BLE001
         raise _odds_error(exc) from exc
+
+
+# ---------------------------- MLB StatsAPI ----------------------------------
+
+
+def _mlb_provider() -> MlbStatsApiProvider:
+    if not get_settings().mlb_stats_enabled:
+        raise HTTPException(status_code=503, detail="MLB StatsAPI integration is disabled")
+    return MlbStatsApiProvider()
+
+
+def _mlb_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, MlbStatsApiError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+
+
+@router.get("/mlb/schedule")
+async def mlb_schedule(
+    game_date: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    team_id: int | None = None,
+    season: int | None = None,
+) -> dict[str, object]:
+    """Return MLB schedule data, including probable pitchers when available."""
+    try:
+        return await _mlb_provider().schedule(
+            game_date=game_date,
+            start_date=start_date,
+            end_date=end_date,
+            team_id=team_id,
+            season=season,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/games/live")
+async def mlb_live_scores(game_date: str | None = None) -> dict[str, object]:
+    """Return compact MLB game status and live score summaries."""
+    try:
+        return await _mlb_provider().live_scores(game_date=game_date)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/games/{game_pk}")
+async def mlb_game(game_pk: int) -> dict[str, object]:
+    try:
+        return await _mlb_provider().game(game_pk)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/games/{game_pk}/linescore")
+async def mlb_linescore(game_pk: int) -> dict[str, object]:
+    try:
+        return await _mlb_provider().linescore(game_pk)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/games/{game_pk}/boxscore")
+async def mlb_boxscore(game_pk: int) -> dict[str, object]:
+    try:
+        return await _mlb_provider().boxscore(game_pk)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/games/{game_pk}/lineups")
+async def mlb_lineups(game_pk: int) -> dict[str, object]:
+    try:
+        return await _mlb_provider().lineups(game_pk)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/probable-pitchers")
+async def mlb_probable_pitchers(game_date: str | None = None) -> dict[str, object]:
+    try:
+        return await _mlb_provider().probable_pitchers(game_date=game_date)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/teams")
+async def mlb_teams(season: int | None = None) -> dict[str, object]:
+    try:
+        return await _mlb_provider().teams(season=season)
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/teams/{team_id}/stats")
+async def mlb_team_stats(
+    team_id: int,
+    season: int,
+    group: str = "hitting",
+    stats: str = "season",
+    game_type: str = "R",
+) -> dict[str, object]:
+    try:
+        return await _mlb_provider().team_stats(
+            team_id,
+            season=season,
+            group=group,
+            stats=stats,
+            game_type=game_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/players/{person_id}/stats")
+async def mlb_player_stats(
+    person_id: int,
+    season: int,
+    group: str = "hitting",
+    stats: str = "season",
+    game_type: str = "R",
+) -> dict[str, object]:
+    try:
+        return await _mlb_provider().player_stats(
+            person_id,
+            season=season,
+            group=group,
+            stats=stats,
+            game_type=game_type,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
+
+
+@router.get("/mlb/history")
+async def mlb_history(
+    start_date: str,
+    end_date: str,
+    team_id: int | None = None,
+) -> dict[str, object]:
+    try:
+        return await _mlb_provider().historical_games(
+            start_date=start_date,
+            end_date=end_date,
+            team_id=team_id,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _mlb_error(exc) from exc
 
 
 # ---------------------------- bot helpers -----------------------------------

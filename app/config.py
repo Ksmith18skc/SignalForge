@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     odds_api_base_url: str = "https://api.odds-api.io/v3"
     odds_bookmakers: str = "DraftKings,FanDuel,BetMGM,Caesars"
     odds_default_sports: str = "basketball,baseball,american-football,ice-hockey"
+    mlb_stats_enabled: bool = True
 
     # --- alert channels ---
     discord_webhook_url: str | None = None
