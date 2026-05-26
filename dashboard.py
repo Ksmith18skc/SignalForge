@@ -715,7 +715,10 @@ def render_edge_card(edge: dict[str, Any]) -> None:
       {reasons_html}
       <div class="sf-card-row"><span class="k">Action:</span>{action}</div>
       <div class="sf-card-row" style="margin-top:6px;">{source_badges}{warn_badges}</div>
-            {render_link_buttons([("Source", edge.get("source_url"))])}
+            {render_link_buttons([
+                ("Open Market", edge.get("market_url")),
+                ("Source", edge.get("source_url")),
+            ])}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
