@@ -16,6 +16,8 @@ from app.models import Alert, Market, Position, Signal, Trade, Trader
 from app.providers.falcon import FalconProvider, get_falcon_health
 from app.providers.mlb_stats_api import MlbStatsApiError, MlbStatsApiProvider
 from app.providers.odds_api import OddsApiError, OddsApiProvider
+from app.providers.pybaseball_provider import PyBaseballError, PyBaseballProvider
+from app.providers.weather_api import WeatherApiError, WeatherApiProvider
 from app.schemas import (
     AlertOut,
     DashboardSummary,
@@ -77,6 +79,14 @@ def health() -> dict[str, object]:
             },
             "mlb_stats_api": {
                 "configured": s.mlb_stats_enabled,
+                "requires_api_key": False,
+            },
+            "weather_api": {
+                "configured": s.has_weather_api_credentials(),
+                "base_url": s.weather_api_base_url,
+            },
+            "pybaseball": {
+                "configured": s.pybaseball_enabled,
                 "requires_api_key": False,
             },
         },
@@ -489,6 +499,183 @@ async def mlb_history(
         )
     except Exception as exc:  # noqa: BLE001
         raise _mlb_error(exc) from exc
+
+
+# ---------------------------- weather ---------------------------------------
+
+
+def _weather_provider() -> WeatherApiProvider:
+    s = get_settings()
+    return WeatherApiProvider(s.weather_api_key, s.weather_api_base_url)
+
+
+def _weather_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, WeatherApiError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if hasattr(exc, "response"):
+        response = exc.response  # type: ignore[attr-defined]
+        return HTTPException(status_code=response.status_code, detail=response.text[:500])
+    return HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+
+
+@router.get("/weather/current")
+async def weather_current(q: str) -> dict[str, object]:
+    try:
+        return await _weather_provider().current(q)
+    except Exception as exc:  # noqa: BLE001
+        raise _weather_error(exc) from exc
+
+
+@router.get("/weather/forecast")
+async def weather_forecast(
+    q: str,
+    days: int = 1,
+    dt: str | None = None,
+    hour: int | None = None,
+) -> dict[str, object]:
+    try:
+        return await _weather_provider().forecast(q, days=days, dt=dt, hour=hour)
+    except Exception as exc:  # noqa: BLE001
+        raise _weather_error(exc) from exc
+
+
+@router.get("/weather/history")
+async def weather_history(
+    q: str,
+    dt: str,
+    hour: int | None = None,
+    end_dt: str | None = None,
+) -> dict[str, object]:
+    try:
+        return await _weather_provider().history(q, dt=dt, hour=hour, end_dt=end_dt)
+    except Exception as exc:  # noqa: BLE001
+        raise _weather_error(exc) from exc
+
+
+@router.get("/weather/baseball")
+async def weather_baseball(
+    q: str,
+    game_date: str | None = None,
+    hour: int | None = None,
+) -> dict[str, object]:
+    """Return compact weather fields that matter for baseball run totals."""
+    try:
+        return await _weather_provider().baseball_weather(q, game_date=game_date, hour=hour)
+    except Exception as exc:  # noqa: BLE001
+        raise _weather_error(exc) from exc
+
+
+# ---------------------------- pybaseball ------------------------------------
+
+
+def _pybaseball_provider() -> PyBaseballProvider:
+    if not get_settings().pybaseball_enabled:
+        raise HTTPException(status_code=503, detail="pybaseball integration is disabled")
+    return PyBaseballProvider()
+
+
+def _pybaseball_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    if isinstance(exc, PyBaseballError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+
+
+@router.get("/baseball/player-lookup")
+async def baseball_player_lookup(first: str, last: str) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().player_lookup(first, last)
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/statcast")
+async def baseball_statcast(
+    start_dt: str,
+    end_dt: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().statcast(start_dt, end_dt, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/pitchers/{pitcher_id}/statcast")
+async def baseball_pitcher_statcast(
+    pitcher_id: int,
+    start_dt: str,
+    end_dt: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().pitcher_statcast(
+            pitcher_id,
+            start_dt,
+            end_dt,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/batters/{batter_id}/statcast")
+async def baseball_batter_statcast(
+    batter_id: int,
+    start_dt: str,
+    end_dt: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().batter_statcast(
+            batter_id,
+            start_dt,
+            end_dt,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/pitching-stats")
+async def baseball_pitching_stats(
+    start_season: int,
+    end_season: int | None = None,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().pitching_stats(start_season, end_season)
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/batting-stats")
+async def baseball_batting_stats(
+    start_season: int,
+    end_season: int | None = None,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().batting_stats(start_season, end_season)
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
+
+
+@router.get("/baseball/players/{player_id}/splits")
+async def baseball_player_splits(
+    player_id: str,
+    season: int | None = None,
+    pitching_splits: bool = False,
+    limit: int = 500,
+) -> list[dict[str, object]]:
+    try:
+        return await _pybaseball_provider().player_splits(
+            player_id,
+            season=season,
+            pitching_splits=pitching_splits,
+            limit=limit,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _pybaseball_error(exc) from exc
 
 
 # ---------------------------- bot helpers -----------------------------------

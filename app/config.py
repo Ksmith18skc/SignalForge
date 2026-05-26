@@ -88,6 +88,9 @@ class Settings(BaseSettings):
     odds_bookmakers: str = "DraftKings,FanDuel,BetMGM,Caesars"
     odds_default_sports: str = "basketball,baseball,american-football,ice-hockey"
     mlb_stats_enabled: bool = True
+    weather_api_key: str | None = None
+    weather_api_base_url: str = "https://api.weatherapi.com/v1"
+    pybaseball_enabled: bool = True
 
     # --- alert channels ---
     discord_webhook_url: str | None = None
@@ -123,6 +126,9 @@ class Settings(BaseSettings):
 
     def has_odds_api_credentials(self) -> bool:
         return bool(self.odds_api_key)
+
+    def has_weather_api_credentials(self) -> bool:
+        return bool(self.weather_api_key)
 
 
 @lru_cache(maxsize=1)
