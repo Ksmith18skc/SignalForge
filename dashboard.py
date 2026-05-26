@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import re
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Iterable
 
 import httpx
@@ -525,13 +526,8 @@ def fmt_event_time(value: Any, *, now: datetime | None = None) -> str:
     dt = _parse_dt(value)
     if not dt:
         return DASH
-    now = (now or datetime.now(timezone.utc)).astimezone()
-    local = dt.astimezone()
-    if local.date() == now.date():
-        return f"Today {local.strftime('%-I:%M %p') if os.name != 'nt' else local.strftime('%I:%M %p').lstrip('0')}"
-    if local.date() == (now + timedelta(days=1)).date():
-        return f"Tomorrow {local.strftime('%-I:%M %p') if os.name != 'nt' else local.strftime('%I:%M %p').lstrip('0')}"
-    return local.strftime("%b %d %I:%M %p").replace(" 0", " ")
+    local = dt.astimezone(ZoneInfo("America/Phoenix"))
+    return local.strftime("%b %d, %Y %I:%M %p MST").replace(" 0", " ")
 
 
 def shorten_wallet(addr: str | None) -> str:
@@ -1300,13 +1296,13 @@ mkt_badge = badge(
     f"MLB games today: {mlb_count}",
     "green" if mlb_count > 0 else "muted",
 )
+tz_mst = ZoneInfo("America/Phoenix")
 now_utc = datetime.now(timezone.utc)
-now_local = now_utc.astimezone()
+now_local = now_utc.astimezone(tz_mst)
 prev_refresh = st.session_state.get("_last_dashboard_refresh_at")
 st.session_state["_last_dashboard_refresh_at"] = now_utc.isoformat()
 last_refresh_age = fmt_relative(prev_refresh, now=now_utc) if prev_refresh else "just now"
-local_label = now_local.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
-utc_label = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+local_label = now_local.strftime("%b %d, %Y %I:%M %p MST").replace(" 0", " ")
 health_label = fmt_dt(health.get("timestamp"))
 
 st.markdown(
@@ -1319,8 +1315,7 @@ st.markdown(
       </div>
       <div>
         {backend_badge}{mkt_badge}{odds_cache_badge}
-                <div class='sf-meta' style='margin-top:6px;'>Local: {local_label}</div>
-                <div class='sf-meta'>UTC: {utc_label}</div>
+                <div class='sf-meta' style='margin-top:6px;'>MST: {local_label}</div>
                 <div class='sf-meta'>Last refresh: {last_refresh_age}</div>
                 <div class='sf-meta'>Backend health: {health_label}</div>
       </div>
