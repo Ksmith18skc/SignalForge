@@ -1306,6 +1306,43 @@ def aggregate_signals_to_positions(signals: list[dict[str, Any]]) -> list[dict[s
     return sorted(positions, key=lambda p: (p.get("score") or 0.0), reverse=True)
 
 
+def position_watchlist_notes(position: dict[str, Any]) -> str:
+    notes: list[str] = []
+    wallets = int(position.get("consensus_wallets") or 0)
+    events = int(position.get("signal_count") or 0)
+    total_size = _as_float(position.get("consensus_total_size")) or _as_float(position.get("size_usd")) or 0.0
+    signal_type = str(position.get("signal_type") or "")
+    largest = position.get("consensus_largest") or DASH
+
+    if wallets >= 3:
+        notes.append(f"{wallets} tracked wallets aligned")
+    elif wallets == 2:
+        notes.append("2-wallet consensus")
+    elif wallets == 1:
+        notes.append(f"single wallet: {largest}")
+
+    if events > wallets and events > 1:
+        notes.append(f"{events} aggregated events")
+    if total_size >= 2500:
+        notes.append(f"large tracked size {fmt_money(total_size)}")
+    elif total_size >= 1000:
+        notes.append(f"meaningful size {fmt_money(total_size)}")
+
+    signal_bits = []
+    if "multi_wallet_consensus" in signal_type:
+        signal_bits.append("consensus")
+    if "size_threshold" in signal_type:
+        signal_bits.append("size threshold")
+    if "trusted_wallet_entry" in signal_type:
+        signal_bits.append("trusted entry")
+    if signal_bits:
+        notes.append("signals: " + ", ".join(signal_bits))
+
+    if not notes:
+        notes.append(position.get("reason") or "tracked wallet activity")
+    return " | ".join(notes)
+
+
 # =============================================================================
 # Bail early if backend offline
 # =============================================================================
@@ -2143,6 +2180,68 @@ with tab_watchlist:
                         action_run_wallet_scan()
                     st.cache_data.clear()
                     st.rerun()
+
+    st.markdown("### Active wallet positions")
+    watchlist_positions = sorted(
+        positions_all,
+        key=lambda p: (
+            _as_float(p.get("confidence")) or 0.0,
+            _as_float(p.get("score")) or 0.0,
+            _as_float(p.get("consensus_total_size")) or _as_float(p.get("size_usd")) or 0.0,
+        ),
+        reverse=True,
+    )
+    if watchlist_positions:
+        rows = []
+        for p in watchlist_positions:
+            wallet_disp = p.get("wallet") if show_full_wallet else shorten_wallet(p.get("wallet"))
+            rows.append({
+                "confidence": p.get("confidence") or 0.0,
+                "score": p.get("score") or 0.0,
+                "trader": p.get("trader_nickname") or DASH,
+                "wallet": wallet_disp or DASH,
+                "league": p.get("league") or DASH,
+                "matchup": p.get("matchup") or _market_label(p),
+                "contract": p.get("contract") or DASH,
+                "position": " ".join(
+                    str(part) for part in (p.get("side"), p.get("outcome")) if part
+                ) or p.get("consensus_direction") or DASH,
+                "avg_entry": p.get("entry_price"),
+                "tracked_size": p.get("consensus_total_size") or p.get("size_usd"),
+                "wallets": p.get("consensus_wallets") or 1,
+                "events": p.get("signal_count") or 1,
+                "source": p.get("source") or DASH,
+                "notes": position_watchlist_notes(p),
+                "market": p.get("market_url"),
+                "trader_profile": p.get("trader_url"),
+            })
+        df_watch_positions = pd.DataFrame(rows).fillna(DASH)
+        st.dataframe(
+            df_watch_positions,
+            use_container_width=True,
+            hide_index=True,
+            height=min(620, 60 + 32 * len(df_watch_positions)),
+            column_config={
+                "confidence": st.column_config.ProgressColumn(
+                    "confidence", min_value=0, max_value=100, format="%.1f"
+                ),
+                "score": st.column_config.ProgressColumn(
+                    "score", min_value=0, max_value=100, format="%.1f"
+                ),
+                "avg_entry": st.column_config.NumberColumn("avg entry", format="%.3f"),
+                "tracked_size": st.column_config.NumberColumn("tracked size", format="$%.0f"),
+                "wallets": st.column_config.NumberColumn("wallets", format="%d"),
+                "events": st.column_config.NumberColumn("events", format="%d"),
+                "market": st.column_config.LinkColumn("market", display_text="open"),
+                "trader_profile": st.column_config.LinkColumn("trader", display_text="profile"),
+            },
+        )
+    else:
+        render_empty_state(
+            "No active wallet positions.",
+            "Run a wallet scan to populate tracked wallet positions.",
+            actions=[("Run wallet scan", action_run_wallet_scan)],
+        )
 
     st.markdown("### Remove wallets")
     if not traders:
