@@ -6,6 +6,7 @@ import logging
 from collections.abc import Generator
 
 from sqlalchemy import create_engine, event, inspect, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
@@ -82,11 +83,9 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
-        _add_sqlite_column_if_missing("mlb_edges", "normalized_market_name", "VARCHAR(256)")
-        _add_sqlite_column_if_missing("mlb_edges", "market_scope", "VARCHAR(32)")
-        _add_sqlite_column_if_missing("mlb_edges", "is_valid", "BOOLEAN DEFAULT 1")
-        _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
+        _ensure_mlb_edge_validation_columns()
     if _is_postgres:
+        _ensure_mlb_edge_validation_columns()
         _ensure_postgres_trades_external_id_is_text()
 
 
@@ -96,8 +95,47 @@ def _add_sqlite_column_if_missing(table: str, column: str, ddl: str) -> None:
         return
     if column in {col["name"] for col in inspector.get_columns(table)}:
         return
-    with engine.begin() as conn:
-        conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"))
+    except SQLAlchemyError as exc:
+        if "duplicate column" in str(exc).lower() or "already exists" in str(exc).lower():
+            logger.info("Column %s.%s already exists; skipping migration", table, column)
+            return
+        raise
+
+
+def _ensure_mlb_edge_validation_columns() -> None:
+    """Backfill MLB validation columns on existing deployments.
+
+    SQLAlchemy's create_all creates missing tables only; it does not alter an
+    existing mlb_edges table. Render Postgres deployments created before the
+    validation fields need these ALTER TABLE statements at startup.
+    """
+    inspector = inspect(engine)
+    if "mlb_edges" not in inspector.get_table_names():
+        return
+    dialect = engine.dialect.name
+    if dialect == "sqlite":
+        _add_sqlite_column_if_missing("mlb_edges", "normalized_market_name", "TEXT")
+        _add_sqlite_column_if_missing("mlb_edges", "market_scope", "VARCHAR(64)")
+        _add_sqlite_column_if_missing("mlb_edges", "is_valid", "BOOLEAN DEFAULT 1")
+        _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
+        return
+    if dialect.startswith("postgres"):
+        statements = [
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS normalized_market_name TEXT",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS market_scope VARCHAR(64)",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS is_valid BOOLEAN DEFAULT TRUE",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS validation_reason TEXT",
+        ]
+        try:
+            with engine.begin() as conn:
+                for statement in statements:
+                    conn.execute(text(statement))
+        except SQLAlchemyError as exc:
+            logger.exception("mlb_edges validation-column migration failed: %s", exc)
+            raise
 
 
 def _ensure_postgres_trades_external_id_is_text() -> None:
