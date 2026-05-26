@@ -18,6 +18,7 @@ from app.models import (
     MlbGameEnvironmentSnapshot,
     MlbOddsSnapshot,
     MlbPitcherPropSnapshot,
+    PitcherPropOddsSnapshot,
 )
 from app.providers.mlb_stats_api import MlbStatsApiProvider
 from app.providers.odds_api import OddsApiProvider
@@ -25,8 +26,9 @@ from app.providers.weather_api import WeatherApiProvider
 from app.services.mlb_edge import statcast_context
 from app.services.mlb_edge_scoring import edge_to_dict
 from app.services.mlb_environment import score_environment
-from app.services.mlb_odds_analysis import analyze_game_totals, analyze_pitcher_k_props
+from app.services.mlb_odds_analysis import analyze_game_totals
 from app.services.mlb_pitcher_k_model import pitcher_k_edges
+from app.services.mlb_prop_odds import consensus_for_pitcher, names_match, normalize_pitcher_strikeout_props
 from app.services.mlb_totals_model import total_edges
 
 logger = logging.getLogger(__name__)
@@ -53,6 +55,14 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
 
         for pitcher in _pitchers(game):
             prop = await _pitcher_prop_for_game(db, odds, game, pitcher)
+            if prop.get("line") is None or not prop.get("rows"):
+                logger.info(
+                    "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
+                    game.get("game_pk"),
+                    pitcher.get("name"),
+                    prop.get("warnings"),
+                )
+                continue
             statcast = statcast_context(
                 db,
                 player_id=pitcher.get("id") or 0,
@@ -220,7 +230,25 @@ async def _pitcher_prop_for_game(
     pitcher: dict[str, Any],
 ) -> dict[str, Any]:
     payload = await _best_effort_odds_payload(odds, game)
-    analysis = analyze_pitcher_k_props(payload, pitcher_name=pitcher.get("name"))
+    prop_lines = normalize_pitcher_strikeout_props(payload)
+    for line in prop_lines:
+        if pitcher.get("name") and not names_match(line.player_name, pitcher.get("name") or ""):
+            continue
+        db.add(
+            PitcherPropOddsSnapshot(
+                game_pk=game["game_pk"],
+                sportsbook_event_id=str(payload.get("id")) if payload else None,
+                player_name=line.player_name,
+                matched_pitcher_name=pitcher.get("name") if pitcher.get("name") else None,
+                line=line.line,
+                over_price=line.over_price,
+                under_price=line.under_price,
+                sportsbook=line.sportsbook,
+                timestamp=line.timestamp,
+                raw=line.raw,
+            )
+        )
+    analysis = consensus_for_pitcher(prop_lines, pitcher.get("name") or "")
     db.add(
         MlbPitcherPropSnapshot(
             game_pk=game["game_pk"],

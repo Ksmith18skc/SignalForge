@@ -16,7 +16,8 @@ from app.db import SessionLocal, init_db
 from app.models import MlbEdge, MlbGame
 from app.providers.odds_api import OddsApiProvider
 from app.services.mlb_edge_engine import _best_effort_odds_payload
-from app.services.mlb_odds_analysis import analyze_game_totals, analyze_pitcher_k_props
+from app.services.mlb_odds_analysis import analyze_game_totals
+from app.services.mlb_prop_odds import consensus_for_pitcher, normalize_pitcher_strikeout_props
 from app.services.mlb_performance import update_closing_line_fields
 
 logger = logging.getLogger(__name__)
@@ -73,7 +74,7 @@ def _candidate_edges(db: Session, window_minutes: int) -> list[tuple[MlbEdge, Ml
 def _analysis_for_edge(edge: MlbEdge, payload: dict[str, Any] | None) -> dict[str, Any]:
     if edge.edge_type == "pitcher_strikeouts":
         pitcher_name = edge.market.split(" Over ")[0].split(" Under ")[0]
-        return analyze_pitcher_k_props(payload, pitcher_name=pitcher_name)
+        return consensus_for_pitcher(normalize_pitcher_strikeout_props(payload), pitcher_name)
     return analyze_game_totals(payload)
 
 

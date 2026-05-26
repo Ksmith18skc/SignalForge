@@ -311,6 +311,23 @@ class MlbPitcherPropSnapshot(Base):
     source: Mapped[str] = mapped_column(String(32), default="odds_api")
 
 
+class PitcherPropOddsSnapshot(Base):
+    __tablename__ = "pitcher_prop_odds_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, index=True)
+    sportsbook_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    player_name: Mapped[str] = mapped_column(String(128), index=True)
+    matched_pitcher_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    line: Mapped[float] = mapped_column(Float)
+    over_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    under_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sportsbook: Mapped[str] = mapped_column(String(64), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    raw: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(32), default="odds_api")
+
+
 class MlbEdge(Base):
     __tablename__ = "mlb_edges"
 

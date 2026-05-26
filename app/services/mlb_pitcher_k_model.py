@@ -39,7 +39,7 @@ def _pitcher_edge(
     warnings = list(prop.get("warnings") or []) + list(statcast.get("warnings") or [])
     summary = statcast.get("summary") or {}
     k_per_start = _num(summary.get("strikeouts_per_start"))
-    line = _num(prop.get("line"))
+    line = _num(prop.get(f"best_{side}_line")) or _num(prop.get("line"))
     recent_form = 50.0
     if k_per_start is not None and line is not None:
         recent_form = 50 + (k_per_start - line) * 8
@@ -72,7 +72,7 @@ def _pitcher_edge(
     return {
         "edge_type": "pitcher_strikeouts",
         "game_pk": game["game_pk"],
-        "market": f"{pitcher.get('name') or 'Pitcher'} {side.title()} {line if line is not None else '?'} Ks",
+        "market": f"{pitcher.get('name') or 'Pitcher'} {side.title()} {line:.1f} Ks",
         "side": side,
         "line": line,
         "best_book": prop.get(f"best_{side}_book"),

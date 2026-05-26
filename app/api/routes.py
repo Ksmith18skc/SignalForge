@@ -24,6 +24,7 @@ from app.models import (
     MlbOddsSnapshot,
     MlbPitcherPropSnapshot,
     PitcherStatcastSummary,
+    PitcherPropOddsSnapshot,
     Position,
     Signal,
     Trade,
@@ -936,9 +937,46 @@ def mlb_debug_sources(db: Session = Depends(get_db)) -> dict[str, object]:
             "environment_snapshots": db.scalar(select(func.count(MlbGameEnvironmentSnapshot.id))) or 0,
             "odds_snapshots": db.scalar(select(func.count(MlbOddsSnapshot.id))) or 0,
             "pitcher_prop_snapshots": db.scalar(select(func.count(MlbPitcherPropSnapshot.id))) or 0,
+            "pitcher_prop_odds_snapshots": db.scalar(select(func.count(PitcherPropOddsSnapshot.id))) or 0,
             "edges": db.scalar(select(func.count(MlbEdge.id))) or 0,
             "daily_cards": db.scalar(select(func.count(MlbDailyCard.id))) or 0,
         },
+    }
+
+
+@router.get("/mlb/debug/pitcher-props")
+def mlb_debug_pitcher_props(
+    game_pk: int | None = None,
+    player_name: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    query = select(PitcherPropOddsSnapshot).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
+    if game_pk is not None:
+        query = select(PitcherPropOddsSnapshot).where(PitcherPropOddsSnapshot.game_pk == game_pk).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
+    if player_name:
+        pattern = f"%{player_name}%"
+        query = select(PitcherPropOddsSnapshot).where(PitcherPropOddsSnapshot.player_name.ilike(pattern)).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
+        if game_pk is not None:
+            query = query.where(PitcherPropOddsSnapshot.game_pk == game_pk)
+    rows = list(db.scalars(query))
+    return {
+        "count": len(rows),
+        "rows": [
+            {
+                "game_pk": row.game_pk,
+                "sportsbook_event_id": row.sportsbook_event_id,
+                "player_name": row.player_name,
+                "matched_pitcher_name": row.matched_pitcher_name,
+                "line": row.line,
+                "over_price": row.over_price,
+                "under_price": row.under_price,
+                "sportsbook": row.sportsbook,
+                "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+                "source": row.source,
+            }
+            for row in rows
+        ],
     }
 
 
