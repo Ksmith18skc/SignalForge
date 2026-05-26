@@ -96,6 +96,8 @@ class Settings(BaseSettings):
     statcast_cache_player_ids: str = ""
     max_live_statcast_days: int = 7
     max_live_statcast_rows: int = 500
+    mlb_discord_min_score: float = 80.0
+    mlb_edge_default_game_date: str | None = None
 
     # --- alert channels ---
     discord_webhook_url: str | None = None

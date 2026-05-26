@@ -209,6 +209,46 @@ def trigger_scan() -> dict[str, Any]:
         return r.json()
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_mlb_edges(limit: int = 100) -> list[dict[str, Any]]:
+    try:
+        with _client() as c:
+            r = c.get("/mlb/edges/today", params={"limit": limit})
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError:
+        return []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_mlb_daily_card() -> dict[str, Any] | None:
+    try:
+        with _client() as c:
+            r = c.get("/mlb/daily-card")
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError:
+        return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_mlb_sources() -> dict[str, Any] | None:
+    try:
+        with _client() as c:
+            r = c.get("/mlb/debug/sources")
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPError:
+        return None
+
+
+def trigger_mlb_edge_run() -> dict[str, Any]:
+    with _client() as c:
+        r = c.post("/mlb/edges/run", timeout=180.0)
+        r.raise_for_status()
+        return r.json()
+
+
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
@@ -447,6 +487,9 @@ traders = fetch_traders()
 signals_all = fetch_signals(limit=500)
 positions_all = aggregate_signals_to_positions(signals_all)
 alerts_all = fetch_alerts(limit=200)
+mlb_edges_all = fetch_mlb_edges(limit=100)
+mlb_daily_card = fetch_mlb_daily_card()
+mlb_sources = fetch_mlb_sources()
 
 
 # ----------------------------------------------------------------------------
@@ -663,8 +706,8 @@ st.divider()
 # Tabs: signals / traders / alerts / health
 # ----------------------------------------------------------------------------
 
-tab_signals, tab_traders, tab_alerts, tab_health = st.tabs(
-    ["Positions", "Watched Traders", "Alerts", "Health"]
+tab_signals, tab_mlb, tab_traders, tab_alerts, tab_health = st.tabs(
+    ["Positions", "MLB", "Watched Traders", "Alerts", "Health"]
 )
 
 with tab_signals:
@@ -715,6 +758,92 @@ with tab_signals:
         )
     else:
         st.info("No signals match. Try widening the score range or clearing filters.")
+
+with tab_mlb:
+    col_a, col_b, col_c = st.columns([1, 1, 2])
+    col_a.metric("MLB edges", len(mlb_edges_all))
+    col_b.metric(
+        "High-value",
+        sum(1 for e in mlb_edges_all if (e.get("score") or 0) >= 80),
+    )
+    if col_c.button("Run MLB scan", type="primary", width="stretch"):
+        with st.spinner("Running MLB edge engine..."):
+            try:
+                result = trigger_mlb_edge_run()
+                st.success(
+                    f"Generated {result.get('edges', 0)} edges across "
+                    f"{result.get('games', 0)} games."
+                )
+                st.cache_data.clear()
+                st.rerun()
+            except httpx.HTTPError as exc:
+                st.error(f"MLB scan failed: {exc}")
+
+    st.markdown("#### Daily card")
+    if mlb_daily_card:
+        card_cols = st.columns(3)
+        card_cols[0].markdown("**Top totals**")
+        card_cols[0].dataframe(
+            pd.DataFrame(mlb_daily_card.get("top_game_totals") or [])[
+                ["market", "side", "line", "best_book", "best_price", "score", "action"]
+            ] if mlb_daily_card.get("top_game_totals") else pd.DataFrame(),
+            width="stretch",
+            hide_index=True,
+        )
+        card_cols[1].markdown("**Top pitcher Ks**")
+        card_cols[1].dataframe(
+            pd.DataFrame(mlb_daily_card.get("top_pitcher_strikeouts") or [])[
+                ["market", "side", "line", "best_book", "best_price", "score", "action"]
+            ] if mlb_daily_card.get("top_pitcher_strikeouts") else pd.DataFrame(),
+            width="stretch",
+            hide_index=True,
+        )
+        card_cols[2].markdown("**Near misses**")
+        card_cols[2].dataframe(
+            pd.DataFrame(mlb_daily_card.get("near_misses") or [])[
+                ["market", "side", "score", "action"]
+            ] if mlb_daily_card.get("near_misses") else pd.DataFrame(),
+            width="stretch",
+            hide_index=True,
+        )
+        st.json(mlb_daily_card.get("data_quality_summary") or {})
+    else:
+        st.info("No MLB daily card yet. Run the MLB scan.")
+
+    st.markdown("#### Totals and pitcher K edges")
+    if mlb_edges_all:
+        df_mlb = pd.DataFrame(
+            [
+                {
+                    "score": e.get("score"),
+                    "confidence": e.get("confidence"),
+                    "type": e.get("edge_type"),
+                    "market": e.get("market"),
+                    "side": e.get("side"),
+                    "line": e.get("line"),
+                    "best_book": e.get("best_book"),
+                    "best_price": e.get("best_price"),
+                    "action": e.get("action"),
+                    "chase_risk": e.get("chase_risk"),
+                    "warnings": "; ".join(e.get("warnings") or []),
+                }
+                for e in mlb_edges_all
+            ]
+        )
+        st.dataframe(
+            df_mlb,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "score": st.column_config.ProgressColumn("score", min_value=0, max_value=100),
+                "best_price": st.column_config.NumberColumn("best price", format="%.3f"),
+            },
+        )
+    else:
+        st.info("No MLB edges available yet.")
+
+    st.markdown("#### Data source health")
+    st.json(mlb_sources or {})
 
 with tab_traders:
     st.markdown("#### Add wallet")

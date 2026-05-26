@@ -235,6 +235,56 @@ If a future MLB edge/daily-card workflow needs Statcast, use
 summary is missing it downgrades confidence and returns a warning instead of
 calling pybaseball from the web process.
 
+### MLB edge engine
+
+SignalForge can generate a daily MLB analytics card for full-game totals and
+pitcher strikeout props. This is an edge-scoring system only; it does not place
+bets and never treats a candidate as guaranteed.
+
+The engine combines:
+
+- Odds-API.io: totals, player props, line comparison, book disagreement
+- MLB StatsAPI: daily schedule, probable pitchers, game status
+- WeatherAPI: wind, temperature, humidity, precipitation
+- Cached Statcast summaries: pitcher recent form
+- SignalForge smart-money infrastructure as a scoring placeholder for now
+
+Run on demand:
+
+```bash
+curl -X POST http://localhost:8000/mlb/edges/run
+```
+
+Read results:
+
+| Method | Path | Purpose |
+| ------ | ---- | ------- |
+| GET | `/mlb/edges/today` | Ranked MLB edges for today's card |
+| POST | `/mlb/edges/run` | Generate today's MLB edges/card |
+| GET | `/mlb/edges/{edge_id}` | Edge detail plus Discord-ready summary when high-value |
+| GET | `/mlb/daily-card` | Top 5 totals, top 5 K props, near misses, pass list |
+| GET | `/mlb/games/{game_pk}/edge-summary` | Game-level edge/environment summary |
+| GET | `/mlb/debug/sources` | Provider/cache health for MLB engine |
+
+Useful env vars:
+
+```env
+SIGNALFORGE_MLB_DISCORD_MIN_SCORE=80
+SIGNALFORGE_ODDS_API_KEY=...
+SIGNALFORGE_WEATHER_API_KEY=...
+SIGNALFORGE_ALLOW_LIVE_PYBASEBALL_REQUESTS=false
+```
+
+Score actions:
+
+- `<65`: Pass
+- `65-74`: Watch
+- `75-84`: Bettable only at price
+- `85+`: Strong candidate
+
+The dashboard includes an **MLB** tab with a run button, current edges, daily
+card, and source health.
+
 ---
 
 ## Tests

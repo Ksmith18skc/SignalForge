@@ -17,6 +17,12 @@ from app.models import (
     Alert,
     BatterStatcastSummary,
     Market,
+    MlbDailyCard,
+    MlbEdge,
+    MlbGame,
+    MlbGameEnvironmentSnapshot,
+    MlbOddsSnapshot,
+    MlbPitcherPropSnapshot,
     PitcherStatcastSummary,
     Position,
     Signal,
@@ -40,6 +46,13 @@ from app.schemas import (
 )
 from app.services.scanner import run_scan_once
 from app.services.alerts import DISCORD_TIERS, evaluate_alert_decision
+from app.services.mlb_edge_engine import (
+    discord_ready_summary,
+    edge_to_dict,
+    edges_for_date,
+    latest_daily_card,
+    run_daily_mlb_edges,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -805,6 +818,139 @@ def baseball_statcast_cache_status(db: Session = Depends(get_db)) -> dict[str, o
         "latest_pitcher_updated_at": latest_pitcher.isoformat() if latest_pitcher else None,
         "latest_batter_updated_at": latest_batter.isoformat() if latest_batter else None,
         "live_pybaseball_requests_allowed": get_settings().allow_live_pybaseball_requests,
+    }
+
+
+# ---------------------------- MLB edge engine --------------------------------
+
+
+@router.get("/mlb/edges/today")
+def mlb_edges_today(
+    game_date: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    target = game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
+    return edges_for_date(db, card_date=target, limit=limit)
+
+
+@router.post("/mlb/edges/run")
+async def mlb_edges_run(
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    try:
+        return await run_daily_mlb_edges(db, game_date=game_date)
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.exception("MLB edge run failed")
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
+
+
+@router.get("/mlb/edges/{edge_id}")
+def mlb_edge_detail(edge_id: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    edge = db.get(MlbEdge, edge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail=f"MLB edge {edge_id} not found")
+    payload = edge_to_dict(edge)
+    payload["discord_summary"] = (
+        discord_ready_summary(edge)
+        if edge.score >= get_settings().mlb_discord_min_score
+        else None
+    )
+    return payload
+
+
+@router.get("/mlb/daily-card")
+def mlb_daily_card(
+    game_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    target = game_date or get_settings().mlb_edge_default_game_date
+    card = latest_daily_card(db, card_date=target)
+    if card is None:
+        raise HTTPException(
+            status_code=404,
+            detail="No MLB daily card found. Run POST /mlb/edges/run first.",
+        )
+    return card
+
+
+@router.get("/mlb/games/{game_pk}/edge-summary")
+def mlb_game_edge_summary(game_pk: int, db: Session = Depends(get_db)) -> dict[str, object]:
+    game = db.scalar(select(MlbGame).where(MlbGame.game_pk == game_pk))
+    edges = list(
+        db.scalars(
+            select(MlbEdge)
+            .where(MlbEdge.game_pk == game_pk)
+            .order_by(desc(MlbEdge.score))
+        )
+    )
+    env = db.scalar(
+        select(MlbGameEnvironmentSnapshot)
+        .where(MlbGameEnvironmentSnapshot.game_pk == game_pk)
+        .order_by(desc(MlbGameEnvironmentSnapshot.captured_at))
+        .limit(1)
+    )
+    if game is None and not edges:
+        raise HTTPException(status_code=404, detail=f"No MLB edge data for game {game_pk}")
+    return {
+        "game": _mlb_game_payload(game) if game else None,
+        "environment": _mlb_environment_payload(env) if env else None,
+        "edges": [edge_to_dict(edge) for edge in edges],
+    }
+
+
+@router.get("/mlb/debug/sources")
+def mlb_debug_sources(db: Session = Depends(get_db)) -> dict[str, object]:
+    settings = get_settings()
+    return {
+        "providers": {
+            "mlb_stats_api": {"configured": settings.mlb_stats_enabled, "requires_api_key": False},
+            "weather_api": {"configured": settings.has_weather_api_credentials()},
+            "odds_api": {"configured": settings.has_odds_api_credentials()},
+            "pybaseball_live": {"allowed": settings.allow_live_pybaseball_requests},
+            "statcast_cache": baseball_statcast_cache_status(db),
+        },
+        "row_counts": {
+            "mlb_games": db.scalar(select(func.count(MlbGame.id))) or 0,
+            "environment_snapshots": db.scalar(select(func.count(MlbGameEnvironmentSnapshot.id))) or 0,
+            "odds_snapshots": db.scalar(select(func.count(MlbOddsSnapshot.id))) or 0,
+            "pitcher_prop_snapshots": db.scalar(select(func.count(MlbPitcherPropSnapshot.id))) or 0,
+            "edges": db.scalar(select(func.count(MlbEdge.id))) or 0,
+            "daily_cards": db.scalar(select(func.count(MlbDailyCard.id))) or 0,
+        },
+    }
+
+
+def _mlb_game_payload(game: MlbGame) -> dict[str, object]:
+    return {
+        "game_pk": game.game_pk,
+        "game_date": game.game_date,
+        "home_team": game.home_team,
+        "away_team": game.away_team,
+        "venue": game.venue,
+        "probable_home_pitcher": game.probable_home_pitcher,
+        "probable_away_pitcher": game.probable_away_pitcher,
+        "game_status": game.game_status,
+        "start_time": game.start_time.isoformat() if game.start_time else None,
+        "weather_location_query": game.weather_location_query,
+    }
+
+
+def _mlb_environment_payload(env: MlbGameEnvironmentSnapshot) -> dict[str, object]:
+    return {
+        "temperature_score": env.temperature_score,
+        "wind_score": env.wind_score,
+        "humidity_score": env.humidity_score,
+        "precipitation_risk": env.precipitation_risk,
+        "park_factor": env.park_factor,
+        "run_environment_score": env.run_environment_score,
+        "under_environment_score": env.under_environment_score,
+        "k_environment_score": env.k_environment_score,
+        "warnings": env.warnings or [],
+        "captured_at": env.captured_at.isoformat() if env.captured_at else None,
+        "source": env.source,
     }
 
 

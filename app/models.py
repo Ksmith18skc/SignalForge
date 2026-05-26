@@ -224,3 +224,137 @@ class BatterStatcastSummary(Base):
     k_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
     source: Mapped[str] = mapped_column(String(32), default="pybaseball")
+
+
+class MlbGame(Base):
+    __tablename__ = "mlb_games"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    game_date: Mapped[str] = mapped_column(String(10), index=True)
+    home_team: Mapped[str] = mapped_column(String(128))
+    away_team: Mapped[str] = mapped_column(String(128))
+    venue: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    probable_home_pitcher: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    probable_home_pitcher_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    probable_away_pitcher: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    probable_away_pitcher_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    game_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    start_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    weather_location_query: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class MlbGameEnvironmentSnapshot(Base):
+    __tablename__ = "mlb_game_environment_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, index=True)
+    temperature_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wind_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    humidity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    precipitation_risk: Mapped[float | None] = mapped_column(Float, nullable=True)
+    park_factor: Mapped[float | None] = mapped_column(Float, nullable=True)
+    run_environment_score: Mapped[float] = mapped_column(Float, default=50.0)
+    under_environment_score: Mapped[float] = mapped_column(Float, default=50.0)
+    k_environment_score: Mapped[float] = mapped_column(Float, default=50.0)
+    warnings: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+    raw_weather: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="weatherapi")
+
+
+class MlbOddsSnapshot(Base):
+    __tablename__ = "mlb_odds_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, index=True)
+    market: Mapped[str] = mapped_column(String(64), default="game_total")
+    sportsbook_event_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    consensus_total_line: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_over_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_over_book: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    best_under_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_under_book: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    consensus_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    line_disagreement: Mapped[float] = mapped_column(Float, default=0.0)
+    book_count: Mapped[int] = mapped_column(Integer, default=0)
+    stale_book_candidates: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+    movement_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    steam_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rows: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="odds_api")
+
+
+class MlbPitcherPropSnapshot(Base):
+    __tablename__ = "mlb_pitcher_prop_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, index=True)
+    pitcher_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    pitcher_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    prop: Mapped[str] = mapped_column(String(64), default="strikeouts")
+    line: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_over_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_over_book: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    best_under_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_under_book: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    consensus_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    line_disagreement: Mapped[float] = mapped_column(Float, default=0.0)
+    book_count: Mapped[int] = mapped_column(Integer, default=0)
+    movement_direction: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    steam_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rows: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    source: Mapped[str] = mapped_column(String(32), default="odds_api")
+
+
+class MlbEdge(Base):
+    __tablename__ = "mlb_edges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_pk: Mapped[int] = mapped_column(Integer, index=True)
+    edge_type: Mapped[str] = mapped_column(String(32), index=True)  # game_total | pitcher_strikeouts
+    market: Mapped[str] = mapped_column(String(256))
+    side: Mapped[str] = mapped_column(String(16))
+    line: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_book: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    best_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consensus_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    confidence: Mapped[str] = mapped_column(String(16), default="low")
+    action: Mapped[str] = mapped_column(String(64), default="Pass")
+    chase_risk: Mapped[str] = mapped_column(String(16), default="medium")
+    reasons: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+    warnings: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+    data_sources_used: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+    factors: Mapped[dict[str, float] | None] = mapped_column(JSON, default=dict)
+    generated_for_date: Mapped[str] = mapped_column(String(10), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class MlbEdgeFactor(Base):
+    __tablename__ = "mlb_edge_factors"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    edge_id: Mapped[int] = mapped_column(ForeignKey("mlb_edges.id"), index=True)
+    name: Mapped[str] = mapped_column(String(64))
+    value: Mapped[float] = mapped_column(Float)
+    weight: Mapped[float] = mapped_column(Float)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class MlbDailyCard(Base):
+    __tablename__ = "mlb_daily_cards"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    card_date: Mapped[str] = mapped_column(String(10), unique=True, index=True)
+    top_game_totals: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    top_pitcher_strikeouts: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    near_misses: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    pass_list: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, default=list)
+    data_quality_summary: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow)
