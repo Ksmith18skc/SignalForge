@@ -165,8 +165,8 @@ div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 14px 16px;
-  margin-bottom: 10px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
 }
 .sf-card.gold   { border-left: 3px solid var(--gold);   }
 .sf-card.green  { border-left: 3px solid var(--green);  }
@@ -193,9 +193,55 @@ div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
 .sf-card-row {
   color: var(--text);
   font-size: 0.88rem;
-  margin-top: 4px;
+    margin-top: 2px;
 }
 .sf-card-row .k { color: var(--muted); margin-right: 6px; }
+.sf-score {
+    font-size: 1.7rem;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+}
+.score-strong { color: var(--gold); }
+.score-bettable { color: var(--green); }
+.score-watch { color: var(--purple); }
+.score-pass { color: var(--muted); }
+.score-bar {
+    height: 5px;
+    width: 120px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    overflow: hidden;
+    margin-top: 6px;
+    margin-left: auto;
+}
+.score-bar > span {
+    display: block;
+    height: 100%;
+}
+.score-bar-strong { background: var(--gold); }
+.score-bar-bettable { background: var(--green); }
+.score-bar-watch { background: var(--purple); }
+.score-bar-pass { background: var(--muted); }
+.pulse-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px rgba(0,200,83,0.5);
+    animation: pulse 1.6s infinite;
+    margin-right: 6px;
+}
+.pulse-odds {
+    animation: pulse 1.2s infinite;
+    box-shadow: 0 0 10px rgba(0,200,83,0.7);
+}
+@keyframes pulse {
+    0% { transform: scale(1); opacity: 0.7; }
+    50% { transform: scale(1.25); opacity: 1.0; }
+    100% { transform: scale(1); opacity: 0.7; }
+}
 .sf-reasons {
   margin: 6px 0 0 0;
   padding-left: 1.1em;
@@ -403,6 +449,7 @@ def safe_get(path: str, *, default: Any, params: dict[str, Any] | None = None) -
 # =============================================================================
 
 DASH = "—"
+TZ_MST = ZoneInfo("America/Phoenix")
 
 
 def fmt_num(value: Any, *, fmt: str = "{:.2f}", default: str = DASH) -> str:
@@ -490,6 +537,22 @@ def fmt_dt(value: Any, *, short: bool = True) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def fmt_dt_mst(value: Any, *, include_tz: bool = True) -> str:
+    dt = _parse_dt(value)
+    if not dt:
+        return DASH
+    local = dt.astimezone(TZ_MST)
+    label = local.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+    return f"{label} MST" if include_tz else label
+
+
+def fmt_dt_utc(value: Any) -> str:
+    dt = _parse_dt(value)
+    if not dt:
+        return DASH
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def _parse_dt(value: Any) -> datetime | None:
     if not value:
         return None
@@ -526,7 +589,7 @@ def fmt_event_time(value: Any, *, now: datetime | None = None) -> str:
     dt = _parse_dt(value)
     if not dt:
         return DASH
-    local = dt.astimezone(ZoneInfo("America/Phoenix"))
+    local = dt.astimezone(TZ_MST)
     return local.strftime("%b %d, %Y %I:%M %p MST").replace(" 0", " ")
 
 
@@ -558,6 +621,46 @@ def tier_for_score(score: Any) -> tuple[str, str]:
     if s >= 65:
         return ("Watch", "purple")
     return ("Pass", "muted")
+
+
+def score_class(score: Any) -> str:
+    if score is None:
+        return "score-pass"
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "score-pass"
+    if s >= 85:
+        return "score-strong"
+    if s >= 75:
+        return "score-bettable"
+    if s >= 65:
+        return "score-watch"
+    return "score-pass"
+
+
+def score_bar_class(score: Any) -> str:
+    if score is None:
+        return "score-bar-pass"
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return "score-bar-pass"
+    if s >= 85:
+        return "score-bar-strong"
+    if s >= 75:
+        return "score-bar-bettable"
+    if s >= 65:
+        return "score-bar-watch"
+    return "score-bar-pass"
+
+
+def score_percent(score: Any) -> int:
+    try:
+        s = float(score)
+    except (TypeError, ValueError):
+        return 0
+    return int(min(max(s, 0.0), 100.0))
 
 
 def card_kind_for_tier(tier: str) -> str:
@@ -673,9 +776,47 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     data_age_label = f"{data_age}m" if data_age is not None else DASH
     odds_stale = bool(edge.get("odds_stale"))
 
+    opening_line = edge.get("opening_line")
+    current_line = edge.get("current_line")
+    closing_line = edge.get("closing_line")
+    best_price = edge.get("best_price")
+    closing_price = edge.get("closing_price")
+    clv_percent = edge.get("clv_percent")
+    movement_lines: list[str] = []
+    if opening_line is not None or current_line is not None or closing_line is not None:
+        start_line = fmt_num(opening_line, fmt="{:.1f}") if opening_line is not None else DASH
+        end_line = fmt_num(closing_line or current_line, fmt="{:.1f}") if (closing_line or current_line) is not None else DASH
+        movement_lines.append(f"Line: {start_line} → {end_line}")
+    if best_price is not None or closing_price is not None:
+        start_price = fmt_price(best_price) if best_price is not None else DASH
+        end_price = fmt_price(closing_price) if closing_price is not None else DASH
+        movement_lines.append(f"Price: {start_price} → {end_price}")
+    if clv_percent is not None:
+        movement_lines.append(f"CLV: {fmt_pct(clv_percent)}")
+    movement_block = (
+        " · ".join(movement_lines)
+        if movement_lines
+        else "movement unavailable"
+    )
+
     reasons = (edge.get("reasons") or [])[:3]
     warnings = edge.get("warnings") or []
     sources = edge.get("data_sources_used") or []
+    factors = edge.get("factors") or {}
+    factor_lines = []
+    for key, value in factors.items():
+        if value is None:
+            continue
+        label = str(key).replace("_", " ").title()
+        if isinstance(value, (int, float)):
+            factor_lines.append(f"+ {label}: {float(value):.0f}/100")
+        else:
+            factor_lines.append(f"+ {label}: {value}")
+    factor_block = (
+        "<div class='sf-card-row'><span class='k'>EDGE FACTORS</span></div>"
+        + "<div class='sf-card-row sf-meta'>" + "<br/>".join(factor_lines[:5]) + "</div>"
+        if factor_lines else ""
+    )
 
     badges = " ".join([
         badge(tier, tier_kind),
@@ -692,6 +833,11 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         "".join(f"<li>{r}</li>" for r in reasons) +
         "</ul>"
     ) if reasons else "<div class='sf-meta'>No supporting reasons returned.</div>"
+    warnings_html = (
+        "<div class='sf-card-row'><span class='k'>Warnings:</span>"
+        + "; ".join(warnings[:3])
+        + "</div>"
+    ) if warnings else ""
 
     body = f"""
     <div class="sf-card {card_kind}">
@@ -702,13 +848,17 @@ def render_edge_card(edge: dict[str, Any]) -> None:
                       <div class="sf-card-sub">Event: {event_label} · Signal: {fmt_relative(created_at)} · Updated: {fmt_relative(updated_at)} · Resolve: {DASH}</div>
         </div>
         <div style="text-align:right;">
-          <div class="sf-card-title" style="color:var(--gold);">{fmt_score(score)}</div>
+                    <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
+                      <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
           <div class="sf-card-sub">{book} · {price}</div>
         </div>
       </div>
       <div>{badges}</div>
             <div class="sf-card-row"><span class="k">Odds:</span>{odds_source} · Snapshot: {fmt_relative(odds_captured_at)} · Best book: {fmt_relative(best_book_at)} · Data age: {data_age_label}</div>
+    <div class="sf-card-row"><span class="k">Movement:</span>{movement_block}</div>
+            {factor_block}
       {reasons_html}
+            {warnings_html}
       <div class="sf-card-row"><span class="k">Action:</span>{action}</div>
       <div class="sf-card-row" style="margin-top:6px;">{source_badges}{warn_badges}</div>
             {render_link_buttons([
@@ -738,8 +888,14 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
     market_end = signal.get("market_end_date")
     signal_created = signal.get("signal_created_at") or signal.get("created_at")
     market_updated = signal.get("market_updated_at")
+    platform = str(signal.get("market_platform") or "").lower()
+    market_label = "Open Market"
+    if "kalshi" in platform:
+        market_label = "Kalshi"
+    elif platform:
+        market_label = "Polymarket"
     market_links = render_link_buttons([
-        ("Open Market", signal.get("market_url")),
+        (market_label, signal.get("market_url")),
         ("Trader Profile", signal.get("trader_url")),
         ("Source", signal.get("source_url")),
     ])
@@ -781,13 +937,15 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
           <div class="sf-card-sub">Event: {event_label} · Signal: {signal_label} · Updated: {updated_label} · Resolve: {resolve_label}</div>
         </div>
         <div style="text-align:right;">
-          <div class="sf-card-title" style="color:var(--gold);">{fmt_score(score)}</div>
+                    <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
+                      <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
           <div class="sf-card-sub">{side} {outcome} · entry {entry} · {size}</div>
         </div>
       </div>
       <div>{badges_html}</div>
       <div class="sf-card-row">{tag_badges}</div>
       <div class="sf-card-row"><span class="k">Consensus:</span>{consensus_summary}</div>
+    <div class="sf-card-row"><span class="k">Wallet metrics:</span>insufficient history</div>
       <div class="sf-card-row sf-meta">{reason}</div>
       {market_links}
     </div>
@@ -811,9 +969,11 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
 
 def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callable]] | None = None) -> None:
     """Friendly empty state — title, body, optional action buttons."""
+    checked = fmt_dt_mst(datetime.now(timezone.utc))
     st.markdown(
         f"<div class='sf-card'><div class='sf-card-title'>{title}</div>"
-        f"<div class='sf-card-row sf-meta'>{body}</div></div>",
+        f"<div class='sf-card-row sf-meta'>{body}</div>"
+        f"<div class='sf-card-row sf-meta'>Last checked: {checked}</div></div>",
         unsafe_allow_html=True,
     )
     if not actions:
@@ -1204,6 +1364,10 @@ missing_odds_edges = [
 perf_summary = (mlb_performance.get("summary") or {})
 clv_block = (mlb_performance.get("clv") or {})
 
+# Current time context (MST/UTC) used across the dashboard.
+now_utc = datetime.now(timezone.utc)
+now_local = now_utc.astimezone(TZ_MST)
+
 
 # =============================================================================
 # Sidebar — filters + diagnostics
@@ -1238,6 +1402,7 @@ with st.sidebar:
     st.markdown("<div class='sf-divider'></div>", unsafe_allow_html=True)
     st.markdown("**Wallet display**")
     show_full_wallet = st.checkbox("Show full wallet addresses", value=False)
+    show_pass_candidates = st.checkbox("Show pass candidates", value=False)
     debug_mode = st.checkbox("Show raw JSON in Debug tab", value=True)
 
     st.markdown("<div class='sf-divider'></div>", unsafe_allow_html=True)
@@ -1245,7 +1410,15 @@ with st.sidebar:
     st.markdown(f"<div class='sf-meta'>API URL: <code>{API_BASE}</code></div>", unsafe_allow_html=True)
     st.markdown(f"<div class='sf-meta'>Backend: {status_badge(True, ok_label='ok', bad_label='down')}</div>", unsafe_allow_html=True)
     st.markdown(
-        f"<div class='sf-meta'>Last health check: {fmt_dt(health.get('timestamp'))}</div>",
+        f"<div class='sf-meta'>Last health check: {fmt_dt_mst(health.get('timestamp'))}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='sf-meta'>MST: {fmt_dt_mst(now_utc)}</div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"<div class='sf-meta'>UTC: {fmt_dt_utc(now_utc)}</div>",
         unsafe_allow_html=True,
     )
     st.markdown(
@@ -1258,6 +1431,8 @@ def apply_filters(positions: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for p in positions:
         score = _as_float(p.get("score")) or 0.0
+        if not show_pass_candidates and score < 65:
+            continue
         if not (score_min <= score <= score_max):
             continue
         if selected_trader != "(all)" and p.get("trader_nickname") != selected_trader:
@@ -1297,13 +1472,11 @@ mkt_badge = badge(
     "green" if mlb_count > 0 else "muted",
 )
 tz_mst = ZoneInfo("America/Phoenix")
-now_utc = datetime.now(timezone.utc)
-now_local = now_utc.astimezone(tz_mst)
 prev_refresh = st.session_state.get("_last_dashboard_refresh_at")
 st.session_state["_last_dashboard_refresh_at"] = now_utc.isoformat()
 last_refresh_age = fmt_relative(prev_refresh, now=now_utc) if prev_refresh else "just now"
 local_label = now_local.strftime("%b %d, %Y %I:%M %p MST").replace(" 0", " ")
-health_label = fmt_dt(health.get("timestamp"))
+health_label = fmt_dt_mst(health.get("timestamp"))
 
 st.markdown(
     f"""
@@ -1314,8 +1487,8 @@ st.markdown(
         <span class='sf-brand-tagline'>Prediction Market + MLB Edge Terminal</span>
       </div>
       <div>
-        {backend_badge}{mkt_badge}{odds_cache_badge}
-                <div class='sf-meta' style='margin-top:6px;'>MST: {local_label}</div>
+        <span class='pulse-dot'></span>{backend_badge}{mkt_badge}{odds_cache_badge}
+        <div class='sf-meta' style='margin-top:6px;'>MST: {local_label}</div>
                 <div class='sf-meta'>Last refresh: {last_refresh_age}</div>
                 <div class='sf-meta'>Backend health: {health_label}</div>
       </div>
@@ -1395,22 +1568,43 @@ with tab_command:
     left, right = st.columns([3, 2], gap="medium")
 
     with left:
-        st.markdown("### Today's Top Decisions")
+        st.markdown("### TOP ACTIONABLE OPPORTUNITIES")
         top_decisions = sorted(
-            mlb_actionable, key=lambda e: e.get("score") or 0, reverse=True
+            [
+                e for e in mlb_actionable
+                if (e.get("score") or 0) >= 65 and not e.get("odds_stale")
+            ],
+            key=lambda e: e.get("score") or 0,
+            reverse=True,
         )[:5]
         if top_decisions:
             for edge in top_decisions:
                 render_edge_card(edge)
         else:
             render_empty_state(
-                "No actionable edges yet.",
-                "Odds may be missing or stale, or model confidence is below threshold. "
-                "Run an MLB scan or refresh the odds cache.",
+                "NO ACTIONABLE OPPORTUNITIES",
+                "System is monitoring. Check MLB Terminal for watchlist candidates.",
                 actions=[
                     ("Run MLB edge scan", action_run_mlb_edge_scan),
                     ("Refresh odds cache", action_refresh_odds_cache),
                 ],
+            )
+
+        st.markdown("### Watchlist Candidates")
+        watchlist_candidates = [
+            e for e in mlb_edges_all
+            if (e.get("score") or 0) >= 60
+            and (e.get("score") or 0) < 75
+            and str(e.get("action") or "").lower() == "watch"
+        ][:5]
+        if watchlist_candidates:
+            for edge in watchlist_candidates:
+                render_edge_card(edge)
+        else:
+            render_empty_state(
+                "MARKET SILENT",
+                "No watchlist candidates in the 60-74 band right now.",
+                actions=[("Refresh odds cache", action_refresh_odds_cache)],
             )
 
         st.markdown("### Highest Conviction Wallet Flow")
@@ -1427,22 +1621,21 @@ with tab_command:
     with right:
         st.markdown("### System Health")
         provs = providers_block
+        sources_online = sum(
+            1 for key in ("falcon", "odds_api", "weather_api", "mlb_stats_api")
+            if (provs.get(key) or {}).get("configured")
+        )
+        rc = (mlb_sources.get("row_counts") or {})
+        summary_lines = "".join([
+            f"<div class='sf-card-row'>{badge('SYSTEM LIVE', 'green')}</div>",
+            f"<div class='sf-card-row'>{badge('DATA HEALTHY', 'cyan')}</div>",
+            f"<div class='sf-card-row'>MLB games tracked: {rc.get('mlb_games', 0)}</div>",
+            f"<div class='sf-card-row'>Prop snapshots: {rc.get('pitcher_prop_snapshots', 0)}</div>",
+            f"<div class='sf-card-row'>Odds cache: {odds_cache_status.upper()}</div>",
+            f"<div class='sf-card-row'>Sources online: {sources_online}</div>",
+        ])
         st.markdown(
-            "<div class='sf-card'>"
-            + "<div class='sf-card-row'>"
-            + badge(f"DB: {health.get('database', {}).get('backend', '?')}", "cyan")
-            + configured_badge(provs.get("falcon"), "Falcon")
-            + configured_badge(provs.get("odds_api"), "Odds API")
-            + (badge(
-                f"Odds cache: {odds_cache_status}",
-                "green" if odds_cache_status == "fresh" else ("purple" if odds_cache_status == "stale" else "red"),
-              ))
-            + configured_badge(provs.get("weather_api"), "Weather")
-            + configured_badge(provs.get("mlb_stats_api"), "MLB Stats")
-            + (badge("Pybaseball: live OFF", "muted")
-               if not (provs.get("pybaseball", {}) or {}).get("allow_live_requests") else
-               badge("Pybaseball: live ON", "purple"))
-            + "</div></div>",
+            "<div class='sf-card'>" + summary_lines + "</div>",
             unsafe_allow_html=True,
         )
 
@@ -1471,7 +1664,7 @@ with tab_command:
                 ch_badge = badge(channel, "purple" if channel == "discord" else "cyan")
                 st.markdown(
                     "<div class='sf-card'>"
-                    + f"<div class='sf-card-row'>{ch_badge}<span class='sf-meta'> · {fmt_dt(a.get('created_at'))}</span></div>"
+                    + f"<div class='sf-card-row'>{ch_badge}<span class='sf-meta'> · {fmt_dt_mst(a.get('created_at'))}</span></div>"
                     + f"<div class='sf-card-row'>{(a.get('message') or '')[:160]}</div>"
                     + "</div>",
                     unsafe_allow_html=True,
@@ -1502,16 +1695,16 @@ with tab_mlb:
                 st.markdown(f"<h3>{title}</h3>", unsafe_allow_html=True)
                 if not rows:
                     render_empty_state(
-                        "Empty",
-                        "No qualifying edges in this band yet for today's slate.",
+                        "NO QUALIFYING EDGES",
+                        "No qualifying edges in this band for today's slate.",
                     )
                 else:
                     for row in rows[:3]:
                         render_edge_card(row)
     else:
         render_empty_state(
-            "No daily card built yet.",
-            "Run the MLB edge scan to materialize a card for today.",
+            "DAILY CARD MISSING",
+            "Run the MLB edge scan to materialize the daily card.",
             actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
         )
 
@@ -1548,8 +1741,8 @@ with tab_mlb:
         )
     else:
         render_empty_state(
-            "No MLB edges available.",
-            "Run the MLB edge scan; if it still shows nothing, check the Odds Cache tab.",
+            "NO MLB EDGES",
+            "Run the MLB edge scan. If still empty, check the Odds Cache tab.",
             actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
         )
 
@@ -1641,6 +1834,17 @@ with tab_wallet:
 # =============================================================================
 
 with tab_perf:
+    st.markdown("### Performance Window")
+    window = st.selectbox(
+        "Date range",
+        ["Last 7 days", "Today", "Yesterday", "Last 30 days", "All time", "Custom"],
+        index=0,
+    )
+    if window == "Custom":
+        st.caption("Custom date filtering is not yet wired; showing all available data.")
+    else:
+        st.caption("Backend does not yet expose date filters; showing all available data.")
+
     perf_actions = st.columns([1, 1, 6])
     with perf_actions[0]:
         if st.button("Update closing lines", use_container_width=True):
@@ -1652,10 +1856,8 @@ with tab_perf:
     graded = perf_summary.get("graded_edges") or 0
     if not graded:
         render_empty_state(
-            "Performance tracking is empty.",
-            "Tracking begins after closing lines and game results are graded. "
-            "Run `scripts/grade_mlb_results.py` and `scripts/update_mlb_closing_lines.py` "
-            "to seed this view.",
+            "WAITING FOR GRADED RESULTS",
+            "No graded edges yet. Update closing lines, then grade MLB results.",
             actions=[
                 ("Update closing lines", action_update_mlb_closing_lines),
                 ("Grade MLB results", action_grade_mlb_results),
@@ -1686,7 +1888,7 @@ with tab_perf:
             except Exception:
                 pass
         else:
-            render_empty_state("No edge-type breakdown yet.", "Need at least one graded edge per type.")
+            render_empty_state("NO EDGE-TYPE BREAKDOWN", "Need at least one graded edge per type.")
 
         st.markdown("### By score band")
         by_band = mlb_performance.get("by_score_band") or []
@@ -1695,7 +1897,7 @@ with tab_perf:
             st.dataframe(df_band, use_container_width=True, hide_index=True,
                          height=min(220, 60 + 32 * len(df_band)))
         else:
-            render_empty_state("No score-band breakdown yet.", "Grade more edges to populate.")
+            render_empty_state("NO SCORE-BAND BREAKDOWN", "Grade more edges to populate.")
 
         st.markdown("### CLV leaders")
         clv_cols = st.columns(2)
