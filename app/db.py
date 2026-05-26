@@ -65,6 +65,19 @@ def init_db() -> None:
     if _is_sqlite:
         _add_sqlite_column_if_missing("trades", "outcome", "VARCHAR(64)")
         _add_sqlite_column_if_missing("signals", "outcome", "VARCHAR(64)")
+        _add_sqlite_column_if_missing("mlb_edges", "opening_line", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "current_line", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "recommended_line", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "closing_line", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "closing_price", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "result", "VARCHAR(64)")
+        _add_sqlite_column_if_missing("mlb_edges", "win_loss_push", "VARCHAR(8)")
+        _add_sqlite_column_if_missing("mlb_edges", "implied_probability_at_entry", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "implied_probability_at_close", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "clv_points", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
 
 
 def _add_sqlite_column_if_missing(table: str, column: str, ddl: str) -> None:

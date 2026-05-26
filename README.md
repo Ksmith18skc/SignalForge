@@ -308,6 +308,26 @@ curl -X POST http://localhost:8000/mlb/edges/123/grade \
 SignalForge stores entry/open/current/recommended/closing lines, implied
 probabilities, CLV points, CLV percent, and ROI units for later backtesting.
 
+Render cron/background examples:
+
+```bash
+# Morning card generation
+python -m scripts.run_mlb_daily_card
+
+# Closing-line capture; run every 10-15 minutes during MLB slate
+python -m scripts.update_mlb_closing_lines
+
+# Result grading; run hourly after games start finishing
+python -m scripts.grade_mlb_results
+
+# Performance report; optionally send Discord
+python -m scripts.send_mlb_performance_report --discord
+```
+
+All lifecycle scripts are idempotent. Re-running the daily card replaces that
+date's generated edges/card, closing-line updates mutate existing ungraded
+edges, grading skips already-graded edges, and reporting is read-only.
+
 ---
 
 ## Tests
