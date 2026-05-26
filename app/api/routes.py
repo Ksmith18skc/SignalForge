@@ -1141,6 +1141,11 @@ def _edge_payload_with_context(db: Session, edge: MlbEdge) -> dict[str, object]:
     if game:
         payload["game_date"] = game.game_date
         payload["game_start_time"] = game.start_time.isoformat() if game.start_time else None
+        # Surface team names so the dashboard can render compact "NYY @ KC"
+        # titles for game totals/moneyline/spread cards without re-parsing
+        # the slug. Pure display enrichment; no scoring impact.
+        payload["home_team"] = game.home_team
+        payload["away_team"] = game.away_team
 
     now = datetime.utcnow()
     if edge.edge_type == "pitcher_strikeouts":

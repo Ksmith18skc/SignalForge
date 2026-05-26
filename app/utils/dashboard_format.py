@@ -365,3 +365,266 @@ def odds_provider_label(source: Any) -> tuple[str, bool]:
     if raw in {"sportsgameodds", "sgo"}:
         return ("SportsGameOdds", True)
     return ("Odds-API.io", False)
+
+
+# ---------------------------------------------------------------------------
+# Card titles — the headline on every edge card
+# ---------------------------------------------------------------------------
+
+
+# Team abbreviations for the common cases we see on the slate. Falls back to
+# the full team name when not in the map so the title still renders cleanly.
+TEAM_ABBR: dict[str, str] = {
+    "arizona diamondbacks": "ARI",
+    "atlanta braves": "ATL",
+    "baltimore orioles": "BAL",
+    "boston red sox": "BOS",
+    "chicago cubs": "CHC",
+    "chicago white sox": "CHW",
+    "cincinnati reds": "CIN",
+    "cleveland guardians": "CLE",
+    "colorado rockies": "COL",
+    "detroit tigers": "DET",
+    "houston astros": "HOU",
+    "kansas city royals": "KC",
+    "los angeles angels": "LAA",
+    "los angeles dodgers": "LAD",
+    "miami marlins": "MIA",
+    "milwaukee brewers": "MIL",
+    "minnesota twins": "MIN",
+    "new york mets": "NYM",
+    "new york yankees": "NYY",
+    "athletics": "OAK",
+    "oakland athletics": "OAK",
+    "philadelphia phillies": "PHI",
+    "pittsburgh pirates": "PIT",
+    "san diego padres": "SD",
+    "san francisco giants": "SF",
+    "seattle mariners": "SEA",
+    "st. louis cardinals": "STL",
+    "tampa bay rays": "TB",
+    "texas rangers": "TEX",
+    "toronto blue jays": "TOR",
+    "washington nationals": "WSH",
+}
+
+
+def team_short(team: Any) -> str:
+    """Return a 2-4 letter team code when known, else the full name."""
+    if not team:
+        return ""
+    key = str(team).strip().lower()
+    return TEAM_ABBR.get(key, str(team).strip())
+
+
+def _side_label(side: Any) -> str:
+    s = str(side or "").strip().lower()
+    if s in {"over", "o"}:
+        return "Over"
+    if s in {"under", "u"}:
+        return "Under"
+    if s in {"home"}:
+        return "Home"
+    if s in {"away"}:
+        return "Away"
+    if s in {"yes", "y", "buy"}:
+        return s.upper()
+    if s in {"no", "n", "sell"}:
+        return s.upper()
+    return str(side or "").strip().title()
+
+
+def _line_label(line: Any) -> str | None:
+    try:
+        f = float(line)
+    except (TypeError, ValueError):
+        return None
+    if abs(f - round(f)) < 1e-9:
+        return f"{int(round(f))}"
+    return f"{f:.1f}"
+
+
+def _pitcher_name_from_market(market: str | None) -> str | None:
+    """Pull a pitcher name from market strings like 'Joe Ryan Strikeouts -
+    Over 6.5'. Returns None when the market doesn't follow the schema."""
+    if not market:
+        return None
+    s = str(market)
+    if "Strikeouts" not in s:
+        return None
+    head = s.split("Strikeouts", 1)[0].strip()
+    return head or None
+
+
+def format_card_title(edge: dict[str, Any]) -> str:
+    """Concise, decision-first headline. Examples:
+        'Joe Ryan — Over 6.5 Ks'
+        'NYY @ KC — Under 8.5'
+        'SEA @ OAK — Moneyline'
+
+    Never returns a dangling hyphen and never inserts a placeholder
+    ('?', '—') into the suffix; if a field is missing, that piece is just
+    omitted so the title still reads cleanly.
+    """
+    edge_type = str(edge.get("edge_type") or "").lower()
+    side_label = _side_label(edge.get("side"))
+    line_label = _line_label(edge.get("line"))
+    market_scope = str(edge.get("market_scope") or "").lower()
+    home = team_short(edge.get("home_team"))
+    away = team_short(edge.get("away_team"))
+    matchup = f"{away} @ {home}" if home and away else (home or away or "")
+
+    if edge_type == "pitcher_strikeouts":
+        name = _pitcher_name_from_market(edge.get("market"))
+        head = name or "Pitcher"
+        if side_label and line_label:
+            return f"{head} — {side_label} {line_label} Ks"
+        if side_label:
+            return f"{head} — {side_label} Ks"
+        return f"{head} — Strikeouts"
+
+    if edge_type == "game_total" or "total" in edge_type or "total" in market_scope:
+        if not matchup:
+            matchup = _matchup_from_string(edge.get("market"))
+        scope_prefix = ""
+        if "first_5" in market_scope or "first 5" in market_scope:
+            scope_prefix = "F5 "
+        elif "team_total" in market_scope or "team total" in market_scope:
+            scope_prefix = "Team Total "
+        if side_label and line_label:
+            return f"{matchup or 'Game'} — {scope_prefix}{side_label} {line_label}".strip()
+        return f"{matchup or 'Game'} — {scope_prefix}Total".strip()
+
+    if "moneyline" in edge_type or "moneyline" in market_scope:
+        suffix = f"Moneyline {side_label}".strip() if side_label else "Moneyline"
+        return f"{matchup or 'Game'} — {suffix}"
+
+    if "spread" in edge_type or "spread" in market_scope:
+        if side_label and line_label:
+            return f"{matchup or 'Game'} — Spread {side_label} {line_label}"
+        return f"{matchup or 'Game'} — Spread"
+
+    # Fallback: strip dangling hyphens off the raw market string so we
+    # never render 'Joe Ryan Strikeouts -' style titles.
+    raw = str(edge.get("market") or "").strip()
+    raw = raw.rstrip(" -–—·")
+    return raw or "Market"
+
+
+def _matchup_from_string(value: Any) -> str:
+    """Best-effort matchup extraction from 'NYY vs KC ...' style strings."""
+    if not value:
+        return ""
+    s = str(value)
+    for sep in [" vs ", " @ ", " at "]:
+        if sep in s.lower():
+            chunk = s.split("-")[0]
+            return chunk.strip()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Polished labels for missing data (per UI spec)
+# ---------------------------------------------------------------------------
+
+MISSING_LABELS: dict[str, str] = {
+    "projection": "Model projection not yet calibrated",
+    "history": "Limited recent sample",
+    "hit_rate": "Limited recent sample",
+    "clv_pending": "CLV pending",
+    "closing": "Awaiting closing line",
+    "movement": "Movement data building",
+    "form": "History building",
+    "factors": "Composition not yet available",
+}
+
+
+def polished_missing(kind: str) -> str:
+    """Return a polished, premium-terminal phrasing for a missing data
+    section. Falls back to 'Data unavailable' for unknown kinds."""
+    return MISSING_LABELS.get(kind, "Data unavailable")
+
+
+# ---------------------------------------------------------------------------
+# Probability formatting for prediction-market and SignalForge sections
+# ---------------------------------------------------------------------------
+
+
+def format_probability(value: Any, *, default: str = DASH) -> str:
+    """Render a 0–1 probability as '42.0%'. Inputs already in % (e.g. 42)
+    are passed through. Returns the default sentinel when missing."""
+    if value is None or value == "":
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if 0 <= f <= 1:
+        return f"{f * 100:.1f}%"
+    if 0 <= f <= 100:
+        return f"{f:.1f}%"
+    return default
+
+
+def format_cents(value: Any, *, default: str = DASH) -> str:
+    """Render a prediction-market probability as cents ('34¢'). Used in
+    Kalshi/Polymarket lines where the betting interface speaks in cents."""
+    if value is None or value == "":
+        return default
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return default
+    if 0 < f < 1:
+        return f"{int(round(f * 100))}¢"
+    if 1 <= f <= 100:
+        return f"{int(round(f))}¢"
+    return default
+
+
+def edge_vs_market(model_prob: Any, market_prob: Any) -> str | None:
+    """Signed edge string like '+4.2%' (SF probability minus market
+    implied). Returns None when either side is missing."""
+    if model_prob is None or market_prob is None:
+        return None
+    try:
+        mp = float(model_prob)
+        kp = float(market_prob)
+    except (TypeError, ValueError):
+        return None
+    if 0 <= mp <= 1:
+        mp *= 100
+    if 0 <= kp <= 1:
+        kp *= 100
+    delta = mp - kp
+    sign = "+" if delta >= 0 else "-"
+    return f"{sign}{abs(delta):.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# Sharp-money / wallet-flow formatting
+# ---------------------------------------------------------------------------
+
+
+def wallet_alignment_percent(side_count: Any, total_count: Any) -> float | None:
+    """Fraction of tracked wallets aligned with the alert's side, 0..100.
+    Returns None when either count is missing."""
+    s = _to_float(side_count)
+    t = _to_float(total_count)
+    if s is None or t is None or t <= 0:
+        return None
+    return min(100.0, max(0.0, 100.0 * s / t))
+
+
+def format_money_short(value: Any, *, default: str = DASH) -> str:
+    """'$95k' / '$1.2M' / '$412k' compact money for sharp-money sections."""
+    n = _to_float(value)
+    if n is None:
+        return default
+    a = abs(n)
+    sign = "-" if n < 0 else ""
+    if a >= 1_000_000:
+        return f"{sign}${a / 1_000_000:.1f}M"
+    if a >= 1_000:
+        return f"{sign}${a / 1_000:.0f}k"
+    return f"{sign}${a:.0f}"

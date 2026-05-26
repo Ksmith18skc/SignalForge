@@ -32,15 +32,23 @@ from app.utils.dashboard_format import (
     compact_time_ago,
     confidence_label as confidence_label_fn,
     confidence_word,
+    edge_vs_market,
     factor_label as factor_label_fn,
+    format_card_title,
+    format_cents,
     format_edge_delta,
     format_hit_rate,
+    format_money_short,
     format_price_with_implied_prob,
+    format_probability,
     odds_provider_label,
+    polished_missing,
     score_bucket_label,
     score_distribution as score_distribution_fn,
     score_tier as score_tier_fn,
     score_tier_kind,
+    team_short,
+    wallet_alignment_percent,
 )
 
 API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip("/")
@@ -98,14 +106,16 @@ section[data-testid="stSidebar"] * { color: var(--text); }
 section[data-testid="stSidebar"] .sf-meta { color: var(--muted); }
 
 /* Tighten Streamlit's default vertical padding so the terminal feels dense. */
-.main .block-container { padding-top: 1rem; padding-bottom: 2rem; max-width: 1500px; }
-.stMarkdown p { margin-bottom: 0.3rem; }
-.element-container { margin-bottom: 0.4rem; }
+.main .block-container { padding-top: 0.6rem; padding-bottom: 1.6rem; max-width: 1500px; }
+.stMarkdown p { margin-bottom: 0.15rem; line-height: 1.35; }
+.element-container { margin-bottom: 0.22rem; }
+.stMarkdown { line-height: 1.35; }
 
-h1, h2, h3, h4 { color: var(--text); letter-spacing: 0.02em; }
-h1 { font-weight: 700; font-size: 1.6rem; }
-h2 { font-weight: 600; font-size: 1.2rem; }
-h3 { font-weight: 600; font-size: 1.0rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.1em; }
+h1, h2, h3, h4 { color: var(--text); letter-spacing: 0.02em; margin: 0.4rem 0 0.2rem 0; }
+h1 { font-weight: 700; font-size: 1.55rem; }
+h2 { font-weight: 600; font-size: 1.15rem; }
+h3 { font-weight: 600; font-size: 0.95rem; text-transform: uppercase; color: var(--muted); letter-spacing: 0.12em; margin-top: 0.6rem; }
+h4 { font-size: 0.85rem; color: var(--muted); margin-top: 0.4rem; }
 
 /* --- Header strip --- */
 .sf-header {
@@ -188,43 +198,83 @@ div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 6px;
-    padding: 10px 12px;
-    margin-bottom: 8px;
+  padding: 8px 11px;
+  margin-bottom: 6px;
 }
-.sf-card.gold   { border-left: 3px solid var(--gold);   }
+.sf-card.gold   { border-left: 3px solid var(--gold);   box-shadow: 0 0 0 1px rgba(212,175,55,0.08); }
 .sf-card.green  { border-left: 3px solid var(--green);  }
 .sf-card.purple { border-left: 3px solid var(--purple); }
 .sf-card.red    { border-left: 3px solid var(--red);    }
 .sf-card-head {
   display: flex;
   justify-content: space-between;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
-  margin-bottom: 6px;
+  margin-bottom: 4px;
 }
 .sf-card-title {
-  font-size: 1.0rem;
+  font-size: 1.02rem;
   font-weight: 700;
   color: var(--text);
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
+  line-height: 1.2;
 }
 .sf-card-sub {
   color: var(--muted);
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   letter-spacing: 0.04em;
+  line-height: 1.3;
 }
 .sf-card-row {
   color: var(--text);
-  font-size: 0.88rem;
-    margin-top: 2px;
+  font-size: 0.84rem;
+  margin-top: 1px;
+  line-height: 1.35;
 }
 .sf-card-row .k { color: var(--muted); margin-right: 6px; }
 .sf-score {
-    font-size: 2.1rem;
+    font-size: 2.0rem;
     font-weight: 800;
-    letter-spacing: 0.04em;
-    line-height: 1.05;
+    letter-spacing: 0.03em;
+    line-height: 1.0;
+    font-variant-numeric: tabular-nums;
 }
+.sf-score-label {
+    font-size: 0.6rem;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--muted);
+}
+.sf-prob {
+    font-size: 1.7rem;
+    font-weight: 800;
+    color: var(--purple);
+    letter-spacing: 0.02em;
+    line-height: 1.0;
+    font-variant-numeric: tabular-nums;
+}
+.sf-prob-row {
+    display: flex;
+    gap: 14px;
+    align-items: flex-end;
+    margin-top: 2px;
+}
+.sf-prob-cell .lbl {
+    font-size: 0.58rem;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 2px;
+}
+.sf-prob-cell .val {
+    font-size: 0.92rem;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+.sf-prob-cell .val.purple { color: var(--purple); font-weight: 700; }
+.sf-prob-cell .val.green  { color: var(--green); font-weight: 700; }
+.sf-prob-cell .val.gold   { color: var(--gold); font-weight: 700; }
+.sf-prob-cell .val.red    { color: var(--red); font-weight: 700; }
 .score-strong { color: var(--gold); }
 .score-bettable { color: var(--green); }
 .score-watch { color: var(--purple); }
@@ -347,38 +397,38 @@ code { background: var(--panel-2); color: var(--cyan); padding: 1px 6px; border-
 
 /* --- Edge card sub-sections --- */
 .sf-section {
-  margin-top: 8px;
-  padding-top: 6px;
+  margin-top: 6px;
+  padding-top: 5px;
   border-top: 1px dashed var(--border);
 }
 .sf-section-title {
   color: var(--muted);
-  font-size: 0.68rem;
-  letter-spacing: 0.14em;
+  font-size: 0.64rem;
+  letter-spacing: 0.16em;
   text-transform: uppercase;
-  margin-bottom: 3px;
+  margin-bottom: 2px;
 }
 .sf-kv {
   display: grid;
-  grid-template-columns: 150px 1fr;
+  grid-template-columns: 140px 1fr;
   column-gap: 10px;
-  row-gap: 2px;
-  font-size: 0.85rem;
+  row-gap: 1px;
+  font-size: 0.82rem;
 }
 .sf-kv .k { color: var(--muted); }
 .sf-kv .v { color: var(--text); }
 .sf-factor-row {
   display: grid;
-  grid-template-columns: 170px 1fr 38px;
+  grid-template-columns: 160px 1fr 36px;
   align-items: center;
   column-gap: 8px;
-  margin-bottom: 2px;
-  font-size: 0.8rem;
+  margin-bottom: 1px;
+  font-size: 0.78rem;
 }
 .sf-factor-row .lbl { color: var(--muted); }
 .sf-factor-row .val { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .sf-factor-bar {
-  height: 6px;
+  height: 5px;
   background: var(--panel-2);
   border: 1px solid var(--border);
   border-radius: 3px;
@@ -395,13 +445,123 @@ code { background: var(--panel-2); color: var(--cyan); padding: 1px 6px; border-
 .sf-trust {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  font-size: 0.8rem;
+  gap: 8px 14px;
+  font-size: 0.76rem;
   color: var(--text);
 }
-.sf-trust .ok { color: var(--green); }
-.sf-trust .warn { color: var(--red); }
+.sf-trust .ok      { color: var(--green); }
+.sf-trust .warn    { color: var(--red); }
 .sf-trust .neutral { color: var(--muted); }
+.sf-trust .info    { color: var(--cyan); }
+
+/* --- Live ribbon (Command Center) --- */
+.sf-ribbon {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 7px 12px;
+  margin-bottom: 10px;
+  font-size: 0.78rem;
+}
+.sf-ribbon .seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.sf-ribbon .seg .lbl {
+  color: var(--muted);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+}
+.sf-ribbon .seg .ok   { color: var(--green); }
+.sf-ribbon .seg .warn { color: var(--red); }
+.sf-ribbon .seg .info { color: var(--cyan); }
+.sf-ribbon .sep { color: var(--border); }
+
+/* --- Market Pulse chip strip --- */
+.sf-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+.sf-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  font-size: 0.72rem;
+  color: var(--text);
+  letter-spacing: 0.04em;
+}
+.sf-chip .lbl   { color: var(--muted); text-transform: uppercase; font-size: 0.62rem; letter-spacing: 0.14em; }
+.sf-chip .val   { color: var(--text); font-weight: 700; font-variant-numeric: tabular-nums; }
+.sf-chip.ok    { border-color: var(--green); }
+.sf-chip.ok .val { color: var(--green); }
+.sf-chip.warn  { border-color: var(--red); }
+.sf-chip.warn .val { color: var(--red); }
+.sf-chip.info  { border-color: var(--cyan); }
+.sf-chip.info .val { color: var(--cyan); }
+
+/* --- Sharp money block (wallet cards) --- */
+.sf-sharp-pct {
+  font-size: 1.6rem;
+  font-weight: 800;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.0;
+}
+.sf-sharp-meta {
+  color: var(--muted);
+  font-size: 0.76rem;
+  margin-top: 2px;
+}
+
+/* --- Price block --- */
+.sf-price-grid {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  column-gap: 8px;
+  row-gap: 1px;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+.sf-price-grid .lbl { color: var(--muted); font-size: 0.7rem; letter-spacing: 0.12em; text-transform: uppercase; }
+.sf-price-grid .val { color: var(--text); }
+.sf-price-grid .val.purple { color: var(--purple); font-weight: 700; }
+.sf-price-grid .val.green  { color: var(--green); font-weight: 700; }
+.sf-price-grid .val.gold   { color: var(--gold); font-weight: 700; }
+.sf-price-grid .edge       { color: var(--green); font-weight: 700; }
+.sf-price-grid .edge.neg   { color: var(--red); }
+
+/* --- Pill tag (compact, less shouty than the existing sf-badge) --- */
+.sf-pill {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 10px;
+  font-size: 0.66rem;
+  letter-spacing: 0.1em;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  background: rgba(138,148,166,0.06);
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+.sf-pill.green  { color: var(--green); border-color: var(--green); background: var(--green-soft); }
+.sf-pill.gold   { color: var(--gold); border-color: var(--gold); background: var(--gold-soft); }
+.sf-pill.purple { color: var(--purple); border-color: var(--purple); background: var(--purple-soft); }
+.sf-pill.red    { color: var(--red); border-color: var(--red); background: var(--red-soft); }
+.sf-pill.cyan   { color: var(--cyan); border-color: var(--cyan); }
 .sf-bucket-row {
   display: grid;
   grid-template-columns: 70px 1fr 50px;
@@ -862,48 +1022,160 @@ def _factor_bar_color(value: float) -> str:
     return "lo"
 
 
-def _render_factor_block(factors: dict[str, Any]) -> str:
-    """Compact 1-line-per-factor block with a tiny horizontal bar. Renames
-    factors via FACTOR_LABELS — never claims they are probabilities."""
+def _pill(text: str, kind: str = "muted") -> str:
+    """Compact, less-shouty alternative to the rectangular sf-badge."""
+    return f"<span class='sf-pill {kind}'>{text}</span>"
+
+
+def _missing_tag(kind: str) -> str:
+    """Render a small neutral chip for missing data instead of a full row."""
+    return _pill(polished_missing(kind), "muted")
+
+
+def render_factor_bars(factors: dict[str, Any], *, limit: int = 5) -> str:
+    """`Why this edge exists` — compact factor bars with renamed labels.
+
+    Caps the visible list at `limit` so the card stays scannable; if there
+    are extra factors, we tack on a small chip indicating how many more
+    were compressed away."""
     if not factors:
-        return ""
-    rows: list[str] = []
+        return f"<div class='sf-section'><div class='sf-section-title'>Why this edge exists</div>{_missing_tag('factors')}</div>"
+    items: list[tuple[str, float]] = []
     for name, value in factors.items():
         if value is None:
             continue
         try:
-            v = float(value)
+            items.append((name, float(value)))
         except (TypeError, ValueError):
             continue
+    if not items:
+        return f"<div class='sf-section'><div class='sf-section-title'>Why this edge exists</div>{_missing_tag('factors')}</div>"
+    # Sort by magnitude so the loudest contributor shows up first.
+    items.sort(key=lambda kv: kv[1], reverse=True)
+    visible = items[:limit]
+    hidden = max(0, len(items) - limit)
+    rows: list[str] = []
+    for name, v in visible:
         label = factor_label_fn(name)
         pct = max(0.0, min(100.0, v))
         color = _factor_bar_color(pct)
         rows.append(
-            f"<div class='sf-factor-row'>"
+            "<div class='sf-factor-row'>"
             f"<span class='lbl'>{label}</span>"
             f"<span class='sf-factor-bar {color}'><span style='width:{pct:.0f}%'></span></span>"
-            f"<span class='val'>{v:.0f}/100</span>"
-            f"</div>"
+            f"<span class='val'>{v:.0f}</span>"
+            "</div>"
         )
-    if not rows:
-        return ""
+    extra = f"<div class='sf-card-sub' style='margin-top:2px;'>+{hidden} more factor{'s' if hidden != 1 else ''}</div>" if hidden else ""
     return (
         "<div class='sf-section'>"
-        "<div class='sf-section-title'>Edge Composition</div>"
-        + "".join(rows[:8])
+        "<div class='sf-section-title'>Why this edge exists</div>"
+        + "".join(rows)
+        + extra
         + "</div>"
     )
 
 
+def render_market_price_block(edge: dict[str, Any]) -> str:
+    """Reference pricing block. Sportsbook is the visible quote; the
+    prediction-market row only renders when the edge actually carries
+    Kalshi/Polymarket fields. SignalForge estimate is shown only when the
+    backend provides one — we never invent a probability from the score."""
+    edge_type = str(edge.get("edge_type") or "").lower()
+    market_price = edge.get("best_price")
+    best_book = edge.get("best_book") or "—"
+    sb_implied = american_to_implied_probability(market_price)
+    sb_value = (
+        f"<span class='val'>{best_book} {american_from_price(market_price) or DASH}"
+        + (f" <span class='sf-card-sub'>· {sb_implied * 100:.1f}%</span>" if sb_implied is not None else "")
+        + "</span>"
+    )
+
+    pm_platform = str(edge.get("prediction_market_platform") or "").strip()
+    pm_side = edge.get("prediction_market_side")
+    pm_price = edge.get("prediction_market_price")
+    pm_value = None
+    if pm_platform and pm_price is not None:
+        platform_label = pm_platform.title() if pm_platform else "Market"
+        side_label = (str(pm_side or "").upper() + " ") if pm_side else ""
+        pm_value = f"<span class='val purple'>{platform_label} {side_label}{format_cents(pm_price)}</span>"
+
+    sf_prob = (
+        edge.get("model_probability")
+        or edge.get("signalforge_probability")
+        or edge.get("estimated_probability")
+    )
+    if edge_type == "pitcher_strikeouts":
+        sf_proj = edge.get("projected_strikeouts") or edge.get("projected_ks")
+        sf_unit = "Ks"
+    elif edge_type == "game_total":
+        sf_proj = edge.get("projected_total") or edge.get("model_projected_total")
+        sf_unit = ""
+    else:
+        sf_proj = None
+        sf_unit = ""
+
+    sf_value_parts: list[str] = []
+    if sf_prob is not None:
+        sf_value_parts.append(f"<span class='val purple'>{format_probability(sf_prob)}</span>")
+    if sf_proj is not None:
+        suffix = f" {sf_unit}".rstrip() if sf_unit else ""
+        sf_value_parts.append(f"<span class='val'>proj {sf_proj:.1f}{suffix}</span>")
+    if not sf_value_parts:
+        score = edge.get("score")
+        if score is not None:
+            sf_value_parts.append(f"<span class='val'>Score {fmt_score(score)}</span>")
+        else:
+            sf_value_parts.append(_missing_tag("projection"))
+
+    edge_value = None
+    pm_implied = None
+    if pm_price is not None:
+        try:
+            pm_implied = float(pm_price)
+            if pm_implied > 1:
+                pm_implied /= 100.0
+        except (TypeError, ValueError):
+            pm_implied = None
+    if sf_prob is not None and pm_implied is not None:
+        edge_str = edge_vs_market(sf_prob, pm_implied)
+        if edge_str is not None:
+            neg_cls = " neg" if edge_str.startswith("-") else ""
+            edge_value = f"<span class='edge{neg_cls}'>{edge_str} vs prediction market</span>"
+    elif sf_prob is not None and sb_implied is not None:
+        edge_str = edge_vs_market(sf_prob, sb_implied)
+        if edge_str is not None:
+            neg_cls = " neg" if edge_str.startswith("-") else ""
+            edge_value = f"<span class='edge{neg_cls}'>{edge_str} vs sportsbook</span>"
+
+    rows: list[tuple[str, str]] = []
+    if pm_value:
+        rows.append(("Prediction Market", pm_value))
+    rows.append((
+        "Sportsbook" if pm_value else "Reference price",
+        sb_value,
+    ))
+    rows.append(("SignalForge", " · ".join(sf_value_parts)))
+    if edge_value:
+        rows.append(("Market edge", edge_value))
+    elif sf_prob is not None and pm_implied is None:
+        rows.append(("Market edge", _missing_tag("projection")))
+    body = "".join(
+        f"<span class='lbl'>{k}</span>{v}" for k, v in rows
+    )
+    return f"<div class='sf-section'><div class='sf-section-title'>Pricing</div><div class='sf-price-grid'>{body}</div></div>"
+
+
 def _render_model_vs_market(edge: dict[str, Any]) -> str:
-    """For pitcher K and game total cards: market line, model projection,
-    edge delta, recent form. Never invents a projection."""
+    """Lightweight 'projection vs market line' block — only renders for
+    pitcher K and game total cards, and only when a real backend
+    projection field exists. Missing values collapse into a small chip
+    rather than a full ugly row."""
     edge_type = str(edge.get("edge_type") or "")
     if edge_type not in {"pitcher_strikeouts", "game_total"}:
         return ""
     rows: list[tuple[str, str]] = []
     line = edge.get("line")
-    market_price = edge.get("best_price")
     if edge_type == "pitcher_strikeouts":
         proj = (
             edge.get("projected_strikeouts")
@@ -915,47 +1187,39 @@ def _render_model_vs_market(edge: dict[str, Any]) -> str:
             or edge.get("recent_ks_per_start")
             or (edge.get("statcast_summary") or {}).get("strikeouts_per_start")
         )
-        rows.append(("Market line", f"{_fmt_line(line)} Ks" if line is not None else DASH))
+        if line is not None:
+            rows.append(("Market line", f"{_fmt_line(line)} Ks"))
         if proj is not None:
-            rows.append(("SignalForge projection", f"{_fmt_line(proj)} Ks"))
+            rows.append(("SF projection", f"{_fmt_line(proj)} Ks"))
             rows.append(("Edge delta", format_edge_delta(proj, line, unit="Ks")))
-        else:
-            rows.append(("SignalForge projection", "Projection unavailable"))
         if recent is not None:
-            rows.append(("Recent Ks/start", _fmt_line(recent)))
-        rows.append(("Market price", format_price_with_implied_prob(market_price)))
+            rows.append(("Recent K/start", _fmt_line(recent)))
     else:
-        env_score = (edge.get("factors") or {}).get("environment")
         proj = edge.get("projected_total") or edge.get("model_projected_total")
-        rows.append(("Market total", _fmt_line(line) if line is not None else DASH))
+        if line is not None:
+            rows.append(("Market total", _fmt_line(line)))
         if proj is not None:
-            rows.append(("SignalForge projected total", _fmt_line(proj)))
+            rows.append(("SF projection", _fmt_line(proj)))
             rows.append(("Edge delta", format_edge_delta(proj, line)))
-        else:
-            note = "Projection unavailable"
-            if env_score is not None:
-                note = "Model projection unavailable; environment score only."
-            rows.append(("SignalForge projected total", note))
-        if env_score is not None:
-            try:
-                rows.append(("Environment rating", f"{float(env_score):.0f}/100"))
-            except (TypeError, ValueError):
-                pass
-        rows.append(("Market price", format_price_with_implied_prob(market_price)))
-    body = "".join(
-        f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows
-    )
+
+    if not rows:
+        return ""
+    # If we have a market line but no projection, append the polished tag
+    # instead of an entire 'Projection unavailable' row.
+    has_projection = any("projection" in k.lower() for k, _ in rows)
+    suffix = "" if has_projection else f"<div style='margin-top:3px;'>{_missing_tag('projection')}</div>"
+    body = "".join(f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows)
     return (
         "<div class='sf-section'>"
         "<div class='sf-section-title'>Model vs Market</div>"
-        f"<div class='sf-kv'>{body}</div>"
+        f"<div class='sf-kv'>{body}</div>{suffix}"
         "</div>"
     )
 
 
 def _render_recent_form(edge: dict[str, Any]) -> str:
-    """Recent-form panel for pitcher K cards. Uses real fields only — when
-    backend doesn't expose them yet, the row reads 'Insufficient history'."""
+    """Recent-form panel for pitcher K cards. Real fields only — if a row
+    is missing, it's omitted; a single neutral chip explains the gap."""
     if str(edge.get("edge_type") or "") != "pitcher_strikeouts":
         return ""
     line = edge.get("line")
@@ -977,45 +1241,42 @@ def _render_recent_form(edge: dict[str, Any]) -> str:
     hits5 = edge.get("hits_last_5_vs_line") or summary.get("hits_last_5_vs_line")
     att5 = edge.get("attempts_last_5_vs_line") or summary.get("attempts_last_5_vs_line")
 
-    def row(label: str, value: str) -> str:
-        return f"<div class='k'>{label}</div><div class='v'>{value}</div>"
-
-    rows: list[str] = []
-    rows.append(
-        row(
-            "Last 3 starts K/start",
-            _fmt_line(last3) if last3 is not None else "Insufficient history",
-        )
-    )
-    rows.append(
-        row(
-            "Last 5 starts K/start",
-            _fmt_line(last5) if last5 is not None else
-            (_fmt_line(recent_kps) if recent_kps is not None else "Insufficient history"),
-        )
-    )
-    rows.append(
-        row(
-            "Season K/start",
-            _fmt_line(season_kps) if season_kps is not None else "Insufficient history",
-        )
-    )
+    rows: list[tuple[str, str]] = []
+    if last3 is not None:
+        rows.append(("Last 3 K/start", _fmt_line(last3)))
+    if last5 is not None:
+        rows.append(("Last 5 K/start", _fmt_line(last5)))
+    elif recent_kps is not None:
+        rows.append(("Recent K/start", _fmt_line(recent_kps)))
+    if season_kps is not None:
+        rows.append(("Season K/start", _fmt_line(season_kps)))
     if line is not None:
-        rows.append(row(f"Hit rate vs {_fmt_line(line)} (last 5)", format_hit_rate(hits5, att5)))
-        rows.append(row(f"Hit rate vs {_fmt_line(line)} (last 10)", format_hit_rate(hits10, att10)))
-    else:
-        rows.append(row("Hit rate vs line", "hit rate unavailable"))
+        rate5 = format_hit_rate(hits5, att5)
+        if rate5 != "insufficient history":
+            rows.append((f"Hit rate vs {_fmt_line(line)} (5)", rate5))
+        rate10 = format_hit_rate(hits10, att10)
+        if rate10 != "insufficient history":
+            rows.append((f"Hit rate vs {_fmt_line(line)} (10)", rate10))
+
+    if not rows:
+        return (
+            "<div class='sf-section'>"
+            "<div class='sf-section-title'>Recent Form</div>"
+            f"{_missing_tag('history')}"
+            "</div>"
+        )
+    body = "".join(f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows)
     return (
         "<div class='sf-section'>"
         "<div class='sf-section-title'>Recent Form</div>"
-        f"<div class='sf-kv'>{''.join(rows)}</div>"
+        f"<div class='sf-kv'>{body}</div>"
         "</div>"
     )
 
 
 def _movement_tags(edge: dict[str, Any]) -> list[tuple[str, str]]:
-    """Return movement-related tags (label, kind) only when fields support
-    them. Never invents direction."""
+    """Movement chips. Only emitted when a real underlying field supports
+    the claim — we never invent a 'STEAM' tag."""
     tags: list[tuple[str, str]] = []
     direction = str(edge.get("movement_direction") or "").lower()
     if direction in {"steam", "steaming"}:
@@ -1047,58 +1308,74 @@ def _render_movement_clv(edge: dict[str, Any]) -> str:
     rows: list[tuple[str, str]] = []
     has_line = any(v is not None for v in (opening_line, current_line, closing_line))
     if has_line:
-        start = _fmt_line(opening_line)
-        mid = _fmt_line(current_line)
-        end = _fmt_line(closing_line) if closing_line is not None else (
-            "pending" if not graded else DASH
-        )
-        rows.append(("Line", f"{start} → {mid} → {end}"))
-    if best_price is not None or closing_price is not None:
+        # Skip 'open → current' when both are identical — that's the engine
+        # default and reads as visual clutter rather than information.
+        start = opening_line
+        cur = current_line
+        end = closing_line
+        parts: list[str] = []
+        if start is not None:
+            parts.append(_fmt_line(start))
+        if cur is not None and (start is None or abs(float(cur) - float(start)) > 1e-9):
+            parts.append(_fmt_line(cur))
+        if end is not None:
+            parts.append(_fmt_line(end))
+        elif not graded:
+            parts.append("<span class='sf-pill muted'>" + polished_missing("closing") + "</span>")
+        if len(parts) >= 2:
+            rows.append(("Line", " → ".join(parts)))
+
+    if best_price is not None and closing_price is not None:
         sp = american_from_price(best_price) or DASH
-        cp = american_from_price(closing_price) if closing_price is not None else (
-            "pending" if not graded else DASH
-        )
+        cp = american_from_price(closing_price) or DASH
         rows.append(("Price", f"{sp} → {cp}"))
+
     if clv_percent is not None or clv_points is not None:
         points = (
             f"{float(clv_points):+.1f} pts" if clv_points is not None else DASH
         )
         pct = fmt_pct(clv_percent) if clv_percent is not None else DASH
         rows.append(("CLV", f"{points} · {pct}"))
-    else:
-        rows.append(
-            ("CLV", "pending" if not graded else "Closing line not captured yet")
-        )
 
-    if not has_line and best_price is None and closing_price is None and clv_percent is None:
+    tags = _movement_tags(edge)
+
+    if not rows and not tags:
+        # No movement data, no closing line, nothing to show. Collapse to a
+        # neutral chip rather than a big empty section header.
         return (
             "<div class='sf-section'>"
-            "<div class='sf-section-title'>Market Movement & CLV</div>"
-            "<div class='sf-meta'>Movement unavailable</div>"
+            "<div class='sf-section-title'>Market Movement &amp; CLV</div>"
+            f"{_missing_tag('movement')}"
             "</div>"
         )
 
     body = "".join(f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows)
-    tags = _movement_tags(edge)
-    tag_html = "".join(badge(t, kind) for t, kind in tags)
-    tag_block = f"<div style='margin-top:4px;'>{tag_html}</div>" if tag_html else ""
+    tag_html = " ".join(_pill(t, kind) for t, kind in tags)
+    tag_block = f"<div style='margin-top:3px;'>{tag_html}</div>" if tag_html else ""
+    clv_chip = (
+        f"<div style='margin-top:3px;'>{_missing_tag('clv_pending')}</div>"
+        if not graded and clv_percent is None and clv_points is None
+        else ""
+    )
     return (
         "<div class='sf-section'>"
-        "<div class='sf-section-title'>Market Movement & CLV</div>"
+        "<div class='sf-section-title'>Market Movement &amp; CLV</div>"
         f"<div class='sf-kv'>{body}</div>"
+        f"{clv_chip}"
         f"{tag_block}"
         "</div>"
     )
 
 
-def _render_trust(edge: dict[str, Any], *, odds_source: str, fallback: bool) -> str:
-    """Trust panel: data fresh / odds source / book count / Statcast / warnings."""
+def render_trust_tags(edge: dict[str, Any], *, odds_source: str, fallback: bool) -> str:
+    """Single-line trust strip. Severe warnings (high chase, stale odds)
+    surface explicitly; everything else stays compact and unobtrusive."""
     fresh = not bool(edge.get("odds_stale"))
     data_age = edge.get("odds_data_age_minutes")
     odds_fresh_label = "Odds fresh" if fresh else "Odds stale"
-    fresh_cls = "ok" if fresh else "warn"
     if data_age is not None:
-        odds_fresh_label += f" ({data_age}m)"
+        odds_fresh_label += f" · {data_age}m"
+    fresh_cls = "ok" if fresh else "warn"
 
     factors = edge.get("factors") or {}
     book_count = (
@@ -1110,68 +1387,69 @@ def _render_trust(edge: dict[str, Any], *, odds_source: str, fallback: bool) -> 
         book_count_int = int(book_count) if book_count else 0
     except (TypeError, ValueError):
         book_count_int = 0
-    book_label = f"{book_count_int} books" if book_count_int else "books ?"
-    book_cls = "ok" if book_count_int >= 2 else "neutral"
 
     sources = [str(s) for s in (edge.get("data_sources_used") or [])]
     statcast_ok = any("statcast" in s.lower() for s in sources)
-    statcast_label = "Cached Statcast" if statcast_ok else "Statcast missing"
-    statcast_cls = "ok" if statcast_ok else "neutral"
-    if str(edge.get("edge_type") or "") == "game_total":
-        statcast_label = "Statcast n/a"
-        statcast_cls = "neutral"
+    is_pitcher = str(edge.get("edge_type") or "") == "pitcher_strikeouts"
 
     warnings = edge.get("warnings") or []
-    warn_label = f"{len(warnings)} warnings" if warnings else "no warnings"
-    warn_cls = "warn" if warnings else "ok"
-
     chase = str(edge.get("chase_risk") or "").lower()
-    chase_label = f"chase: {chase or '?'}"
-    chase_cls = "warn" if chase == "high" else ("neutral" if chase == "medium" else "ok")
 
-    market_scope = str(edge.get("market_scope") or "")
-    scope_label = market_scope.replace("_", " ").title() if market_scope else None
+    pieces: list[str] = [f"<span class='{fresh_cls}'>{'✓' if fresh else '⚠'} {odds_fresh_label}</span>"]
+    if book_count_int:
+        pieces.append(f"<span class='ok'>✓ {book_count_int} books</span>")
+    if is_pitcher:
+        pieces.append(
+            f"<span class='ok'>✓ Cached Statcast</span>"
+            if statcast_ok
+            else "<span class='neutral'>· Statcast pending</span>"
+        )
+    if fallback:
+        pieces.append("<span class='warn'>⚠ Fallback source</span>")
+    if chase == "high":
+        pieces.append("<span class='warn'>⚠ High chase</span>")
+    elif chase == "medium":
+        pieces.append("<span class='neutral'>· Med chase</span>")
+    # Warnings only when severe — quiet by default.
+    if len(warnings) >= 3:
+        pieces.append(f"<span class='warn'>⚠ {len(warnings)} warnings</span>")
+    return f"<div class='sf-trust'>{''.join(pieces)}</div>"
 
-    source_label = f"src: {odds_source}"
-    source_cls = "neutral" if fallback else "ok"
 
-    pieces: list[str] = [
-        f"<span class='{fresh_cls}'>{'✓' if fresh else '⚠'} {odds_fresh_label}</span>",
-        f"<span class='{source_cls}'>{'✓' if not fallback else '⚠'} {source_label}</span>",
-        f"<span class='{book_cls}'>{'✓' if book_cls == 'ok' else '·'} {book_label}</span>",
-        f"<span class='{statcast_cls}'>{'✓' if statcast_cls == 'ok' else '·'} {statcast_label}</span>",
-        f"<span class='{warn_cls}'>{'✓' if not warnings else '⚠'} {warn_label}</span>",
-        f"<span class='{chase_cls}'>· {chase_label}</span>",
-    ]
-    if scope_label:
-        pieces.append(f"<span class='neutral'>· {scope_label}</span>")
+def render_time_context(edge: dict[str, Any], *, now: datetime | None = None) -> str:
+    """Compact 'event · last update · data age' line. Uses tabular-num
+    timestamps so the row doesn't shimmy as values tick over."""
+    base_now = now or datetime.now(timezone.utc)
+    game_start = edge.get("game_start_time")
+    game_date = edge.get("game_date")
+    event_label = fmt_event_time(game_start) if game_start else (game_date or DASH)
+    odds_captured_at = edge.get("odds_snapshot_captured_at")
+    best_book_at = edge.get("best_book_updated_at")
+    data_age = edge.get("odds_data_age_minutes")
+    age_label = f"{data_age}m" if data_age is not None else compact_time_ago(odds_captured_at, now=base_now)
+    book_move = compact_time_ago(best_book_at, now=base_now)
+    book_segment = f" · book moved {book_move}" if book_move != DASH else ""
     return (
-        "<div class='sf-section'>"
-        "<div class='sf-section-title'>Trust</div>"
-        f"<div class='sf-trust'>{''.join(pieces)}</div>"
-        "</div>"
+        f"<div class='sf-card-sub'>{event_label} · odds {age_label} ago{book_segment}</div>"
     )
 
 
+def _live_dot(edge: dict[str, Any]) -> str:
+    """Pulse dot when the odds are fresh; static dim dot otherwise."""
+    if edge.get("odds_stale"):
+        return "<span class='pulse-dot' style='background:var(--red);box-shadow:none;animation:none;'></span>"
+    return "<span class='pulse-dot'></span>"
+
+
 def render_edge_card(edge: dict[str, Any]) -> None:
-    """Dense MLB edge card. Sections:
-        1. Header (matchup + side/line + score)
-        2. Label + chips (HIGH CONV / ACTIONABLE WATCH / PASS / WATCH SETUP)
-        3. Sportsbook line (book · price + implied prob)
-        4. Model vs Market
-        5. Recent Form (pitcher K only)
-        6. Edge Composition (factor bars)
-        7. Market Movement & CLV
-        8. Reasons + warnings
-        9. Trust panel
-    """
+    """Premium edge card. Single source of truth for the visual hierarchy
+    used across Command Center, MLB Terminal, Daily Card."""
     score = edge.get("score")
     label, label_kind = confidence_label_fn(
         score,
         edge.get("action"),
         edge.get("confidence"),
     )
-    # Map new tier kinds back to the existing left-border CSS class.
     card_kind = {
         "gold": "gold",
         "green": "green",
@@ -1181,85 +1459,122 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         "muted": "",
     }.get(label_kind, "")
 
-    market = edge.get("market") or DASH
-    matchup = matchup_from_market(market)
-    side = (edge.get("side") or DASH).title()
+    title = format_card_title(edge)
+    side = (edge.get("side") or "").title()
     line = edge.get("line")
     line_str = _fmt_line(line)
-    book = edge.get("best_book") or DASH
-    best_price = edge.get("best_price")
-    price_label = format_price_with_implied_prob(best_price)
-    action = edge.get("action") or DASH
-    edge_type = edge.get("edge_type") or ""
-
-    game_start = edge.get("game_start_time")
-    game_date = edge.get("game_date")
-    event_label = fmt_event_time(game_start) if game_start else (game_date or DASH)
-    created_at = edge.get("created_at")
-    odds_captured_at = edge.get("odds_snapshot_captured_at")
-    best_book_at = edge.get("best_book_updated_at")
+    edge_type = str(edge.get("edge_type") or "")
     odds_source, fallback = odds_provider_label(edge.get("odds_snapshot_source"))
-    data_age = edge.get("odds_data_age_minutes")
-    data_age_label = f"{data_age}m" if data_age is not None else DASH
     odds_stale = bool(edge.get("odds_stale"))
 
+    sub_bits: list[str] = []
+    home = team_short(edge.get("home_team"))
+    away = team_short(edge.get("away_team"))
+    if home and away and edge_type == "pitcher_strikeouts":
+        sub_bits.append(f"{away} @ {home}")
+    if line is not None and side and edge_type != "pitcher_strikeouts":
+        sub_bits.append(f"{side} {line_str}")
+    market_scope = str(edge.get("market_scope") or "")
+    if market_scope and market_scope.lower() != "player_prop" and market_scope.lower() != "full_game_total":
+        sub_bits.append(market_scope.replace("_", " ").title())
+    sub_label = " · ".join(sub_bits) if sub_bits else (edge.get("market") or "")
+
+    # Header right-rail: score is the primary, model probability (when
+    # available) is the secondary readout. The score never claims to be a
+    # probability — but if the backend supplies one, we show it explicitly.
+    sf_prob = (
+        edge.get("model_probability")
+        or edge.get("signalforge_probability")
+        or edge.get("estimated_probability")
+    )
+    prob_row_parts: list[str] = [
+        f"<div class='sf-prob-cell'><div class='lbl'>Score</div>"
+        f"<div class='val'><span class='sf-score {score_class(score)}'>{fmt_score(score)}</span></div></div>"
+    ]
+    if sf_prob is not None:
+        prob_row_parts.append(
+            "<div class='sf-prob-cell'>"
+            "<div class='lbl'>SF prob</div>"
+            f"<div class='val purple'>{format_probability(sf_prob)}</div></div>"
+        )
+    market_price = edge.get("best_price")
+    sb_implied = american_to_implied_probability(market_price)
+    if sb_implied is not None:
+        prob_row_parts.append(
+            "<div class='sf-prob-cell'>"
+            "<div class='lbl'>Mkt implied</div>"
+            f"<div class='val'>{sb_implied * 100:.1f}%</div></div>"
+        )
+
+    # Pill chips — gold reserved for HIGH CONV, color hierarchy strict.
+    pills: list[str] = [_pill(label, label_kind)]
+    confidence_label_str, confidence_kind = confidence_word(edge.get("confidence"))
+    if confidence_label_str != label and confidence_kind != "muted":
+        pills.append(_pill(confidence_label_str, confidence_kind))
+    chase = str(edge.get("chase_risk") or "").lower()
+    if chase == "high":
+        pills.append(_pill("AVOID CHASE", "red"))
+    if odds_stale:
+        pills.append(_pill("STALE", "red"))
+    if fallback:
+        pills.append(_pill("FALLBACK", "purple"))
+    pill_html = " ".join(pills)
+
     reasons = (edge.get("reasons") or [])[:3]
-    warnings = edge.get("warnings") or []
     factors = edge.get("factors") or {}
 
-    badges = " ".join(filter(None, [
-        badge(label, label_kind),
-        confidence_badge(edge.get("confidence")),
-        chase_risk_badge(edge.get("chase_risk")),
-        badge(edge_type.replace("_", " "), "cyan") if edge_type else "",
-        badge("FALLBACK ODDS SOURCE", "purple") if fallback else "",
-        badge("Stale Odds", "red") if odds_stale else "",
-    ]))
-    warn_badges = " ".join(badge(w[:34], "red") for w in warnings[:3])
-
-    reasons_html = (
-        "<ul class='sf-reasons'>" +
-        "".join(f"<li>{r}</li>" for r in reasons) +
-        "</ul>"
-    ) if reasons else "<div class='sf-meta'>No supporting reasons returned.</div>"
-
-    factor_section = _render_factor_block(factors)
+    factor_section = render_factor_bars(factors)
+    price_section = render_market_price_block(edge)
     model_section = _render_model_vs_market(edge)
     form_section = _render_recent_form(edge)
     movement_section = _render_movement_clv(edge)
-    trust_section = _render_trust(edge, odds_source=odds_source, fallback=fallback)
+    trust_section = render_trust_tags(edge, odds_source=odds_source, fallback=fallback)
+    time_block = render_time_context(edge)
+
+    reasons_html = ""
+    if reasons:
+        # Dedupe near-identical reasons (the engine sometimes echoes the
+        # same fact in two ways). Keeps the bullet list under three.
+        seen: set[str] = set()
+        deduped: list[str] = []
+        for r in reasons:
+            key = re.sub(r"\s+", " ", str(r)).strip().lower()
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(r)
+        if deduped:
+            reasons_html = (
+                "<ul class='sf-reasons'>"
+                + "".join(f"<li>{r}</li>" for r in deduped[:3])
+                + "</ul>"
+            )
+
+    links_html = render_link_buttons([
+        ("Market", edge.get("market_url")),
+        ("Source", edge.get("source_url")),
+    ])
 
     body = f"""
     <div class="sf-card {card_kind}">
       <div class="sf-card-head">
         <div>
-          <div class="sf-card-title">{matchup}</div>
-          <div class="sf-card-sub">{side} {line_str} · {market}</div>
-          <div class="sf-card-sub">Event: {event_label} · Signal: {fmt_relative(created_at)} · Odds: {fmt_relative(odds_captured_at)} · Age: {data_age_label}</div>
+          <div class="sf-card-title">{_live_dot(edge)}{title}</div>
+          <div class="sf-card-sub">{sub_label}</div>
+          {time_block}
         </div>
-        <div style="text-align:right;">
-          <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
-          <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
-          <div class="sf-card-sub">{book} · {price_label}</div>
+        <div class="sf-prob-row" style="margin-left:auto;">
+          {''.join(prob_row_parts)}
         </div>
       </div>
-      <div>{badges}</div>
-      <div class="sf-card-row"><span class="k">Action:</span>{action} · <span class="k">Best book updated:</span>{fmt_relative(best_book_at)}</div>
+      <div style="margin-bottom:4px;">{pill_html}</div>
+      {price_section}
       {model_section}
       {form_section}
       {factor_section}
       {movement_section}
-      <div class="sf-section">
-        <div class="sf-section-title">Reasons</div>
-        {reasons_html}
-        {('<div class="sf-card-row"><span class="k">Warnings:</span>' + '; '.join(warnings[:3]) + '</div>') if warnings else ''}
-        <div style="margin-top:4px;">{warn_badges}</div>
-      </div>
-      {trust_section}
-      {render_link_buttons([
-          ("Open Market", edge.get("market_url")),
-          ("Source", edge.get("source_url")),
-      ])}
+      {('<div class="sf-section"><div class="sf-section-title">Why we like it</div>' + reasons_html + '</div>') if reasons_html else ''}
+      <div class="sf-section">{trust_section}</div>
+      {links_html}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
@@ -1312,16 +1627,49 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
         f"{signal.get('consensus_direction', DASH)}"
     )
 
-    badges_html = " ".join([
-        badge(tier, tier_kind),
-        badge(f"src: {source}", "purple" if source == "Falcon" else "cyan"),
-        badge(side, "green" if side in {"YES", "BUY"} else ("red" if side in {"NO", "SELL"} else "muted")),
-    ])
+    pills_html = " ".join(filter(None, [
+        _pill(tier, tier_kind),
+        _pill(f"SRC {source}", "purple" if source == "Falcon" else "cyan") if source else "",
+        _pill(side, "green" if side in {"YES", "BUY"} else ("red" if side in {"NO", "SELL"} else "muted")) if side else "",
+    ]))
 
     event_label = event_date or (fmt_event_time(market_end) if market_end else DASH)
     updated_label = fmt_relative(market_updated)
-    signal_label = fmt_relative(signal_created)
-    resolve_label = fmt_event_time(market_end) if market_end else DASH
+
+    # Sharp money block: hide entirely when no wallet alignment data exists.
+    consensus_wallets = signal.get("consensus_wallets") or 0
+    consensus_total = signal.get("consensus_total_size")
+    consensus_direction = signal.get("consensus_direction") or ""
+    consensus_largest = signal.get("consensus_largest") or ""
+    largest_size = next(
+        (t.get("size_usd") for t in consensus_traders if t.get("name") == consensus_largest),
+        None,
+    )
+    alignment_pct = wallet_alignment_percent(consensus_wallets, consensus_wallets)
+    # When the watchlist hasn't recorded an opposing side we treat all
+    # tracked wallets as aligned (100%). That's not a fabrication — it
+    # mirrors what `consensus_wallets` already counts.
+    sharp_block = ""
+    if consensus_wallets:
+        align_label = "100%" if alignment_pct is None else f"{alignment_pct:.0f}%"
+        size_label = format_money_short(consensus_total)
+        largest_label = (
+            f"{consensus_largest} · {format_money_short(largest_size)}"
+            if consensus_largest and largest_size is not None
+            else consensus_largest or DASH
+        )
+        consensus_side = consensus_direction or DASH
+        sharp_block = (
+            "<div class='sf-section'>"
+            "<div class='sf-section-title'>Sharp Wallet Alignment</div>"
+            f"<div class='sf-sharp-pct'>{align_label}</div>"
+            "<div class='sf-sharp-meta'>"
+            f"{consensus_wallets} tracked wallet{'s' if consensus_wallets != 1 else ''} · {size_label} exposure"
+            "</div>"
+            f"<div class='sf-sharp-meta'>Largest entry: {largest_label}</div>"
+            f"<div class='sf-sharp-meta'>Consensus: {consensus_side}</div>"
+            "</div>"
+        )
 
     body = f"""
     <div class="sf-card {card_kind}">
@@ -1329,19 +1677,26 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
         <div>
           <div class="sf-card-title">{trader} <span class="sf-card-sub">{wallet}</span></div>
           <div class="sf-card-sub">{market}</div>
-          <div class="sf-card-sub">Event: {event_label} · Signal: {signal_label} · Updated: {updated_label} · Resolve: {resolve_label}</div>
+          <div class="sf-card-sub">{event_label} · signal {fmt_relative(signal_created)} · mkt {updated_label}</div>
         </div>
-        <div style="text-align:right;">
-                    <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
-                      <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
-          <div class="sf-card-sub">{side} {outcome} · entry {entry} · {size}</div>
+        <div class="sf-prob-row" style="margin-left:auto;">
+          <div class='sf-prob-cell'>
+            <div class='lbl'>Score</div>
+            <div class='val'><span class='sf-score {score_class(score)}'>{fmt_score(score)}</span></div>
+          </div>
+          <div class='sf-prob-cell'>
+            <div class='lbl'>Entry</div>
+            <div class='val'>{entry}</div>
+          </div>
+          <div class='sf-prob-cell'>
+            <div class='lbl'>Size</div>
+            <div class='val'>{size}</div>
+          </div>
         </div>
       </div>
-      <div>{badges_html}</div>
-      <div class="sf-card-row">{tag_badges}</div>
-      <div class="sf-card-row"><span class="k">Consensus:</span>{consensus_summary}</div>
-    <div class="sf-card-row"><span class="k">Wallet metrics:</span>insufficient history</div>
-      <div class="sf-card-row sf-meta">{reason}</div>
+      <div style="margin-bottom:4px;">{pills_html}</div>
+      {sharp_block}
+      {('<div class="sf-card-row sf-meta">' + reason + '</div>') if reason else ''}
       {market_links}
     </div>
     """
@@ -2109,6 +2464,43 @@ m7.metric(
 # =============================================================================
 
 with tab_command:
+    # Compact live ribbon — replaces the old bulky System Health card. Bulky
+    # provider diagnostics now live only in Odds Cache + Health/Debug.
+    provs_for_ribbon = providers_block
+    sources_online_n = sum(
+        1 for key in ("falcon", "odds_api", "weather_api", "mlb_stats_api")
+        if (provs_for_ribbon.get(key) or {}).get("configured")
+    )
+    rc_for_ribbon = (mlb_sources.get("row_counts") or {})
+    odds_cache_seg = (
+        f"<span class='ok'>Odds {odds_cache_status.title()}</span>"
+        if odds_cache_status == "fresh"
+        else (
+            f"<span class='warn'>Odds {odds_cache_status.title()}</span>"
+            if odds_cache_status in {"empty", "stale"}
+            else f"<span class='info'>Odds {odds_cache_status.title()}</span>"
+        )
+    )
+    last_refresh_seg = compact_time_ago(prev_refresh, now=now_utc) if prev_refresh else "just now"
+    ribbon_html = (
+        "<div class='sf-ribbon'>"
+        f"<span class='seg'><span class='pulse-dot'></span><span class='ok'>LIVE</span></span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'><span class='lbl'>Games</span>{rc_for_ribbon.get('mlb_games', 0)}</span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'>{odds_cache_seg}</span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'><span class='lbl'>Sources</span>{sources_online_n}</span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'><span class='lbl'>Edges</span>{len(mlb_edges_all)}</span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'><span class='lbl'>High Conv</span>{len(high_conviction)}</span>"
+        f"<span class='sep'>·</span>"
+        f"<span class='seg'><span class='lbl'>Refresh</span>{last_refresh_seg}</span>"
+        "</div>"
+    )
+    st.markdown(ribbon_html, unsafe_allow_html=True)
+
     left, right = st.columns([3, 2], gap="medium")
 
     with left:
@@ -2167,42 +2559,27 @@ with tab_command:
             )
 
     with right:
-        st.markdown("### System Health")
-        provs = providers_block
-        sources_online = sum(
-            1 for key in ("falcon", "odds_api", "weather_api", "mlb_stats_api")
-            if (provs.get(key) or {}).get("configured")
-        )
-        rc = (mlb_sources.get("row_counts") or {})
-        summary_lines = "".join([
-            f"<div class='sf-card-row'>{badge('SYSTEM LIVE', 'green')}</div>",
-            f"<div class='sf-card-row'>{badge('DATA HEALTHY', 'cyan')}</div>",
-            f"<div class='sf-card-row'>MLB games tracked: {rc.get('mlb_games', 0)}</div>",
-            f"<div class='sf-card-row'>Prop snapshots: {rc.get('pitcher_prop_snapshots', 0)}</div>",
-            f"<div class='sf-card-row'>Odds cache: {odds_cache_status.upper()}</div>",
-            f"<div class='sf-card-row'>Sources online: {sources_online}</div>",
-        ])
-        st.markdown(
-            "<div class='sf-card'>" + summary_lines + "</div>",
-            unsafe_allow_html=True,
-        )
-
         st.markdown("### Market Pulse")
         rc = (mlb_sources.get("row_counts") or {})
-        edges_block_total = len(mlb_edges_all)
         edges_with_warnings = sum(1 for e in mlb_edges_all if e.get("warnings"))
-        st.markdown(
-            "<div class='sf-card'>"
-            + f"<div class='sf-card-row'><span class='k'>MLB games:</span>{rc.get('mlb_games', 0)}</div>"
-            + f"<div class='sf-card-row'><span class='k'>Odds snapshots:</span>{rc.get('odds_snapshots', 0)}</div>"
-            + f"<div class='sf-card-row'><span class='k'>Pitcher prop snapshots:</span>{rc.get('pitcher_prop_snapshots', 0)}</div>"
-            + f"<div class='sf-card-row'><span class='k'>Active edges:</span>{edges_block_total}</div>"
-            + f"<div class='sf-card-row'><span class='k'>High conviction:</span>{len(high_conviction)}</div>"
-            + f"<div class='sf-card-row'><span class='k'>Missing odds:</span>{len(missing_odds_edges)}</div>"
-            + f"<div class='sf-card-row'><span class='k'>With warnings:</span>{edges_with_warnings}</div>"
-            + "</div>",
-            unsafe_allow_html=True,
-        )
+
+        def _chip(label: str, value: Any, kind: str = "") -> str:
+            return (
+                f"<div class='sf-chip {kind}'><span class='lbl'>{label}</span>"
+                f"<span class='val'>{value}</span></div>"
+            )
+
+        chip_kind_for_count = lambda n, ok_min=1: ("ok" if n >= ok_min else "")  # noqa: E731
+        chips = "".join([
+            _chip("Games", rc.get("mlb_games", 0), chip_kind_for_count(rc.get("mlb_games", 0))),
+            _chip("Edges", len(mlb_edges_all), chip_kind_for_count(len(mlb_edges_all))),
+            _chip("High Conv", len(high_conviction), "ok" if high_conviction else ""),
+            _chip("Odds Snaps", rc.get("odds_snapshots", 0), "info"),
+            _chip("Prop Snaps", rc.get("pitcher_prop_snapshots", 0), "info"),
+            _chip("Warnings", edges_with_warnings, "warn" if edges_with_warnings else ""),
+            _chip("Missing Odds", len(missing_odds_edges), "warn" if missing_odds_edges else ""),
+        ])
+        st.markdown(f"<div class='sf-chips'>{chips}</div>", unsafe_allow_html=True)
 
         st.markdown("### Recent Alerts")
         recent_sent = [a for a in alerts_all if a.get("status") == "sent"][:5]

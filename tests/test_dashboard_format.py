@@ -16,15 +16,23 @@ from app.utils.dashboard_format import (
     compact_time_ago,
     confidence_label,
     confidence_word,
+    edge_vs_market,
     factor_label,
+    format_card_title,
+    format_cents,
     format_edge_delta,
     format_hit_rate,
+    format_money_short,
     format_price_with_implied_prob,
+    format_probability,
     odds_provider_label,
+    polished_missing,
     score_bucket_label,
     score_distribution,
     score_tier,
     score_tier_kind,
+    team_short,
+    wallet_alignment_percent,
 )
 
 
@@ -242,3 +250,156 @@ class TestCompactTimeAgo:
     def test_missing_returns_dash(self):
         assert compact_time_ago(None) == DASH
         assert compact_time_ago("") == DASH
+
+
+class TestCardTitleFormat:
+    def test_pitcher_strikeouts_clean_title(self):
+        edge = {
+            "edge_type": "pitcher_strikeouts",
+            "market": "Joe Ryan Strikeouts - Over 6.5",
+            "side": "over",
+            "line": 6.5,
+        }
+        assert format_card_title(edge) == "Joe Ryan — Over 6.5 Ks"
+
+    def test_pitcher_drops_dangling_hyphen_when_line_missing(self):
+        edge = {
+            "edge_type": "pitcher_strikeouts",
+            "market": "Joe Ryan Strikeouts -",
+            "side": "over",
+            "line": None,
+        }
+        # Should not end with a hyphen; should still describe the bet.
+        title = format_card_title(edge)
+        assert not title.rstrip().endswith("-")
+        assert "Joe Ryan" in title
+        assert "Over" in title
+
+    def test_game_total_with_team_names_uses_abbreviations(self):
+        edge = {
+            "edge_type": "game_total",
+            "market": "Full Game Total - Under 8.5",
+            "side": "under",
+            "line": 8.5,
+            "home_team": "Kansas City Royals",
+            "away_team": "New York Yankees",
+        }
+        assert format_card_title(edge) == "NYY @ KC — Under 8.5"
+
+    def test_game_total_without_team_names(self):
+        edge = {
+            "edge_type": "game_total",
+            "market": "Full Game Total - Over 9.0",
+            "side": "over",
+            "line": 9.0,
+        }
+        title = format_card_title(edge)
+        # Should still render a sensible 'Over 9' headline even with no
+        # team names — never the raw 'Full Game Total -' with hyphen.
+        assert "Over 9" in title
+        assert not title.endswith("-")
+
+    def test_unknown_edge_type_strips_trailing_hyphen(self):
+        edge = {
+            "edge_type": "weird_type",
+            "market": "Some Market -",
+            "side": None,
+            "line": None,
+        }
+        assert format_card_title(edge) == "Some Market"
+
+    def test_integer_line_renders_without_decimal(self):
+        edge = {
+            "edge_type": "pitcher_strikeouts",
+            "market": "Joe Ryan Strikeouts - Over 7",
+            "side": "over",
+            "line": 7,
+        }
+        assert format_card_title(edge) == "Joe Ryan — Over 7 Ks"
+
+
+class TestTeamShort:
+    def test_known_team(self):
+        assert team_short("New York Yankees") == "NYY"
+        assert team_short("Kansas City Royals") == "KC"
+        assert team_short("MIAMI MARLINS") == "MIA"
+
+    def test_unknown_team_passthrough(self):
+        assert team_short("Some New Franchise") == "Some New Franchise"
+
+    def test_empty_returns_empty(self):
+        assert team_short(None) == ""
+        assert team_short("") == ""
+
+
+class TestPolishedMissing:
+    def test_known_kinds_return_premium_phrasing(self):
+        assert polished_missing("projection") == "Model projection not yet calibrated"
+        assert polished_missing("history") == "Limited recent sample"
+        assert polished_missing("clv_pending") == "CLV pending"
+        assert polished_missing("closing") == "Awaiting closing line"
+        # Never the ugly raw 'pending' / 'insufficient history'.
+        for ugly in ("pending", "insufficient history", "n/a", "null", "None"):
+            for kind in ("projection", "history", "clv_pending", "closing", "movement"):
+                assert polished_missing(kind).lower() != ugly.lower()
+
+    def test_unknown_kind_falls_back(self):
+        assert polished_missing("not-a-kind") == "Data unavailable"
+
+
+class TestFormatProbability:
+    def test_fractional_input(self):
+        assert format_probability(0.42) == "42.0%"
+
+    def test_percent_input(self):
+        assert format_probability(42) == "42.0%"
+
+    def test_missing(self):
+        assert format_probability(None) == DASH
+        assert format_probability("") == DASH
+
+
+class TestFormatCents:
+    def test_fraction(self):
+        assert format_cents(0.34) == "34¢"
+
+    def test_int(self):
+        assert format_cents(34) == "34¢"
+
+    def test_missing(self):
+        assert format_cents(None) == DASH
+
+
+class TestEdgeVsMarket:
+    def test_signed_delta_in_percent(self):
+        assert edge_vs_market(0.5, 0.42) == "+8.0%"
+        assert edge_vs_market(0.4, 0.50) == "-10.0%"
+
+    def test_returns_none_when_missing(self):
+        assert edge_vs_market(None, 0.42) is None
+        assert edge_vs_market(0.5, None) is None
+
+
+class TestMoneyShort:
+    def test_thousands_and_millions(self):
+        assert format_money_short(95_000) == "$95k"
+        assert format_money_short(1_200_000) == "$1.2M"
+        assert format_money_short(412_000) == "$412k"
+
+    def test_small_value(self):
+        assert format_money_short(123) == "$123"
+
+    def test_missing(self):
+        assert format_money_short(None) == DASH
+
+
+class TestWalletAlignment:
+    def test_full_alignment(self):
+        assert wallet_alignment_percent(4, 4) == 100.0
+
+    def test_partial(self):
+        assert wallet_alignment_percent(3, 5) == 60.0
+
+    def test_missing_or_zero(self):
+        assert wallet_alignment_percent(None, 4) is None
+        assert wallet_alignment_percent(2, 0) is None
