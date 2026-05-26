@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import re
 import smtplib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from email.message import EmailMessage
 from typing import Literal
 
@@ -16,6 +17,11 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.models import Alert, Signal, Trade, Trader
+from app.utils.dashboard_format import (
+    american_to_implied_probability,
+    confidence_label,
+    factor_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +64,109 @@ class AlertDecision:
     action: str
     chase_risk: str
     reason: str
+
+
+_SLUG_DATE_RE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
+# A "human" market title contains a space or capital letter — anything else
+# (mlb-mia-tor-2026-05-25-spread-home-1pt5) is treated as the raw slug.
+_SLUG_LIKE_RE = re.compile(r"^[a-z0-9.\-]+$")
+
+
+def event_date_from_slug(slug: str | None) -> date | None:
+    """Extract the calendar date encoded in slugs like
+    `mlb-mia-tor-2026-05-25-spread-home-1pt5`. Returns None when the slug
+    has no parseable date — never throws."""
+    if not slug:
+        return None
+    m = _SLUG_DATE_RE.search(slug)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def market_expiration_reason(
+    signal: Signal,
+    *,
+    now: datetime | None = None,
+    grace_hours: int = 3,
+) -> str | None:
+    """Return a reason string if the market's event is already over.
+
+    Checks (cheapest first):
+      1. `Market.is_active is False`
+      2. `Market.end_date` is in the past (with `grace_hours` slack for late
+         settlement of live markets — without it, a market mid-game could be
+         marked done if its `end_date` is the scheduled first-pitch time).
+      3. Event date parsed out of the slug is before today's UTC date.
+
+    Returns None when the market is still in-play or its lifecycle can't be
+    determined (we'd rather alert on an unknown-state market than silently
+    drop signals from one without an `end_date`).
+    """
+    market = signal.market
+    if market is None:
+        return None
+    now = now or datetime.utcnow()
+    if market.is_active is False:
+        return "market is no longer active"
+    if market.end_date is not None and market.end_date + timedelta(hours=grace_hours) < now:
+        return f"market end_date {market.end_date.isoformat()} already passed"
+    event_date = event_date_from_slug(market.slug)
+    if event_date is not None and event_date < now.date():
+        return f"event date {event_date.isoformat()} in the past"
+    return None
+
+
+def _humanize_market(signal: Signal) -> dict[str, str]:
+    """Best-effort: return {matchup, contract, league} from slug + title.
+
+    Keeps a human-readable Market.title untouched. For slug-style titles like
+    `mlb-mia-tor-2026-05-25-spread-home-1pt5` we extract league, teams, and
+    the contract description so alerts read like a betting card.
+    """
+    market = signal.market
+    title = (market.title or "") if market else ""
+    slug = (market.slug or "") if market else ""
+
+    if title and not _SLUG_LIKE_RE.match(title):
+        return {"matchup": title, "contract": "", "league": ""}
+
+    if not slug:
+        return {"matchup": title or "Unknown market", "contract": "", "league": ""}
+
+    parts = slug.split("-")
+    league = parts[0].upper() if parts else ""
+
+    date_idx = None
+    for i in range(max(len(parts) - 2, 0)):
+        if (
+            re.fullmatch(r"20\d{2}", parts[i] or "")
+            and re.fullmatch(r"\d{2}", parts[i + 1] or "")
+            and re.fullmatch(r"\d{2}", parts[i + 2] or "")
+        ):
+            date_idx = i
+            break
+
+    if date_idx is None or date_idx < 2:
+        return {"matchup": title or slug, "contract": "", "league": league}
+
+    teams = [p.upper() for p in parts[1:date_idx]]
+    matchup = f"{teams[0]} @ {teams[1]}" if len(teams) >= 2 else " ".join(teams)
+    rest = parts[date_idx + 3:]
+    contract = ""
+    if rest[:1] == ["spread"] and len(rest) >= 3:
+        contract = f"Spread {rest[1].title()} {rest[2].replace('pt', '.')}"
+    elif rest[:1] == ["total"] and len(rest) >= 2:
+        contract = f"Total {rest[1].replace('pt', '.')}"
+    elif rest[:1] == ["moneyline"] and len(rest) >= 2:
+        contract = f"Moneyline {' '.join(p.title() for p in rest[1:])}"
+    elif rest:
+        contract = " ".join(p.title() for p in rest)
+
+    return {"matchup": f"{league} {matchup}".strip(), "contract": contract, "league": league}
 
 
 def _market_url(signal: Signal) -> str | None:
@@ -368,6 +477,15 @@ def evaluate_alert_decision(db: Session, signal: Signal, settings: Settings | No
     ctx = _load_alert_context(db, signal)
     min_trade_size = max(100.0, settings.min_trade_size_usd)
 
+    # Lifecycle gate first — alerts for already-finished events are pure
+    # noise. Caught here even before the trade-size floor so we never page
+    # an operator about a yesterday game.
+    expiration_reason = market_expiration_reason(signal)
+    if expiration_reason:
+        return AlertDecision(
+            "ignore", ctx, "Watch only", _chase_risk(ctx),
+            f"event expired ({expiration_reason})",
+        )
     if signal.size_usd is None or signal.size_usd <= min_trade_size:
         return AlertDecision("ignore", ctx, "Watch only", _chase_risk(ctx), "trade size below alert floor")
     if signal.entry_price is None or signal.entry_price <= 0:
@@ -451,14 +569,123 @@ def _trader_links(ctx: AlertContext, signal: Signal) -> str:
     return " | ".join(links) or "n/a"
 
 
+def _prob_pct(price: float | None) -> str | None:
+    """Wallet trades quote `price` as a 0–1 probability already (the
+    Polymarket convention). Skip the American-odds conversion path."""
+    if price is None:
+        return None
+    try:
+        p = float(price)
+    except (TypeError, ValueError):
+        return None
+    if p <= 0 or p >= 1:
+        return None
+    return f"{p * 100:.1f}%"
+
+
+def _entry_range_with_prob(ctx: AlertContext) -> str:
+    lo = ctx.entry_price_min
+    hi = ctx.entry_price_max
+    if lo is None or hi is None:
+        return "n/a"
+    if abs(lo - hi) < 0.0001:
+        prob = _prob_pct(lo)
+        suffix = f" ({prob})" if prob else ""
+        return f"{_price(lo)}{suffix}"
+    prob_lo = _prob_pct(lo)
+    prob_hi = _prob_pct(hi)
+    if prob_lo and prob_hi:
+        return f"{_price(lo)} ({prob_lo}) – {_price(hi)} ({prob_hi})"
+    return f"{_price(lo)} – {_price(hi)}"
+
+
+def _current_with_prob(ctx: AlertContext) -> str:
+    price = ctx.current_price
+    if price is None:
+        return "n/a"
+    prob = _prob_pct(price)
+    return f"{_price(price)} ({prob})" if prob else _price(price)
+
+
+def _price_movement_summary(ctx: AlertContext) -> str | None:
+    """Entry → current, with delta and direction. None if no movement data."""
+    first = ctx.first_entry_price
+    current = ctx.current_price
+    if first is None or current is None:
+        return None
+    delta = current - first
+    arrow = "→" if abs(delta) < 0.0001 else ("↑" if delta > 0 else "↓")
+    pct_delta = (delta / first * 100.0) if first else 0.0
+    return f"{_price(first)} {arrow} {_price(current)} ({pct_delta:+.1f}%)"
+
+
+def _time_to_event(market) -> tuple[str, str] | None:
+    """Returns ('Starts in 4h 12m', '2026-05-26 23:00 UTC') or None."""
+    if market is None:
+        return None
+    end = market.end_date
+    if end is None:
+        return None
+    now = datetime.utcnow()
+    delta = (end - now).total_seconds()
+    if delta < 0:
+        absdelta = -delta
+        if absdelta < 3600:
+            label = f"ended {int(absdelta // 60)}m ago"
+        elif absdelta < 86400:
+            label = f"ended {int(absdelta // 3600)}h ago"
+        else:
+            label = f"ended {int(absdelta // 86400)}d ago"
+    else:
+        if delta < 3600:
+            label = f"in {int(delta // 60)}m"
+        elif delta < 86400:
+            hours = int(delta // 3600)
+            mins = int((delta % 3600) // 60)
+            label = f"in {hours}h {mins:02d}m"
+        else:
+            days = int(delta // 86400)
+            hours = int((delta % 86400) // 3600)
+            label = f"in {days}d {hours}h"
+    iso = end.strftime("%Y-%m-%d %H:%M UTC")
+    return label, iso
+
+
+def _chase_emoji(risk: str) -> str:
+    return {"Low": "🟢", "Medium": "🟡", "High": "🔴"}.get(risk, "·")
+
+
+def _tier_emoji(tier: AlertTier) -> str:
+    """Public-facing tier glyph that matches the dashboard's vocabulary
+    (HIGH CONV gold / ACTIONABLE green / WATCH gray)."""
+    return {
+        "high_conviction": "🟡",
+        "possible_entry": "🟢",
+        "discord_alert": "⚪",
+    }.get(tier, "·")
+
+
+def _public_tier_label(decision: AlertDecision, signal: Signal) -> str:
+    """Combine the score-based dashboard label with the engine's tier so
+    operators see the same vocabulary across Discord and the terminal."""
+    label, _ = confidence_label(signal.score, decision.action)
+    tier_label = _tier_title(decision.tier)
+    if label and label != tier_label:
+        return f"{label} · {tier_label}"
+    return tier_label
+
+
 def _build_discord_embed(signal: Signal, decision: AlertDecision) -> dict:
     ctx = decision.context
-    market_title = signal.market.title if signal.market else f"market#{signal.market_id}"
+    market = signal.market
+    parts = _humanize_market(signal)
+    matchup = parts["matchup"]
+    contract = parts["contract"]
     market_url = _market_url(signal)
-    side = signal.side or "n/a"
-    if signal.outcome:
-        side = f"{side} / {signal.outcome}"
-    smart_money = f"{ctx.trader_count} wallet{'s' if ctx.trader_count != 1 else ''} aligned"
+    side = signal.side or "?"
+    outcome = signal.outcome or ""
+    side_block = f"{side} {outcome}".strip()
+
     first_at = ctx.first_entry_at or signal.created_at
     minutes = None
     if first_at and signal.created_at:
@@ -467,39 +694,88 @@ def _build_discord_embed(signal: Signal, decision: AlertDecision) -> dict:
     if minutes is not None and ctx.trader_count > 1:
         reason = f"{reason} ({ctx.trader_count} watched wallets within {minutes} min.)"
 
-    description = "\n".join(
-        [
-            f"Market: {market_title}",
-            f"Side: {side}",
-            f"Score: {signal.score:.0f}",
-            f"Smart money: {smart_money}",
-            f"Total tracked size: {_money(ctx.total_tracked_size)}",
-            f"Entry range: {_entry_range(ctx)}",
-            f"Current price: {_price(ctx.current_price)}",
-            f"Chase risk: {decision.chase_risk}",
-            f"Reason: {reason}",
-        ]
-    )
+    tier_label = _public_tier_label(decision, signal)
+    chase = _chase_emoji(decision.chase_risk)
+
+    header_bits = [
+        f"**Score:** {signal.score:.0f} · **{tier_label}**",
+        f"**Smart money:** {ctx.trader_count} wallet{'s' if ctx.trader_count != 1 else ''} · {_money(ctx.total_tracked_size)}",
+        f"**Side:** {side_block or 'n/a'}",
+        f"**Entry:** {_entry_range_with_prob(ctx)}",
+        f"**Current:** {_current_with_prob(ctx)}",
+    ]
+    movement = _price_movement_summary(ctx)
+    if movement:
+        header_bits.append(f"**Move:** {movement}")
+    header_bits.append(f"**Chase risk:** {chase} {decision.chase_risk}")
+
+    event_info = _time_to_event(market)
+    if event_info:
+        when_label, when_iso = event_info
+        header_bits.append(f"**Event:** {when_label} · {when_iso}")
+    elif market and getattr(market, "slug", None):
+        slug_date = event_date_from_slug(market.slug)
+        if slug_date:
+            header_bits.append(f"**Event date:** {slug_date.isoformat()}")
+
+    book_factors: list[str] = []
+    breakdown = signal.score_breakdown if isinstance(signal.score_breakdown, dict) else None
+    if breakdown:
+        for key in (
+            "trust_score",
+            "consensus_score",
+            "size_score",
+            "category_match",
+            "price_movement",
+        ):
+            value = breakdown.get(key)
+            if value is None:
+                continue
+            try:
+                book_factors.append(f"{factor_label(key)}: {float(value):.0f}/100")
+            except (TypeError, ValueError):
+                continue
+
+    description = "\n".join(header_bits)
+
+    fields = [
+        {"name": "Action", "value": decision.action, "inline": False},
+    ]
+    if book_factors:
+        fields.append({"name": "Edge composition", "value": "\n".join(book_factors[:5])[:1024], "inline": False})
+    fields.append({"name": "Reason", "value": (reason or "n/a")[:1024], "inline": False})
+    fields.append({"name": "Traders", "value": _trader_links(ctx, signal)[:1024], "inline": False})
+
     links = []
     if market_url:
         links.append(f"[Market]({market_url})")
     trader_url = _trader_url(signal)
     if trader_url:
         links.append(f"[Lead trader]({trader_url})")
+    source = (signal.source or "").strip()
+    fields.append({
+        "name": "Links",
+        "value": (" · ".join(links) or "n/a") + (f"  · source: {source}" if source else ""),
+        "inline": False,
+    })
+
+    title_main = matchup or "Unknown market"
+    if contract:
+        title_main = f"{title_main} · {contract}"
+    title = f"{_tier_emoji(decision.tier)} {tier_label} — {title_main}"
 
     embed = {
-        "title": f"{_tier_icon(decision.tier)} {_tier_title(decision.tier)} - {market_title}",
+        "title": title[:256],
         "description": description[:3900],
         "color": _discord_color(decision.tier),
-        "fields": [
-            {"name": "Action", "value": decision.action, "inline": False},
-            {"name": "Links", "value": " | ".join(links) or "n/a", "inline": False},
-            {"name": "Traders", "value": _trader_links(ctx, signal)[:1024], "inline": False},
-        ],
+        "fields": fields,
         "timestamp": (signal.created_at or datetime.utcnow()).isoformat(),
+        "footer": {"text": (market.slug or "")[:2048]} if market and market.slug else {"text": ""},
     }
     if market_url:
         embed["url"] = market_url
+    if not embed["footer"]["text"]:
+        embed.pop("footer", None)
     return embed
 
 

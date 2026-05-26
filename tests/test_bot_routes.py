@@ -112,18 +112,26 @@ def test_bot_high_conviction_returns_filtered_candidates(db_session: Session) ->
 
 
 def test_bot_high_conviction_returns_near_misses_and_event_date_filter(db_session: Session) -> None:
+    # Dates are computed relative to "now" so the new market-expiration
+    # guard (which rejects yesterday games) doesn't flake this test as the
+    # wall clock advances. The slug encodes the event date.
     now = datetime.utcnow()
+    today_str = now.date().isoformat()
+    yesterday_str = (now.date() - timedelta(days=1)).isoformat()
+    tomorrow = now.date() + timedelta(days=1)
     old_market = Market(
-        slug="mlb-old-game-2026-05-24",
+        slug=f"mlb-old-game-{yesterday_str}",
         title="Old Game",
         yes_price=0.5,
         volume_24h_usd=30_000,
+        end_date=now + timedelta(hours=4),
     )
     current_market = Market(
-        slug="mlb-current-game-2026-05-25",
+        slug=f"mlb-current-game-{tomorrow.isoformat()}",
         title="Current Game",
         yes_price=0.5,
         volume_24h_usd=30_000,
+        end_date=now + timedelta(days=1, hours=4),
     )
     trader = Trader(nickname="near-miss", wallet_address="0xabc", trust_score=70)
     db_session.add_all([old_market, current_market, trader])
@@ -162,15 +170,15 @@ def test_bot_high_conviction_returns_near_misses_and_event_date_filter(db_sessio
         db_session,
         limit=5,
         hours=24,
-        event_date_from=date(2026, 5, 25),
+        event_date_from=tomorrow,
     )
 
     assert payload["count"] == 0
-    assert payload["event_date_from"] == "2026-05-25"
+    assert payload["event_date_from"] == tomorrow.isoformat()
     assert len(payload["near_misses"]) == 1
     near_miss = payload["near_misses"][0]
     assert near_miss["market"] == "Current Game"
-    assert near_miss["event_date"] == "2026-05-25"
+    assert near_miss["event_date"] == tomorrow.isoformat()
     assert near_miss["failed_reason"] == "score below hard alert floor"
 
 

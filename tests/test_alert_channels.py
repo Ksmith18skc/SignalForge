@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import httpx
 
@@ -12,7 +12,10 @@ from app.services.alerts import (
     TelegramChannel,
     _discord_payload,
     _format_signal,
+    _humanize_market,
     evaluate_alert_decision,
+    event_date_from_slug,
+    market_expiration_reason,
 )
 
 
@@ -211,10 +214,13 @@ def test_alert_decision_high_conviction_from_aligned_wallets(db_session):
     assert decision.context.total_tracked_size == 3_420
     embed = payload["embeds"][0]
     assert "HIGH CONVICTION SIGNAL" in embed["title"]
-    assert "Market: Knicks +2.5 vs Cavs" in embed["description"]
-    assert "Side: BUY / Knicks" in embed["description"]
-    assert "Total tracked size: $3,420" in embed["description"]
-    assert "Entry range: 0.47-0.50" in embed["description"]
+    assert "Knicks +2.5 vs Cavs" in embed["title"]
+    assert "Side:" in embed["description"]
+    assert "BUY Knicks" in embed["description"]
+    # Both raw $ amount AND implied probability annotation surface in the new
+    # alpha embed; the operator should not have to mentally convert.
+    assert "$3,420" in embed["description"]
+    assert "0.47" in embed["description"] and "0.50" in embed["description"]
     assert "0xaaa" not in embed["title"]
 
 
@@ -480,7 +486,250 @@ def test_dispatcher_allows_market_summary_when_tier_upgrades(db_session):
     assert alerts[0].status == "sent"
 
 
-def test_dispatcher_skips_market_summary_without_tier_upgrade(db_session):
+# ---------------------------------------------------------------------------
+# Expired-market guard + alpha-embed regression tests
+# ---------------------------------------------------------------------------
+
+
+def test_event_date_from_slug_extracts_ymd():
+    assert event_date_from_slug("mlb-mia-tor-2026-05-25-spread-home-1pt5") == date(2026, 5, 25)
+    assert event_date_from_slug("wnba-por-nyl-2026-05-25-total-176pt5") == date(2026, 5, 25)
+
+
+def test_event_date_from_slug_handles_missing_or_bad():
+    assert event_date_from_slug(None) is None
+    assert event_date_from_slug("no-date-here") is None
+    assert event_date_from_slug("bogus-9999-99-99-bogus") is None
+
+
+def test_market_expiration_reason_flags_past_slug_date(db_session):
+    market = Market(slug="mlb-mia-tor-2026-05-25-spread-home-1pt5", title="m", yes_price=0.5)
+    db_session.add(market)
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Miami",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+    )
+    signal.market = market
+
+    reason = market_expiration_reason(signal, now=datetime(2026, 5, 26, 12, 0, 0))
+    assert reason is not None
+    assert "2026-05-25" in reason
+
+
+def test_market_expiration_reason_passes_today_event(db_session):
+    market = Market(slug="mlb-mia-tor-2026-05-26-spread-home-1pt5", title="m", yes_price=0.5)
+    db_session.add(market)
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Miami",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+    )
+    signal.market = market
+
+    reason = market_expiration_reason(signal, now=datetime(2026, 5, 26, 12, 0, 0))
+    assert reason is None
+
+
+def test_market_expiration_reason_flags_inactive_market(db_session):
+    market = Market(slug="any-market", title="m", yes_price=0.5, is_active=False)
+    db_session.add(market)
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Yes",
+        entry_price=0.5,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+    )
+    signal.market = market
+
+    reason = market_expiration_reason(signal)
+    assert reason == "market is no longer active"
+
+
+def test_alert_decision_rejects_expired_market(db_session):
+    """The scanner can still emit signals after a game finishes (lag, late
+    trade ingestion). The webhook must never fire for those events."""
+    now = datetime.utcnow()
+    yesterday = (now - timedelta(days=1)).date().isoformat()
+    market = Market(
+        slug=f"mlb-mia-tor-{yesterday}-spread-home-1pt5",
+        title=f"mlb-mia-tor-{yesterday}-spread-home-1pt5",
+        yes_price=0.37,
+        volume_24h_usd=30_000,
+        liquidity_usd=10_000,
+    )
+    trader = Trader(nickname="VeryLucky888", wallet_address="0xdef", trust_score=80)
+    db_session.add_all([market, trader])
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        trader_id=trader.id,
+        signal_type="multi_wallet_consensus",
+        side="BUY",
+        outcome="Miami Marlins",
+        entry_price=0.58,
+        size_usd=9_800,
+        score=72,
+        source="Falcon",
+        reason="4 watched wallets BUY Miami Marlins",
+        created_at=now,
+    )
+    signal.market = market
+    signal.trader = trader
+    db_session.add(signal)
+    db_session.flush()
+
+    decision = evaluate_alert_decision(db_session, signal, Settings())
+
+    assert decision.tier == "ignore"
+    assert "event expired" in decision.reason
+
+
+def test_alert_decision_rejects_market_end_date_in_past(db_session):
+    """Even if the slug has no date, an `end_date` in the past should
+    block the alert. Grace window is short enough for next-day cleanup."""
+    now = datetime.utcnow()
+    market = Market(
+        slug="kalshi-presidential-winner",
+        title="Will X win?",
+        yes_price=0.5,
+        end_date=now - timedelta(days=2),
+    )
+    trader = Trader(nickname="sharp", wallet_address="0xabc", trust_score=80)
+    db_session.add_all([market, trader])
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        trader_id=trader.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Yes",
+        entry_price=0.5,
+        size_usd=5_000,
+        score=82,
+        source="Falcon",
+        created_at=now,
+    )
+    signal.market = market
+    signal.trader = trader
+    db_session.add(signal)
+    db_session.flush()
+
+    decision = evaluate_alert_decision(db_session, signal, Settings())
+
+    assert decision.tier == "ignore"
+    assert "expired" in decision.reason
+
+
+def test_humanize_market_parses_mlb_spread_slug():
+    market = Market(
+        slug="mlb-mia-tor-2026-05-25-spread-home-1pt5",
+        title="mlb-mia-tor-2026-05-25-spread-home-1pt5",
+        platform="polymarket",
+    )
+    signal = Signal(
+        market_id=1, signal_type="x", side="BUY",
+        entry_price=0.5, size_usd=100, score=70, source="Falcon",
+    )
+    signal.market = market
+    parts = _humanize_market(signal)
+    assert parts["matchup"] == "MLB MIA @ TOR"
+    assert parts["contract"] == "Spread Home 1.5"
+
+
+def test_humanize_market_keeps_existing_human_title():
+    market = Market(
+        slug="knicks-cavs-spread",
+        title="Knicks +2.5 vs Cavs",
+        platform="polymarket",
+    )
+    signal = Signal(
+        market_id=1, signal_type="x", side="BUY",
+        entry_price=0.5, size_usd=100, score=70, source="Falcon",
+    )
+    signal.market = market
+    parts = _humanize_market(signal)
+    assert parts["matchup"] == "Knicks +2.5 vs Cavs"
+    # Already human, no contract to extract.
+    assert parts["contract"] == ""
+
+
+def test_discord_embed_uses_humanized_title_and_implied_prob(db_session):
+    """Alpha embed regression: title shows MLB matchup + contract, body
+    shows entry price with implied probability so an operator can read it
+    without translating Polymarket decimals."""
+    now = datetime.utcnow()
+    market = Market(
+        slug=f"mlb-mia-tor-{now.date().isoformat()}-spread-home-1pt5",
+        title=f"mlb-mia-tor-{now.date().isoformat()}-spread-home-1pt5",
+        yes_price=0.37,
+        volume_24h_usd=30_000,
+        liquidity_usd=10_000,
+        end_date=now + timedelta(hours=4),
+    )
+    traders = [
+        Trader(nickname="VeryLucky888", wallet_address="0xa", trust_score=82),
+        Trader(nickname="bananawoin", wallet_address="0xb", trust_score=70),
+    ]
+    db_session.add(market)
+    db_session.add_all(traders)
+    db_session.flush()
+    db_session.add_all([
+        Trade(
+            trader_id=traders[0].id, market_id=market.id, side="BUY",
+            outcome="Miami Marlins", price=0.58, size_usd=4_000,
+            source="Falcon", timestamp=now - timedelta(minutes=20),
+        ),
+        Trade(
+            trader_id=traders[1].id, market_id=market.id, side="BUY",
+            outcome="Miami Marlins", price=0.62, size_usd=2_500,
+            source="Falcon", timestamp=now - timedelta(minutes=5),
+        ),
+    ])
+    signal = Signal(
+        market_id=market.id, trader_id=traders[0].id,
+        signal_type="multi_wallet_consensus", side="BUY",
+        outcome="Miami Marlins", entry_price=0.58, size_usd=4_000,
+        score=82, source="Falcon", created_at=now,
+        reason="4 watched wallets aligned",
+    )
+    signal.market = market
+    signal.trader = traders[0]
+    db_session.add(signal)
+    db_session.flush()
+
+    decision = evaluate_alert_decision(db_session, signal, Settings())
+    payload = _discord_payload(signal, decision)
+    embed = payload["embeds"][0]
+
+    # Title contains humanized matchup + contract, not the raw slug.
+    assert "MLB MIA @ TOR" in embed["title"]
+    assert "Spread Home 1.5" in embed["title"]
+    # Description shows implied probability annotations.
+    description = embed["description"]
+    assert "Score:" in description
+    assert "Smart money:" in description
+    # 0.58 → 58.0%
+    assert "58.0%" in description or "62.0%" in description
+    # Footer retains the raw slug for forensics/dedup.
+    assert embed["footer"]["text"].startswith("mlb-mia-tor-")
     signal = _make_high_conviction_signal(db_session)
     previous = Signal(
         market_id=signal.market_id,
