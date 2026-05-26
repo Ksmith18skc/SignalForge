@@ -17,7 +17,11 @@ quickly. Without it, Discord global command propagation can take longer.
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
+from contextlib import contextmanager
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import discord
@@ -30,6 +34,30 @@ from app.utils.logging import configure_logging
 logger = logging.getLogger(__name__)
 
 REQUEST_TIMEOUT = 20.0
+
+
+@contextmanager
+def _single_instance_lock():
+    lock_file = Path(tempfile.gettempdir()) / "signalforge-discord-bot.lock"
+    handle = lock_file.open("w")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise SystemExit("Another SignalForge Discord bot process is already running.") from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                raise SystemExit("Another SignalForge Discord bot process is already running.") from exc
+        yield
+    finally:
+        handle.close()
 
 
 def _api_base() -> str:
@@ -329,7 +357,8 @@ def main() -> None:
     settings = get_settings()
     if not settings.discord_bot_token:
         raise SystemExit("SIGNALFORGE_DISCORD_BOT_TOKEN is required")
-    bot.run(settings.discord_bot_token)
+    with _single_instance_lock():
+        bot.run(settings.discord_bot_token)
 
 
 if __name__ == "__main__":
