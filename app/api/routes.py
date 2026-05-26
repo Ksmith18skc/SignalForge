@@ -56,6 +56,7 @@ from app.services.mlb_edge_engine import (
     latest_daily_card,
     run_daily_mlb_edges,
 )
+from app.services.odds_cache import MLB_PITCHER_PROPS_TTL, MLB_TOTALS_TTL
 from app.services.mlb_performance import (
     clv_report,
     grade_edge,
@@ -277,10 +278,20 @@ def _enrich_signal(signal: Signal) -> SignalOut:
     if signal.trader:
         base.wallet = signal.trader.wallet_address
         base.trader_nickname = signal.trader.nickname
+        if signal.trader.wallet_address:
+            base.trader_url = f"https://polymarketanalytics.com/traders/{signal.trader.wallet_address}"
     if signal.market:
         base.market_title = signal.market.title
         base.market_slug = signal.market.slug
         base.market_platform = signal.market.platform
+        base.market_created_at = signal.market.created_at
+        base.market_updated_at = signal.market.updated_at
+        base.market_end_date = signal.market.end_date
+        if signal.market.slug:
+            if signal.market.platform and signal.market.platform.lower() == "kalshi":
+                base.market_url = f"https://kalshi.com/markets/{signal.market.slug.upper()}"
+            else:
+                base.market_url = f"https://polymarket.com/event/{signal.market.slug}"
     return base
 
 
@@ -887,7 +898,15 @@ def mlb_edges_today(
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
     target = game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
-    return edges_for_date(db, card_date=target, limit=limit)
+    edges = list(
+        db.scalars(
+            select(MlbEdge)
+            .where(MlbEdge.generated_for_date == target)
+            .order_by(desc(MlbEdge.score))
+            .limit(limit)
+        )
+    )
+    return [_edge_payload_with_context(db, edge) for edge in edges]
 
 
 @router.post("/mlb/edges/run")
@@ -908,7 +927,7 @@ def mlb_edge_detail(edge_id: int, db: Session = Depends(get_db)) -> dict[str, ob
     edge = db.get(MlbEdge, edge_id)
     if edge is None:
         raise HTTPException(status_code=404, detail=f"MLB edge {edge_id} not found")
-    payload = edge_to_dict(edge)
+    payload = _edge_payload_with_context(db, edge)
     payload["discord_summary"] = (
         discord_ready_summary(edge)
         if edge.score >= get_settings().mlb_discord_min_score
@@ -953,7 +972,7 @@ def mlb_game_edge_summary(game_pk: int, db: Session = Depends(get_db)) -> dict[s
     return {
         "game": _mlb_game_payload(game) if game else None,
         "environment": _mlb_environment_payload(env) if env else None,
-        "edges": [edge_to_dict(edge) for edge in edges],
+        "edges": [_edge_payload_with_context(db, edge) for edge in edges],
     }
 
 
@@ -1021,6 +1040,139 @@ def mlb_debug_pitcher_props(
 
 def _mlb_card_date(game_date: str | None) -> str:
     return game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _latest_odds_snapshot(db: Session, game_pk: int) -> MlbOddsSnapshot | None:
+    return db.scalar(
+        select(MlbOddsSnapshot)
+        .where(MlbOddsSnapshot.game_pk == game_pk)
+        .order_by(desc(MlbOddsSnapshot.captured_at))
+        .limit(1)
+    )
+
+
+def _latest_prop_snapshot(db: Session, game_pk: int) -> MlbPitcherPropSnapshot | None:
+    return db.scalar(
+        select(MlbPitcherPropSnapshot)
+        .where(MlbPitcherPropSnapshot.game_pk == game_pk)
+        .order_by(desc(MlbPitcherPropSnapshot.captured_at))
+        .limit(1)
+    )
+
+
+def _best_book_timestamp_from_rows(
+    rows: list[dict[str, Any]] | None,
+    *,
+    book: str | None,
+    line: float | None,
+    timestamp_key: str,
+    book_key: str,
+) -> str | None:
+    if not rows or not book:
+        return None
+    candidates: list[datetime] = []
+    for row in rows:
+        if str(row.get(book_key) or "") != book:
+            continue
+        if line is not None:
+            try:
+                row_line = float(row.get("line"))
+            except (TypeError, ValueError):
+                row_line = None
+            if row_line is not None and abs(row_line - line) > 0.0001:
+                continue
+        ts = _parse_dt(row.get(timestamp_key))
+        if ts:
+            candidates.append(ts)
+    if not candidates:
+        return None
+    return max(candidates).isoformat()
+
+
+def _source_url_from_rows(
+    rows: list[dict[str, Any]] | None,
+    *,
+    book: str | None,
+    side: str | None,
+    line: float | None,
+) -> str | None:
+    if not rows or not book or not side:
+        return None
+    side_key = str(side).lower()
+    for row in rows:
+        if str(row.get("bookmaker") or "") != book:
+            continue
+        if line is not None:
+            try:
+                row_line = float(row.get("line"))
+            except (TypeError, ValueError):
+                row_line = None
+            if row_line is not None and abs(row_line - line) > 0.0001:
+                continue
+        links = row.get("direct_links") or {}
+        if isinstance(links, dict):
+            link = links.get(side_key)
+            if link:
+                return str(link)
+    return None
+
+
+def _edge_payload_with_context(db: Session, edge: MlbEdge) -> dict[str, object]:
+    payload = edge_to_dict(edge)
+    game = db.scalar(select(MlbGame).where(MlbGame.game_pk == edge.game_pk))
+    if game:
+        payload["game_date"] = game.game_date
+        payload["game_start_time"] = game.start_time.isoformat() if game.start_time else None
+
+    now = datetime.utcnow()
+    if edge.edge_type == "pitcher_strikeouts":
+        snap = _latest_prop_snapshot(db, edge.game_pk)
+        if snap:
+            payload["odds_snapshot_captured_at"] = snap.captured_at.isoformat() if snap.captured_at else None
+            payload["odds_snapshot_source"] = snap.source
+            payload["best_book_updated_at"] = _best_book_timestamp_from_rows(
+                snap.rows,
+                book=edge.best_book,
+                line=edge.line,
+                timestamp_key="timestamp",
+                book_key="sportsbook",
+            )
+            age_minutes = int((now - snap.captured_at).total_seconds() / 60) if snap.captured_at else None
+            payload["odds_data_age_minutes"] = age_minutes
+            payload["odds_stale"] = bool(age_minutes is not None and age_minutes > MLB_PITCHER_PROPS_TTL.total_seconds() / 60)
+    else:
+        snap = _latest_odds_snapshot(db, edge.game_pk)
+        if snap:
+            payload["odds_snapshot_captured_at"] = snap.captured_at.isoformat() if snap.captured_at else None
+            payload["odds_snapshot_source"] = snap.source
+            payload["best_book_updated_at"] = _best_book_timestamp_from_rows(
+                snap.rows,
+                book=edge.best_book,
+                line=edge.line,
+                timestamp_key="updated_at",
+                book_key="bookmaker",
+            )
+            payload["source_url"] = _source_url_from_rows(
+                snap.rows,
+                book=edge.best_book,
+                side=edge.side,
+                line=edge.line,
+            )
+            age_minutes = int((now - snap.captured_at).total_seconds() / 60) if snap.captured_at else None
+            payload["odds_data_age_minutes"] = age_minutes
+            payload["odds_stale"] = bool(age_minutes is not None and age_minutes > MLB_TOTALS_TTL.total_seconds() / 60)
+    return payload
 
 
 @router.get("/mlb/debug/odds/events")
@@ -1206,6 +1358,24 @@ async def mlb_debug_odds_cache_refresh(
         db, provider, games, game_date=card_date, force=True,
     )
     return result.as_dict()
+
+
+@router.post("/mlb/debug/closing-lines/run")
+async def mlb_debug_run_closing_lines(window_minutes: int = 30) -> dict[str, object]:
+    """Run the closing-line updater script once."""
+    from scripts.update_mlb_closing_lines import main_async
+
+    exit_code = await main_async(["--window-minutes", str(window_minutes)])
+    return {"status": "ok" if exit_code == 0 else "error", "exit_code": exit_code}
+
+
+@router.post("/mlb/debug/grade-results/run")
+async def mlb_debug_run_grade_results() -> dict[str, object]:
+    """Run the MLB grading script once."""
+    from scripts.grade_mlb_results import main_async
+
+    exit_code = await main_async([])
+    return {"status": "ok" if exit_code == 0 else "error", "exit_code": exit_code}
 
 
 @router.post("/mlb/edges/{edge_id}/grade")

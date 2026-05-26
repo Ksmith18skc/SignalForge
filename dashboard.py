@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Iterable
 
 import httpx
@@ -202,6 +202,20 @@ div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
   font-size: 0.85rem;
 }
 .sf-reasons li { margin-bottom: 2px; }
+.sf-link-buttons { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.sf-link-button {
+    display: inline-block;
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text);
+    background: var(--panel-2);
+    text-decoration: none;
+}
+.sf-link-button:hover { border-color: var(--cyan); color: var(--cyan); }
 
 /* --- Tables --- */
 div[data-testid="stDataFrame"] {
@@ -475,6 +489,51 @@ def fmt_dt(value: Any, *, short: bool = True) -> str:
     return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
 
 
+def _parse_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def fmt_relative(value: Any, *, now: datetime | None = None) -> str:
+    dt = _parse_dt(value)
+    if not dt:
+        return DASH
+    now = now or datetime.now(timezone.utc)
+    delta = (now - dt).total_seconds()
+    if delta < 0:
+        delta = abs(delta)
+        suffix = "from now"
+    else:
+        suffix = "ago"
+    if delta < 60:
+        return f"{int(delta)}s {suffix}"
+    if delta < 3600:
+        return f"{int(delta // 60)}m {suffix}"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h {suffix}"
+    return f"{int(delta // 86400)}d {suffix}"
+
+
+def fmt_event_time(value: Any, *, now: datetime | None = None) -> str:
+    dt = _parse_dt(value)
+    if not dt:
+        return DASH
+    now = (now or datetime.now(timezone.utc)).astimezone()
+    local = dt.astimezone()
+    if local.date() == now.date():
+        return f"Today {local.strftime('%-I:%M %p') if os.name != 'nt' else local.strftime('%I:%M %p').lstrip('0')}"
+    if local.date() == (now + timedelta(days=1)).date():
+        return f"Tomorrow {local.strftime('%-I:%M %p') if os.name != 'nt' else local.strftime('%I:%M %p').lstrip('0')}"
+    return local.strftime("%b %d %I:%M %p").replace(" 0", " ")
+
+
 def shorten_wallet(addr: str | None) -> str:
     if not addr:
         return DASH
@@ -571,6 +630,19 @@ def matchup_from_market(market: str | None) -> str:
     return " ".join(head.split()[:8])
 
 
+def link_button(label: str, url: str | None) -> str:
+    if not url:
+        return ""
+    return f'<a class="sf-link-button" href="{url}" target="_blank" rel="noopener">{label}</a>'
+
+
+def render_link_buttons(links: list[tuple[str, str | None]]) -> str:
+    buttons = "".join(link_button(label, url) for label, url in links if url)
+    if not buttons:
+        return ""
+    return f"<div class='sf-link-buttons'>{buttons}</div>"
+
+
 # =============================================================================
 # Card renderers
 # =============================================================================
@@ -592,6 +664,19 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     action = edge.get("action") or DASH
     edge_type = edge.get("edge_type") or ""
 
+    game_start = edge.get("game_start_time")
+    game_date = edge.get("game_date")
+    event_label = fmt_event_time(game_start) if game_start else (game_date or DASH)
+    created_at = edge.get("created_at")
+    updated_at = edge.get("graded_at")
+    odds_captured_at = edge.get("odds_snapshot_captured_at")
+    best_book_at = edge.get("best_book_updated_at")
+    odds_source_raw = str(edge.get("odds_snapshot_source") or "odds_api").lower()
+    odds_source = "SportsGameOdds" if "sports" in odds_source_raw else "Odds-API.io"
+    data_age = edge.get("odds_data_age_minutes")
+    data_age_label = f"{data_age}m" if data_age is not None else DASH
+    odds_stale = bool(edge.get("odds_stale"))
+
     reasons = (edge.get("reasons") or [])[:3]
     warnings = edge.get("warnings") or []
     sources = edge.get("data_sources_used") or []
@@ -601,6 +686,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         confidence_badge(edge.get("confidence")),
         chase_risk_badge(edge.get("chase_risk")),
         badge(edge_type.replace("_", " "), "cyan") if edge_type else "",
+        badge("Stale Odds", "gold") if odds_stale else "",
     ])
     warn_badges = " ".join(badge(w[:34], "red") for w in warnings[:3])
     source_badges = " ".join(badge(s, "purple") for s in sources[:4])
@@ -616,7 +702,8 @@ def render_edge_card(edge: dict[str, Any]) -> None:
       <div class="sf-card-head">
         <div>
           <div class="sf-card-title">{matchup}</div>
-          <div class="sf-card-sub">{side} {line_str} · {market}</div>
+                    <div class="sf-card-sub">{side} {line_str} · {market}</div>
+                      <div class="sf-card-sub">Event: {event_label} · Signal: {fmt_relative(created_at)} · Updated: {fmt_relative(updated_at)} · Resolve: {DASH}</div>
         </div>
         <div style="text-align:right;">
           <div class="sf-card-title" style="color:var(--gold);">{fmt_score(score)}</div>
@@ -624,9 +711,11 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         </div>
       </div>
       <div>{badges}</div>
+            <div class="sf-card-row"><span class="k">Odds:</span>{odds_source} · Snapshot: {fmt_relative(odds_captured_at)} · Best book: {fmt_relative(best_book_at)} · Data age: {data_age_label}</div>
       {reasons_html}
       <div class="sf-card-row"><span class="k">Action:</span>{action}</div>
       <div class="sf-card-row" style="margin-top:6px;">{source_badges}{warn_badges}</div>
+            {render_link_buttons([("Source", edge.get("source_url"))])}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
@@ -646,6 +735,32 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
     size = fmt_money(signal.get("size_usd"))
     source = signal.get("source") or DASH
     reason = signal.get("reason") or ""
+    event_date = signal.get("event_date") or ""
+    market_end = signal.get("market_end_date")
+    signal_created = signal.get("signal_created_at") or signal.get("created_at")
+    market_updated = signal.get("market_updated_at")
+    market_links = render_link_buttons([
+        ("Open Market", signal.get("market_url")),
+        ("Trader Profile", signal.get("trader_url")),
+        ("Source", signal.get("source_url")),
+    ])
+
+    consensus_traders = signal.get("consensus_traders") or []
+    tag_values: list[str] = []
+    for t in consensus_traders[:4]:
+        size = t.get("size_usd")
+        size_label = fmt_money(size) if size is not None else "$—"
+        tag_values.append(f"{t.get('name') or DASH} · {size_label}")
+    remaining = max(0, len(consensus_traders) - 4)
+    if remaining:
+        tag_values.append(f"+{remaining} more")
+    tag_badges = " ".join(badge(f"[{tag}]", "muted") for tag in tag_values) if tag_values else badge("[—]", "muted")
+    consensus_summary = (
+        f"{signal.get('consensus_wallets', 0)} wallets · "
+        f"{fmt_money(signal.get('consensus_total_size'))} tracked · "
+        f"largest {signal.get('consensus_largest', DASH)} · "
+        f"{signal.get('consensus_direction', DASH)}"
+    )
 
     badges_html = " ".join([
         badge(tier, tier_kind),
@@ -653,12 +768,18 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
         badge(side, "green" if side in {"YES", "BUY"} else ("red" if side in {"NO", "SELL"} else "muted")),
     ])
 
+    event_label = event_date or (fmt_event_time(market_end) if market_end else DASH)
+    updated_label = fmt_relative(market_updated)
+    signal_label = fmt_relative(signal_created)
+    resolve_label = fmt_event_time(market_end) if market_end else DASH
+
     body = f"""
     <div class="sf-card {card_kind}">
       <div class="sf-card-head">
         <div>
           <div class="sf-card-title">{trader} <span class="sf-card-sub">{wallet}</span></div>
           <div class="sf-card-sub">{market}</div>
+          <div class="sf-card-sub">Event: {event_label} · Signal: {signal_label} · Updated: {updated_label} · Resolve: {resolve_label}</div>
         </div>
         <div style="text-align:right;">
           <div class="sf-card-title" style="color:var(--gold);">{fmt_score(score)}</div>
@@ -666,10 +787,27 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
         </div>
       </div>
       <div>{badges_html}</div>
+      <div class="sf-card-row">{tag_badges}</div>
+      <div class="sf-card-row"><span class="k">Consensus:</span>{consensus_summary}</div>
       <div class="sf-card-row sf-meta">{reason}</div>
+      {market_links}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
+
+    if len(consensus_traders) > 4:
+        expander_key = f"consensus-{signal.get('market_id')}-{signal.get('side')}-{signal.get('outcome')}"
+        with st.expander("Consensus wallets (full list)", expanded=False, key=expander_key):
+            st.markdown(
+                " ".join(
+                    badge(
+                        f"[{t.get('name') or DASH} · {fmt_money(t.get('size_usd')) if t.get('size_usd') is not None else '$—'}]",
+                        "muted",
+                    )
+                    for t in consensus_traders
+                ),
+                unsafe_allow_html=True,
+            )
 
 
 def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callable]] | None = None) -> None:
@@ -750,6 +888,35 @@ def action_test_backend() -> None:
         f"Backend OK · env={payload.get('environment')} · "
         f"db={payload.get('database', {}).get('backend', '?')}"
     )
+
+
+def action_update_mlb_closing_lines() -> None:
+    with st.spinner("Updating MLB closing lines..."):
+        try:
+            result = api_post(
+                "/mlb/debug/closing-lines/run",
+                timeout=MLB_RUN_TIMEOUT,
+            )
+        except ApiError as exc:
+            render_api_error(exc, prefix="Closing-line update failed")
+            return
+    status = result.get("status") or "ok"
+    st.success(f"Closing-line update finished ({status}).")
+    st.cache_data.clear()
+    st.rerun()
+
+
+def action_grade_mlb_results() -> None:
+    with st.spinner("Grading MLB results..."):
+        try:
+            result = api_post("/mlb/debug/grade-results/run", timeout=MLB_RUN_TIMEOUT)
+        except ApiError as exc:
+            render_api_error(exc, prefix="MLB grading failed")
+            return
+    status = result.get("status") or "ok"
+    st.success(f"MLB grading finished ({status}).")
+    st.cache_data.clear()
+    st.rerun()
 
 
 # =============================================================================
@@ -929,6 +1096,25 @@ def aggregate_signals_to_positions(signals: list[dict[str, Any]]) -> list[dict[s
         avg_entry = (num / den) if den else None
         latest_sig = max(grouped, key=lambda s: str(s.get("created_at") or ""))
         types = sorted({str(s.get("signal_type")) for s in grouped if s.get("signal_type")})
+        consensus_traders = []
+        for sig in grouped:
+            name = sig.get("trader_nickname") or shorten_wallet(sig.get("wallet"))
+            consensus_traders.append(
+                {
+                    "name": name or DASH,
+                    "size_usd": _as_float(sig.get("size_usd")),
+                }
+            )
+        consensus_traders = sorted(
+            consensus_traders,
+            key=lambda t: (t.get("size_usd") or 0.0),
+            reverse=True,
+        )
+        total_tracked = sum(t.get("size_usd") or 0.0 for t in consensus_traders)
+        largest = consensus_traders[0]["name"] if consensus_traders else DASH
+        direction = " ".join(
+            [str(first.get("side") or ""), str(first.get("outcome") or _market_label(first))]
+        ).strip()
         position = dict(latest_sig)
         position["score"] = max(_as_float(s.get("score")) or 0.0 for s in grouped)
         position["confidence"] = max(_as_float(s.get("confidence")) or 0.0 for s in grouped)
@@ -938,6 +1124,15 @@ def aggregate_signals_to_positions(signals: list[dict[str, Any]]) -> list[dict[s
         position["signal_count"] = len(grouped)
         position["market_url"] = _market_url(first)
         position["trader_url"] = _trader_url(first)
+        position["market_end_date"] = first.get("market_end_date")
+        position["market_created_at"] = first.get("market_created_at")
+        position["market_updated_at"] = first.get("market_updated_at")
+        position["signal_created_at"] = latest_sig.get("created_at")
+        position["consensus_traders"] = consensus_traders
+        position["consensus_total_size"] = total_tracked
+        position["consensus_wallets"] = len(consensus_traders)
+        position["consensus_largest"] = largest
+        position["consensus_direction"] = direction or DASH
         position.update(_parse_market_parts(first))
         positions.append(position)
     return sorted(positions, key=lambda p: (p.get("score") or 0.0), reverse=True)
@@ -1102,6 +1297,14 @@ mkt_badge = badge(
     f"MLB games today: {mlb_count}",
     "green" if mlb_count > 0 else "muted",
 )
+now_utc = datetime.now(timezone.utc)
+now_local = now_utc.astimezone()
+prev_refresh = st.session_state.get("_last_dashboard_refresh_at")
+st.session_state["_last_dashboard_refresh_at"] = now_utc.isoformat()
+last_refresh_age = fmt_relative(prev_refresh, now=now_utc) if prev_refresh else "just now"
+local_label = now_local.strftime("%b %d, %Y %I:%M %p").replace(" 0", " ")
+utc_label = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+health_label = fmt_dt(health.get("timestamp"))
 
 st.markdown(
     f"""
@@ -1113,9 +1316,10 @@ st.markdown(
       </div>
       <div>
         {backend_badge}{mkt_badge}{odds_cache_badge}
-        <span class='sf-meta' style='margin-left:8px;'>Last refresh:
-          {fmt_dt(oc_metrics.get('last_refresh_at') or health.get('timestamp'))}
-        </span>
+                <div class='sf-meta' style='margin-top:6px;'>Local: {local_label}</div>
+                <div class='sf-meta'>UTC: {utc_label}</div>
+                <div class='sf-meta'>Last refresh: {last_refresh_age}</div>
+                <div class='sf-meta'>Backend health: {health_label}</div>
       </div>
     </div>
     """,
@@ -1439,6 +1643,14 @@ with tab_wallet:
 # =============================================================================
 
 with tab_perf:
+    perf_actions = st.columns([1, 1, 6])
+    with perf_actions[0]:
+        if st.button("Update closing lines", use_container_width=True):
+            action_update_mlb_closing_lines()
+    with perf_actions[1]:
+        if st.button("Grade MLB results", use_container_width=True):
+            action_grade_mlb_results()
+
     graded = perf_summary.get("graded_edges") or 0
     if not graded:
         render_empty_state(
@@ -1446,6 +1658,10 @@ with tab_perf:
             "Tracking begins after closing lines and game results are graded. "
             "Run `scripts/grade_mlb_results.py` and `scripts/update_mlb_closing_lines.py` "
             "to seed this view.",
+            actions=[
+                ("Update closing lines", action_update_mlb_closing_lines),
+                ("Grade MLB results", action_grade_mlb_results),
+            ],
         )
     else:
         pc1, pc2, pc3, pc4, pc5, pc6, pc7 = st.columns(7)

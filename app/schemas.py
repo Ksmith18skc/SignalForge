@@ -96,6 +96,11 @@ class SignalOut(BaseModel):
     market_title: str | None = None
     market_slug: str | None = None
     market_platform: str | None = None
+    market_created_at: datetime | None = None
+    market_updated_at: datetime | None = None
+    market_end_date: datetime | None = None
+    market_url: str | None = None
+    trader_url: str | None = None
 
 
 # ----------------------------- Alert ----------------------------------------
