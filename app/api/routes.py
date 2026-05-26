@@ -14,6 +14,7 @@ from app.config import get_settings
 from app.db import get_db
 from app.models import Alert, Market, Position, Signal, Trade, Trader
 from app.providers.falcon import FalconProvider, get_falcon_health
+from app.providers.odds_api import OddsApiError, OddsApiProvider
 from app.schemas import (
     AlertOut,
     DashboardSummary,
@@ -68,6 +69,11 @@ def health() -> dict[str, object]:
             },
             "polymarket": {"configured": s.has_polymarket_credentials()},
             "kalshi": {"configured": s.has_kalshi_credentials()},
+            "odds_api": {
+                "configured": s.has_odds_api_credentials(),
+                "base_url": s.odds_api_base_url,
+                "bookmakers": [b.strip() for b in s.odds_bookmakers.split(",") if b.strip()],
+            },
         },
         "alerts": {
             "console": {"configured": True},
@@ -193,6 +199,140 @@ def list_signals(db: Session = Depends(get_db), limit: int = 50) -> list[SignalO
 @router.get("/alerts", response_model=list[AlertOut])
 def list_alerts(db: Session = Depends(get_db), limit: int = 50) -> list[Alert]:
     return list(db.scalars(select(Alert).order_by(desc(Alert.created_at)).limit(limit)))
+
+
+# ---------------------------- sportsbook odds -------------------------------
+
+
+def _odds_provider() -> OddsApiProvider:
+    s = get_settings()
+    return OddsApiProvider(s.odds_api_key, s.odds_api_base_url, s.odds_bookmakers)
+
+
+def _odds_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, OddsApiError):
+        return HTTPException(status_code=400, detail=str(exc))
+    if hasattr(exc, "response"):
+        response = exc.response  # type: ignore[attr-defined]
+        return HTTPException(
+            status_code=response.status_code,
+            detail=response.text[:500],
+        )
+    return HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+
+
+@router.get("/odds/sports")
+async def odds_sports() -> list[dict[str, object]]:
+    try:
+        return await _odds_provider().sports()
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/bookmakers")
+async def odds_bookmakers() -> list[dict[str, object]]:
+    try:
+        return await _odds_provider().bookmakers()
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/bookmakers/selected")
+async def odds_selected_bookmakers() -> object:
+    try:
+        return await _odds_provider().selected_bookmakers()
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/leagues")
+async def odds_leagues(sport: str) -> list[dict[str, object]]:
+    try:
+        return await _odds_provider().leagues(sport)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/events")
+async def odds_events(
+    sport: str,
+    league: str | None = None,
+    status: str | None = "pending,live",
+    bookmaker: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> list[dict[str, object]]:
+    try:
+        return await _odds_provider().events(
+            sport,
+            league=league,
+            status=status,
+            bookmaker=bookmaker,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/events/live")
+async def odds_live_events(sport: str | None = None) -> list[dict[str, object]]:
+    try:
+        return await _odds_provider().live_events(sport)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/events/search")
+async def odds_search_events(query: str) -> list[dict[str, object]]:
+    if len(query.strip()) < 3:
+        raise HTTPException(status_code=400, detail="query must be at least 3 characters")
+    try:
+        return await _odds_provider().search_events(query)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/events/{event_id}")
+async def odds_event(event_id: str) -> dict[str, object]:
+    try:
+        return await _odds_provider().event(event_id)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/compare")
+async def odds_compare(
+    event_id: str,
+    bookmakers: str | None = None,
+    market: str | None = None,
+    side: str | None = None,
+    line: float | None = None,
+) -> dict[str, object]:
+    """Compare sportsbook lines across books for one event."""
+    try:
+        return await _odds_provider().compare_lines(
+            event_id,
+            bookmakers=bookmakers,
+            market=market,
+            side=side,
+            line=line,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
+
+
+@router.get("/odds/movements")
+async def odds_movements(
+    event_id: str,
+    bookmaker: str,
+    market: str,
+    market_line: float | None = None,
+) -> dict[str, object]:
+    try:
+        return await _odds_provider().odds_movements(event_id, bookmaker, market, market_line)
+    except Exception as exc:  # noqa: BLE001
+        raise _odds_error(exc) from exc
 
 
 # ---------------------------- bot helpers -----------------------------------

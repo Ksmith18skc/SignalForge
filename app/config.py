@@ -83,6 +83,10 @@ class Settings(BaseSettings):
     polymarket_base_url: str = "https://gamma-api.polymarket.com"
     kalshi_api_key: str | None = None
     kalshi_base_url: str = "https://trading-api.kalshi.com/trade-api/v2"
+    odds_api_key: str | None = None
+    odds_api_base_url: str = "https://api.odds-api.io/v3"
+    odds_bookmakers: str = "DraftKings,FanDuel,BetMGM,Caesars"
+    odds_default_sports: str = "basketball,baseball,american-football,ice-hockey"
 
     # --- alert channels ---
     discord_webhook_url: str | None = None
@@ -115,6 +119,9 @@ class Settings(BaseSettings):
 
     def has_kalshi_credentials(self) -> bool:
         return bool(self.kalshi_api_key)
+
+    def has_odds_api_credentials(self) -> bool:
+        return bool(self.odds_api_key)
 
 
 @lru_cache(maxsize=1)
