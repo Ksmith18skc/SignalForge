@@ -12,6 +12,7 @@ from app.services.mlb_edge_scoring import (
     weighted_score,
 )
 from app.services.mlb_odds_analysis import movement_score, odds_edge_score
+from app.services.mlb_market_validation import MarketSubtype, normalized_prop_name
 
 
 def pitcher_k_edges(
@@ -69,10 +70,24 @@ def _pitcher_edge(
     warnings.extend(environment.get("warnings") or [])
     cls = classify_edge(score, warnings)
     reasons = _reasons(side, pitcher, prop, summary, environment, factors)
+    market_scope = prop.get("market_scope") or MarketSubtype.PLAYER_PROP.value
+    try:
+        MarketSubtype(market_scope)
+    except ValueError:
+        market_scope = MarketSubtype.PLAYER_PROP.value
+    normalized_name = normalized_prop_name(
+        player=pitcher.get("name"),
+        side=side,
+        line=line,
+    )
     return {
         "edge_type": "pitcher_strikeouts",
         "game_pk": game["game_pk"],
-        "market": f"{pitcher.get('name') or 'Pitcher'} {side.title()} {line:.1f} Ks",
+        "market": normalized_name,
+        "normalized_market_name": normalized_name,
+        "market_scope": market_scope,
+        "is_valid": bool(prop.get("is_valid", True)),
+        "validation_reason": prop.get("validation_reason") or "",
         "side": side,
         "line": line,
         "best_book": prop.get(f"best_{side}_book"),

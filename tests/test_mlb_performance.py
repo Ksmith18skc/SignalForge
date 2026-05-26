@@ -55,9 +55,18 @@ def test_performance_reports_group_by_market_and_score_band(db_session):
         best_price=1.8,
         recommended_line=6.5,
     )
+    e3 = _edge(
+        game_pk=3,
+        score=90,
+        is_valid=False,
+        validation_reason="malformed line",
+        best_price=2.0,
+        recommended_line=3.7,
+    )
     grade_edge(e1, closing_line=9.0, closing_price=1.8, win_loss_push="win")
     grade_edge(e2, closing_line=6.0, closing_price=1.95, win_loss_push="loss")
-    db_session.add_all([e1, e2])
+    grade_edge(e3, closing_line=4.0, closing_price=1.8, win_loss_push="win")
+    db_session.add_all([e1, e2, e3])
     db_session.commit()
 
     summary = performance_summary(db_session)

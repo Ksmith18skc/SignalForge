@@ -82,6 +82,10 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
+        _add_sqlite_column_if_missing("mlb_edges", "normalized_market_name", "VARCHAR(256)")
+        _add_sqlite_column_if_missing("mlb_edges", "market_scope", "VARCHAR(32)")
+        _add_sqlite_column_if_missing("mlb_edges", "is_valid", "BOOLEAN DEFAULT 1")
+        _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
     if _is_postgres:
         _ensure_postgres_trades_external_id_is_text()
 

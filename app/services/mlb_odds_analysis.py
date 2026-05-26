@@ -8,6 +8,18 @@ from statistics import mean
 from typing import Any
 
 from app.providers.odds_api import best_prices, normalize_odds_lines
+from app.services.mlb_market_validation import (
+    MarketSubtype,
+    classify_market_subtype,
+    is_valid_line,
+    is_valid_price,
+    normalize_book_key,
+    record_invalid_odds,
+    record_malformed_line,
+    record_provider_mismatch,
+    record_rejection,
+    trusted_books,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +70,8 @@ def is_total_market(row: dict[str, Any]) -> bool:
     name = _market_name_lower(row)
     if not name:
         return False
+    if "strikeout" in name or "pitcher k" in name or "player prop" in name:
+        return False
     if name in TOTAL_MARKET_NAMES:
         return True
     # Don't mistake "Team Total" or "1st Half Total" for the full game total.
@@ -76,40 +90,95 @@ def is_pitcher_k_market(row: dict[str, Any]) -> bool:
 
 def analyze_game_totals(odds_payload: dict[str, Any] | None) -> dict[str, Any]:
     if not odds_payload:
-        return _empty("Odds missing")
+        return _empty("Odds missing", is_valid=False, validation_reason="odds payload missing")
     all_rows = normalize_odds_lines(odds_payload)
-    rows = [row for row in all_rows if is_total_market(row)]
-    if not rows:
+    validated_rows: list[dict[str, Any]] = []
+    trusted = trusted_books()
+    for row in all_rows:
+        scope = classify_market_subtype(row)
+        if scope not in {
+            MarketSubtype.FULL_GAME_TOTAL,
+            MarketSubtype.TEAM_TOTAL,
+            MarketSubtype.FIRST_5_TOTAL,
+            MarketSubtype.ALT_TOTAL,
+        }:
+            continue
+        if scope != MarketSubtype.FULL_GAME_TOTAL:
+            record_rejection(
+                f"non-full-game total market skipped ({scope.value})",
+                row=row,
+                scope=scope,
+            )
+            continue
+        if not row.get("bookmaker"):
+            record_invalid_odds("missing bookmaker", row=row)
+            continue
+        line = row.get("line")
+        if not is_valid_line(scope, line):
+            record_malformed_line("full-game total line out of range", row=row)
+            continue
+        outcomes = row.get("outcomes") or {}
+        over = outcomes.get("over")
+        under = outcomes.get("under")
+        if not is_valid_price(over) or not is_valid_price(under):
+            record_invalid_odds("missing or malformed totals price", row=row)
+            continue
+        validated_rows.append(row)
+    if not validated_rows:
         seen_markets = sorted({str(r.get("market") or "?") for r in all_rows})
         logger.warning(
             "No totals market found in event %s. Markets present: %s",
             odds_payload.get("id"), seen_markets[:10],
         )
         return _empty(
-            f"No full-game totals found. Markets present: {seen_markets[:10]}"
+            f"No valid full-game totals found. Markets present: {seen_markets[:10]}",
+            is_valid=False,
+            validation_reason="no valid full-game totals",
         )
-    lines = [float(r["line"]) for r in rows if r.get("line") is not None]
-    best = best_prices(rows)
-    books = sorted({str(r.get("bookmaker")) for r in rows if r.get("bookmaker")})
+    trusted_rows = [
+        row for row in validated_rows
+        if normalize_book_key(row.get("bookmaker")) in trusted
+    ]
+    if not trusted_rows:
+        record_provider_mismatch(
+            "no trusted sportsbook lines for full-game totals",
+            details={
+                "event_id": odds_payload.get("id"),
+                "books": sorted({str(r.get("bookmaker")) for r in validated_rows if r.get("bookmaker")}),
+            },
+        )
+        return _empty(
+            "Full-game totals unavailable from trusted books",
+            is_valid=False,
+            validation_reason="trusted books missing",
+        )
+
+    lines = [float(r["line"]) for r in validated_rows if r.get("line") is not None]
+    best = best_prices(validated_rows)
+    books = sorted({str(r.get("bookmaker")) for r in validated_rows if r.get("bookmaker")})
     stale = [
         str(r.get("bookmaker"))
-        for r in rows
+        for r in validated_rows
         if not r.get("updated_at")
     ]
     return {
-        "rows": rows,
+        "rows": validated_rows,
         "consensus_total_line": round(mean(lines), 2) if lines else None,
         "best_over_price": (best.get("over") or {}).get("price"),
         "best_over_book": (best.get("over") or {}).get("bookmaker"),
         "best_under_price": (best.get("under") or {}).get("price"),
         "best_under_book": (best.get("under") or {}).get("bookmaker"),
-        "consensus_price": _consensus_price(rows),
+        "consensus_price": _consensus_price(validated_rows),
         "line_disagreement": round(max(lines) - min(lines), 2) if len(lines) > 1 else 0.0,
         "book_count": len(books),
         "stale_book_candidates": stale,
         "movement_direction": None,
         "steam_velocity": None,
         "warnings": [] if len(books) >= 2 else ["Fewer than 2 books available"],
+        "is_valid": True,
+        "validation_reason": "",
+        "market_scope": MarketSubtype.FULL_GAME_TOTAL.value,
+        "normalized_market_name": None,
     }
 
 
@@ -158,10 +227,20 @@ def odds_edge_score(analysis: dict[str, Any], side: str) -> float:
     price_bonus = 0.0
     try:
         if side_price is not None and consensus is not None:
+            if not is_valid_price(side_price) or not is_valid_price(consensus):
+                logger.warning(
+                    "Malformed implied probability in odds_edge_score: side_price=%s consensus=%s",
+                    side_price,
+                    consensus,
+                )
+                return 40.0
             price_bonus = (float(side_price) - float(consensus)) * 25
     except (TypeError, ValueError):
         pass
-    return _clamp(50 + min(book_count, 5) * 4 + line_disagreement * 8 + price_bonus)
+    raw = 50 + min(book_count, 5) * 4 + line_disagreement * 8 + price_bonus
+    if raw > 95:
+        logger.warning("Odds edge score capped: raw=%.2f", raw)
+    return _clamp(raw, 0.0, 95.0)
 
 
 def movement_score(analysis: dict[str, Any], side: str) -> float:
@@ -190,11 +269,16 @@ def _consensus_price(rows: list[dict[str, Any]]) -> float | None:
     for row in rows:
         outcomes = row.get("outcomes") or {}
         if isinstance(outcomes, dict):
-            prices.extend(float(v) for v in outcomes.values() if _is_number(v))
+            prices.extend(float(v) for v in outcomes.values() if _is_number(v) and is_valid_price(v))
     return round(mean(prices), 4) if prices else None
 
 
-def _empty(warning: str) -> dict[str, Any]:
+def _empty(
+    warning: str,
+    *,
+    is_valid: bool = False,
+    validation_reason: str = "",
+) -> dict[str, Any]:
     return {
         "rows": [],
         "consensus_total_line": None,
@@ -210,6 +294,10 @@ def _empty(warning: str) -> dict[str, Any]:
         "movement_direction": None,
         "steam_velocity": None,
         "warnings": [warning],
+        "is_valid": is_valid,
+        "validation_reason": validation_reason,
+        "market_scope": MarketSubtype.FULL_GAME_TOTAL.value,
+        "normalized_market_name": None,
     }
 
 

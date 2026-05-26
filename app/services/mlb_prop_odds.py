@@ -10,6 +10,17 @@ from difflib import SequenceMatcher
 from statistics import mean
 from typing import Any
 
+from app.services.mlb_market_validation import (
+    MarketSubtype,
+    is_valid_line,
+    is_valid_price,
+    normalize_book_key,
+    record_invalid_odds,
+    record_malformed_line,
+    record_provider_mismatch,
+    trusted_books,
+)
+
 SUPPORTED_BOOKS = {"draftkings", "fanduel", "betmgm", "caesars"}
 # Substring hints; we lowercase the market name/label/key/type before checking.
 # Covers DK's "Pitcher Strikeouts", FD's "Player Strikeouts", BetMGM's
@@ -44,6 +55,8 @@ def normalize_pitcher_strikeout_props(payload: dict[str, Any] | None) -> list[Pi
         return []
     out: list[PitcherPropLine] = []
     for sportsbook, markets in (payload.get("bookmakers") or {}).items():
+        if not sportsbook:
+            continue
         if _book_key(sportsbook) not in SUPPORTED_BOOKS:
             continue
         if not isinstance(markets, list):
@@ -55,15 +68,23 @@ def normalize_pitcher_strikeout_props(payload: dict[str, Any] | None) -> list[Pi
                 line = _num(odds.get("hdp") or odds.get("line") or odds.get("point"))
                 if line is None:
                     continue
+                if not is_valid_line(MarketSubtype.PLAYER_PROP, line):
+                    record_malformed_line("pitcher prop line out of range", row={"line": line, "market": market.get("name"), "bookmaker": sportsbook})
+                    continue
                 player = _player_name(odds, market)
                 if not player:
+                    continue
+                over_price = _num(odds.get("over") or odds.get("Over"))
+                under_price = _num(odds.get("under") or odds.get("Under"))
+                if not is_valid_price(over_price) or not is_valid_price(under_price):
+                    record_invalid_odds("pitcher prop missing or malformed prices", row={"line": line, "market": market.get("name"), "bookmaker": sportsbook})
                     continue
                 out.append(
                     PitcherPropLine(
                         player_name=player,
                         line=line,
-                        over_price=_num(odds.get("over") or odds.get("Over")),
-                        under_price=_num(odds.get("under") or odds.get("Under")),
+                        over_price=over_price,
+                        under_price=under_price,
                         sportsbook=str(sportsbook),
                         timestamp=_timestamp(market.get("updatedAt") or odds.get("updatedAt")),
                         raw={"market": market, "odds": odds},
@@ -79,7 +100,26 @@ def consensus_for_pitcher(
     matched = [line for line in lines if names_match(line.player_name, pitcher_name)]
     warnings: list[str] = []
     if not matched:
-        return _empty(f"No pitcher strikeout props found for {pitcher_name}")
+        return _empty(
+            f"No pitcher strikeout props found for {pitcher_name}",
+            is_valid=False,
+            validation_reason="no matching pitcher props",
+        )
+    trusted = trusted_books()
+    trusted_rows = [
+        line for line in matched
+        if normalize_book_key(line.sportsbook) in trusted
+    ]
+    if not trusted_rows:
+        record_provider_mismatch(
+            "no trusted sportsbook lines for pitcher props",
+            details={"pitcher": pitcher_name, "books": sorted({line.sportsbook for line in matched})},
+        )
+        return _empty(
+            "Pitcher props unavailable from trusted books",
+            is_valid=False,
+            validation_reason="trusted books missing",
+        )
     books = sorted({line.sportsbook for line in matched})
     if len(books) < 2:
         warnings.append("Fewer than 2 books available")
@@ -114,6 +154,10 @@ def consensus_for_pitcher(
         "movement_direction": None,
         "steam_velocity": None,
         "warnings": warnings,
+        "is_valid": True,
+        "validation_reason": "",
+        "market_scope": MarketSubtype.PLAYER_PROP.value,
+        "normalized_market_name": None,
     }
 
 
@@ -202,7 +246,12 @@ def _num(value: Any) -> float | None:
         return None
 
 
-def _empty(warning: str) -> dict[str, Any]:
+def _empty(
+    warning: str,
+    *,
+    is_valid: bool = False,
+    validation_reason: str = "",
+) -> dict[str, Any]:
     return {
         "rows": [],
         "line": None,
@@ -221,4 +270,8 @@ def _empty(warning: str) -> dict[str, Any]:
         "movement_direction": None,
         "steam_velocity": None,
         "warnings": [warning],
+        "is_valid": is_valid,
+        "validation_reason": validation_reason,
+        "market_scope": MarketSubtype.PLAYER_PROP.value,
+        "normalized_market_name": None,
     }

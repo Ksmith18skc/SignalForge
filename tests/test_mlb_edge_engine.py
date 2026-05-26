@@ -43,10 +43,29 @@ def test_game_total_odds_normalization_compares_books():
 
     analysis = analyze_game_totals(payload)
 
+    assert analysis["is_valid"] is True
     assert analysis["book_count"] == 2
     assert analysis["consensus_total_line"] == 8.75
     assert analysis["best_over_book"] == "FanDuel"
     assert analysis["line_disagreement"] == 0.5
+
+
+def test_game_total_validation_rejects_low_lines():
+    payload = {
+        "bookmakers": {
+            "DraftKings": [
+                {
+                    "name": "Totals",
+                    "updatedAt": "2026-05-25T12:00:00Z",
+                    "odds": [{"hdp": 3.7, "over": 1.91, "under": 1.95}],
+                }
+            ]
+        }
+    }
+
+    analysis = analyze_game_totals(payload)
+
+    assert analysis["is_valid"] is False
 
 
 def test_edge_score_classification_rules():

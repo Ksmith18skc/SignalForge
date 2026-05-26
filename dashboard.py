@@ -1143,6 +1143,11 @@ def fetch_odds_event_match() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+def fetch_market_validation() -> dict[str, Any]:
+    return safe_get("/mlb/debug/market-validation", default={})
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_pitcher_props(limit: int = 100) -> dict[str, Any]:
     return safe_get("/mlb/debug/pitcher-props", default={"count": 0, "rows": []},
                     params={"limit": limit})
@@ -1346,6 +1351,7 @@ odds_cache_payload = fetch_odds_cache()
 odds_providers_payload = fetch_odds_providers()
 event_match_payload = fetch_odds_event_match()
 pitcher_props_payload = fetch_pitcher_props()
+market_validation_payload = fetch_market_validation()
 
 providers_block = health.get("providers", {}) or {}
 falcon_info = providers_block.get("falcon", {}) or {}
@@ -2275,6 +2281,27 @@ with tab_health:
         st.code(ingest.get("last_ingestion_error") or "", language="text")
         st.caption(f"At {fmt_dt(ingest.get('last_ingestion_error_at'))}")
 
+    st.markdown("### Market validation")
+    mv = market_validation_payload or {}
+    mv1, mv2, mv3, mv4 = st.columns(4)
+    mv1.metric("Rejected markets", mv.get("rejected_markets", 0))
+    mv2.metric("Invalid odds", mv.get("invalid_odds", 0))
+    mv3.metric("Malformed lines", mv.get("malformed_lines", 0))
+    mv4.metric("Provider mismatches", mv.get("provider_mismatches", 0))
+    mv_samples = mv.get("samples") or {}
+    sample_blocks = [
+        ("Rejected markets", mv_samples.get("rejected_markets") or []),
+        ("Invalid odds", mv_samples.get("invalid_odds") or []),
+        ("Malformed lines", mv_samples.get("malformed_lines") or []),
+        ("Provider mismatches", mv_samples.get("provider_mismatches") or []),
+    ]
+    for title, rows in sample_blocks:
+        if not rows:
+            continue
+        st.markdown(f"**{title} (latest)**")
+        df_mv = pd.DataFrame(rows).fillna("")
+        st.dataframe(df_mv.head(12), use_container_width=True, hide_index=True)
+
     fetch_errors = st.session_state.get("_fetch_errors") or {}
     if fetch_errors:
         st.markdown("### Recent fetch errors")
@@ -2295,6 +2322,8 @@ with tab_health:
             st.json(odds_providers_payload)
         with st.expander("/mlb/debug/odds/event-match", expanded=False):
             st.json(event_match_payload)
+        with st.expander("/mlb/debug/market-validation", expanded=False):
+            st.json(market_validation_payload)
         with st.expander("/dashboard-summary", expanded=False):
             st.json(summary)
     else:

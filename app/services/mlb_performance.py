@@ -168,7 +168,13 @@ def roi_units(win_loss_push: str | None, price: Any) -> float | None:
 
 
 def _graded_edges(db: Session) -> list[MlbEdge]:
-    return list(db.scalars(select(MlbEdge).where(MlbEdge.win_loss_push.is_not(None))))
+    return list(
+        db.scalars(
+            select(MlbEdge)
+            .where(MlbEdge.win_loss_push.is_not(None))
+            .where(MlbEdge.is_valid.is_(True))
+        )
+    )
 
 
 def _grouped_report(edges: list[MlbEdge], key_fn: Any, key_name: str) -> list[dict[str, Any]]:

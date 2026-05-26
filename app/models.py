@@ -337,6 +337,10 @@ class MlbEdge(Base):
     game_pk: Mapped[int] = mapped_column(Integer, index=True)
     edge_type: Mapped[str] = mapped_column(String(32), index=True)  # game_total | pitcher_strikeouts
     market: Mapped[str] = mapped_column(String(256))
+    normalized_market_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    market_scope: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    is_valid: Mapped[bool] = mapped_column(Boolean, default=True)
+    validation_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     side: Mapped[str] = mapped_column(String(16))
     line: Mapped[float | None] = mapped_column(Float, nullable=True)
     best_book: Mapped[str | None] = mapped_column(String(64), nullable=True)

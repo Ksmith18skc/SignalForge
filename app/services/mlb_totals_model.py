@@ -12,6 +12,7 @@ from app.services.mlb_edge_scoring import (
     weighted_score,
 )
 from app.services.mlb_odds_analysis import movement_score, odds_edge_score
+from app.services.mlb_market_validation import MarketSubtype, normalized_total_name
 
 
 def total_edges(
@@ -56,12 +57,27 @@ def _total_edge(
     score = weighted_score(factors, TOTAL_WEIGHTS)
     warnings = list(odds.get("warnings") or []) + list(environment.get("warnings") or [])
     cls = classify_edge(score, warnings)
-    matchup = f"{game.get('away_team')} at {game.get('home_team')}"
     line = odds.get("consensus_total_line")
+    market_scope = odds.get("market_scope") or MarketSubtype.FULL_GAME_TOTAL.value
+    try:
+        scope_enum = MarketSubtype(market_scope)
+    except ValueError:
+        scope_enum = MarketSubtype.FULL_GAME_TOTAL
+    normalized_name = normalized_total_name(
+        scope=scope_enum,
+        side=side,
+        line=line,
+        home=game.get("home_team"),
+        away=game.get("away_team"),
+    )
     return {
         "edge_type": "game_total",
         "game_pk": game["game_pk"],
-        "market": f"{matchup} {side.title()} {line if line is not None else '?'}",
+        "market": normalized_name,
+        "normalized_market_name": normalized_name,
+        "market_scope": market_scope,
+        "is_valid": bool(odds.get("is_valid", True)),
+        "validation_reason": odds.get("validation_reason") or "",
         "side": side,
         "line": line,
         "best_book": odds.get(f"best_{side}_book"),

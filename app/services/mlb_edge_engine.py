@@ -83,15 +83,30 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         match = matches_by_game.get(int(game["game_pk"]))
         payload = _resolve_cached_payload(db, match)
         totals_analysis = await _odds_for_game(db, game, payload)
-        if totals_analysis.get("book_count"):
+        if totals_analysis.get("book_count") and totals_analysis.get("is_valid", True):
             totals_count += 1
-        for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
-            created_edges.append(_persist_edge(db, edge_payload, card_date))
+        if not totals_analysis.get("is_valid", True):
+            logger.warning(
+                "Skipping totals edges for game_pk=%s: %s",
+                game.get("game_pk"),
+                totals_analysis.get("validation_reason"),
+            )
+        else:
+            for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
+                created_edges.append(_persist_edge(db, edge_payload, card_date))
 
         for pitcher in _pitchers(game):
             prop = await _pitcher_prop_for_game(db, game, pitcher, payload)
-            if prop.get("book_count"):
+            if prop.get("book_count") and prop.get("is_valid", True):
                 pitcher_k_count += 1
+            if not prop.get("is_valid", True):
+                logger.info(
+                    "Skipping pitcher K edge due to invalid market: game=%s pitcher=%s reason=%s",
+                    game.get("game_pk"),
+                    pitcher.get("name"),
+                    prop.get("validation_reason"),
+                )
+                continue
             if prop.get("line") is None or not prop.get("rows"):
                 logger.info(
                     "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
@@ -151,6 +166,7 @@ def edges_for_date(db: Session, *, card_date: str | None = None, limit: int = 10
         db.scalars(
             select(MlbEdge)
             .where(MlbEdge.generated_for_date == target)
+            .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
             .limit(limit)
         )
@@ -159,6 +175,8 @@ def edges_for_date(db: Session, *, card_date: str | None = None, limit: int = 10
 
 
 def discord_ready_summary(edge: MlbEdge) -> str:
+    if not edge.is_valid:
+        return ""
     reasons = "\n".join(f"- {reason}" for reason in (edge.reasons or [])[:3])
     warnings = "\n".join(f"- {warning}" for warning in (edge.warnings or [])[:3])
     warning_block = f"\nWarnings:\n{warnings}" if warnings else ""
@@ -368,6 +386,10 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
         current_line=payload.get("line"),
         recommended_line=payload.get("line"),
         implied_probability_at_entry=_implied_probability(payload.get("best_price")),
+        normalized_market_name=payload.get("normalized_market_name"),
+        market_scope=payload.get("market_scope"),
+        is_valid=payload.get("is_valid", True),
+        validation_reason=payload.get("validation_reason"),
     )
     db.add(edge)
     db.flush()
@@ -381,6 +403,7 @@ def _build_daily_card(db: Session, card_date: str) -> MlbDailyCard:
         db.scalars(
             select(MlbEdge)
             .where(MlbEdge.generated_for_date == card_date)
+            .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
         )
     )

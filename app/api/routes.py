@@ -56,6 +56,7 @@ from app.services.mlb_edge_engine import (
     latest_daily_card,
     run_daily_mlb_edges,
 )
+from app.services.mlb_market_validation import validation_report
 from app.services.odds_cache import MLB_PITCHER_PROPS_TTL, MLB_TOTALS_TTL
 from app.services.mlb_performance import (
     clv_report,
@@ -902,6 +903,7 @@ def mlb_edges_today(
         db.scalars(
             select(MlbEdge)
             .where(MlbEdge.generated_for_date == target)
+            .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
             .limit(limit)
         )
@@ -930,7 +932,7 @@ def mlb_edge_detail(edge_id: int, db: Session = Depends(get_db)) -> dict[str, ob
     payload = _edge_payload_with_context(db, edge)
     payload["discord_summary"] = (
         discord_ready_summary(edge)
-        if edge.score >= get_settings().mlb_discord_min_score
+        if edge.is_valid and edge.score >= get_settings().mlb_discord_min_score
         else None
     )
     return payload
@@ -958,6 +960,7 @@ def mlb_game_edge_summary(game_pk: int, db: Session = Depends(get_db)) -> dict[s
         db.scalars(
             select(MlbEdge)
             .where(MlbEdge.game_pk == game_pk)
+            .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
         )
     )
@@ -1006,14 +1009,18 @@ def mlb_debug_pitcher_props(
     limit: int = 100,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    query = select(PitcherPropOddsSnapshot).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
+    filters = []
     if game_pk is not None:
-        query = select(PitcherPropOddsSnapshot).where(PitcherPropOddsSnapshot.game_pk == game_pk).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
+        filters.append(PitcherPropOddsSnapshot.game_pk == game_pk)
     if player_name:
         pattern = f"%{player_name}%"
-        query = select(PitcherPropOddsSnapshot).where(PitcherPropOddsSnapshot.player_name.ilike(pattern)).order_by(desc(PitcherPropOddsSnapshot.timestamp)).limit(limit)
-        if game_pk is not None:
-            query = query.where(PitcherPropOddsSnapshot.game_pk == game_pk)
+        filters.append(PitcherPropOddsSnapshot.player_name.ilike(pattern))
+    query = (
+        select(PitcherPropOddsSnapshot)
+        .where(*filters)
+        .order_by(desc(PitcherPropOddsSnapshot.timestamp))
+        .limit(limit)
+    )
     rows = list(db.scalars(query))
     return {
         "count": len(rows),
@@ -1331,6 +1338,12 @@ def mlb_debug_odds_cache(db: Session = Depends(get_db)) -> dict[str, object]:
     from app.services import odds_cache
 
     return odds_cache.cache_summary(db)
+
+
+@router.get("/mlb/debug/market-validation")
+def mlb_debug_market_validation() -> dict[str, object]:
+    """Validation counters + recent rejected markets."""
+    return validation_report()
 
 
 @router.get("/mlb/debug/odds-providers")

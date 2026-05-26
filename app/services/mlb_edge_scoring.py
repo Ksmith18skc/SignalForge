@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 TOTAL_WEIGHTS = {
@@ -25,7 +28,10 @@ PITCHER_K_WEIGHTS = {
 
 
 def weighted_score(factors: dict[str, float], weights: dict[str, float]) -> float:
-    return round(sum(_clamp(factors.get(name, 50.0)) * weight for name, weight in weights.items()), 2)
+    raw = sum(_clamp(factors.get(name, 50.0)) * weight for name, weight in weights.items())
+    if raw > 95:
+        logger.warning("Edge score capped: raw=%.2f", raw)
+    return round(min(raw, 95.0), 2)
 
 
 def classify_edge(score: float, warnings: list[str] | None = None) -> dict[str, str]:
@@ -77,6 +83,10 @@ def edge_to_dict(edge: Any) -> dict[str, Any]:
         "game_pk": edge.game_pk,
         "edge_type": edge.edge_type,
         "market": edge.market,
+        "normalized_market_name": edge.normalized_market_name,
+        "market_scope": edge.market_scope,
+        "is_valid": edge.is_valid,
+        "validation_reason": edge.validation_reason,
         "side": edge.side,
         "line": edge.line,
         "best_book": edge.best_book,
