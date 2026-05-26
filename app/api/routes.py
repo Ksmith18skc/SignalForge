@@ -87,6 +87,7 @@ def health() -> dict[str, object]:
         "environment": s.environment,
         "default_copy_mode": s.default_copy_mode,
         "auto_trading_enabled": s.enable_auto_trading,
+        "database": {"backend": _database_backend(s.database_url)},
         "providers": {
             "falcon": {
                 "configured": s.has_falcon_credentials(),
@@ -148,6 +149,15 @@ def health() -> dict[str, object]:
         },
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+def _database_backend(database_url: str) -> str:
+    scheme = database_url.split(":", 1)[0].lower() if database_url else ""
+    if scheme.startswith("sqlite"):
+        return "sqlite"
+    if scheme.startswith("postgres") or scheme.startswith("postgresql"):
+        return "postgres"
+    return "unknown"
 
 
 # ---------------------------- traders ---------------------------------------
