@@ -807,6 +807,11 @@ def fetch_odds_cache() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
+def fetch_odds_providers() -> dict[str, Any]:
+    return safe_get("/mlb/debug/odds-providers", default={})
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def fetch_odds_event_match() -> dict[str, Any]:
     return safe_get("/mlb/debug/odds/event-match", default={})
 
@@ -984,6 +989,7 @@ mlb_daily_card = fetch_mlb_daily_card()
 mlb_sources = fetch_mlb_sources()
 mlb_performance = fetch_mlb_performance()
 odds_cache_payload = fetch_odds_cache()
+odds_providers_payload = fetch_odds_providers()
 event_match_payload = fetch_odds_event_match()
 pitcher_props_payload = fetch_pitcher_props()
 
@@ -1517,6 +1523,9 @@ with tab_odds:
             actions=[("Refresh odds cache", action_refresh_odds_cache)],
         )
     else:
+        providers_diag = odds_providers_payload or {}
+        primary_diag = providers_diag.get("primary") or {}
+        backup_diag = providers_diag.get("backup") or {}
         metrics = odds_cache_payload.get("metrics") or {}
         oc1, oc2, oc3, oc4, oc5, oc6, oc7 = st.columns(7)
         oc1.metric("Cache rows", odds_cache_payload.get("rows", 0))
@@ -1544,6 +1553,51 @@ with tab_odds:
             + "</div>",
             unsafe_allow_html=True,
         )
+
+        st.markdown("### Provider diagnostics")
+        diag_cols = st.columns(3)
+        diag_cols[0].metric("Last provider", providers_diag.get("last_provider_used") or DASH)
+        diag_cols[1].metric("Primary events", primary_diag.get("events_fetched", 0))
+        diag_cols[2].metric("Backup events", backup_diag.get("events_fetched", 0))
+
+        st.markdown(
+            "<div class='sf-card'>"
+            + f"<div class='sf-card-row'><span class='k'>Primary:</span>{primary_diag.get('name') or 'Odds-API'}"
+            + f" · enabled={bool(primary_diag.get('enabled'))}"
+            + f" · last success={fmt_dt(primary_diag.get('last_success_at'))}"
+            + "</div>"
+            + f"<div class='sf-card-row'><span class='k'>Totals found:</span>{primary_diag.get('totals_found', 0)}"
+            + f" · Pitcher props found:{primary_diag.get('pitcher_props_found', 0)}"
+            + "</div>"
+            + f"<div class='sf-card-row'><span class='k'>Last error:</span>"
+            + f"{primary_diag.get('last_error') or DASH}"
+            + f" · at {fmt_dt(primary_diag.get('last_error_at'))}"
+            + "</div>"
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(
+            "<div class='sf-card'>"
+            + f"<div class='sf-card-row'><span class='k'>Backup:</span>{backup_diag.get('name') or 'SportsGameOdds'}"
+            + f" · enabled={bool(backup_diag.get('enabled'))}"
+            + f" · last success={fmt_dt(backup_diag.get('last_success_at'))}"
+            + "</div>"
+            + f"<div class='sf-card-row'><span class='k'>Totals found:</span>{backup_diag.get('totals_found', 0)}"
+            + f" · Pitcher props found:{backup_diag.get('pitcher_props_found', 0)}"
+            + "</div>"
+            + f"<div class='sf-card-row'><span class='k'>Last error:</span>"
+            + f"{backup_diag.get('last_error') or DASH}"
+            + f" · at {fmt_dt(backup_diag.get('last_error_at'))}"
+            + "</div>"
+            + "</div>",
+            unsafe_allow_html=True,
+        )
+
+        recent_errors = providers_diag.get("last_errors") or []
+        if recent_errors:
+            st.markdown("**Recent provider errors**")
+            st.code("\n".join(str(err) for err in recent_errors[-5:]), language="text")
 
         action_cols2 = st.columns([1, 1, 1, 4])
         with action_cols2[0]:
@@ -1821,6 +1875,8 @@ with tab_health:
             st.json(mlb_sources)
         with st.expander("/mlb/debug/odds-cache", expanded=False):
             st.json(odds_cache_payload)
+        with st.expander("/mlb/debug/odds-providers", expanded=False):
+            st.json(odds_providers_payload)
         with st.expander("/mlb/debug/odds/event-match", expanded=False):
             st.json(event_match_payload)
         with st.expander("/dashboard-summary", expanded=False):

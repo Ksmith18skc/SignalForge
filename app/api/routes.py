@@ -1181,6 +1181,14 @@ def mlb_debug_odds_cache(db: Session = Depends(get_db)) -> dict[str, object]:
     return odds_cache.cache_summary(db)
 
 
+@router.get("/mlb/debug/odds-providers")
+def mlb_debug_odds_providers() -> dict[str, object]:
+    """Primary/backup odds provider status and fallback telemetry."""
+    from app.services import odds_cache
+
+    return odds_cache.get_odds_provider_health()
+
+
 @router.post("/mlb/debug/odds-cache/refresh")
 async def mlb_debug_odds_cache_refresh(
     game_date: str | None = None,

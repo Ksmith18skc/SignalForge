@@ -253,6 +253,7 @@ async def _odds_for_game(
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
     analysis = analyze_game_totals(payload)
+    payload_source = (payload or {}).get("source") or "odds_api"
     db.add(
         MlbOddsSnapshot(
             game_pk=game["game_pk"],
@@ -269,6 +270,7 @@ async def _odds_for_game(
             movement_direction=analysis.get("movement_direction"),
             steam_velocity=analysis.get("steam_velocity"),
             rows=analysis.get("rows") or [],
+            source=payload_source,
         )
     )
     return analysis
@@ -281,6 +283,7 @@ async def _pitcher_prop_for_game(
     payload: dict[str, Any] | None,
 ) -> dict[str, Any]:
     prop_lines = normalize_pitcher_strikeout_props(payload)
+    payload_source = (payload or {}).get("source") or "odds_api"
     for line in prop_lines:
         if pitcher.get("name") and not names_match(line.player_name, pitcher.get("name") or ""):
             continue
@@ -296,6 +299,7 @@ async def _pitcher_prop_for_game(
                 sportsbook=line.sportsbook,
                 timestamp=line.timestamp,
                 raw=line.raw,
+                source=payload_source,
             )
         )
     analysis = consensus_for_pitcher(prop_lines, pitcher.get("name") or "")
@@ -315,6 +319,7 @@ async def _pitcher_prop_for_game(
             movement_direction=analysis.get("movement_direction"),
             steam_velocity=analysis.get("steam_velocity"),
             rows=analysis.get("rows") or [],
+            source=payload_source,
         )
     )
     return analysis

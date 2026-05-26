@@ -32,8 +32,14 @@ from typing import Any
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from app.config import get_settings
 from app.models import OddsSnapshot
 from app.providers.odds_api import OddsApiError, OddsApiProvider, OddsApiRateLimited
+from app.providers.sportsgameodds import (
+    SportsGameOddsError,
+    SportsGameOddsProvider,
+    SportsGameOddsRateLimited,
+)
 from app.services.mlb_odds_matching import MatchResult, match_all_games
 
 logger = logging.getLogger(__name__)
@@ -84,8 +90,54 @@ class OddsCacheHealth:
         return float(self.live_api_calls)
 
 
+@dataclass
+class ProviderHealth:
+    name: str
+    enabled: bool
+    last_success_at: datetime | None = None
+    last_error: str | None = None
+    last_error_at: datetime | None = None
+    events_fetched: int = 0
+    totals_found: int = 0
+    pitcher_props_found: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "enabled": self.enabled,
+            "last_success_at": self.last_success_at.isoformat() if self.last_success_at else None,
+            "last_error": self.last_error,
+            "last_error_at": self.last_error_at.isoformat() if self.last_error_at else None,
+            "events_fetched": self.events_fetched,
+            "totals_found": self.totals_found,
+            "pitcher_props_found": self.pitcher_props_found,
+        }
+
+
+@dataclass
+class ProvidersHealth:
+    primary: ProviderHealth
+    backup: ProviderHealth
+    last_provider_used: str | None = None
+    last_errors: list[str] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "primary": self.primary.as_dict(),
+            "backup": self.backup.as_dict(),
+            "last_provider_used": self.last_provider_used,
+            "last_errors": list(self.last_errors),
+        }
+
+
 _health = OddsCacheHealth()
 _metrics_lock = threading.Lock()
+# Provider diagnostics (primary Odds-API, backup SportsGameOdds).
+_providers_lock = threading.Lock()
+_providers_health = ProvidersHealth(
+    primary=ProviderHealth(name="Odds-API", enabled=True),
+    backup=ProviderHealth(name="SportsGameOdds", enabled=False),
+)
 # One refresh at a time, full stop. Threading.Lock (not asyncio.Lock) so
 # concurrent callers on different event loops are also serialized.
 _refresh_lock = threading.Lock()
@@ -96,11 +148,21 @@ def get_odds_cache_health() -> OddsCacheHealth:
         return OddsCacheHealth(**_health.__dict__)
 
 
+def get_odds_provider_health() -> dict[str, Any]:
+    with _providers_lock:
+        return _providers_health.as_dict()
+
+
 def reset_metrics() -> None:
     """Test helper."""
     global _health
     with _metrics_lock:
         _health = OddsCacheHealth()
+    with _providers_lock:
+        _providers_health.primary = ProviderHealth(name="Odds-API", enabled=True)
+        _providers_health.backup = ProviderHealth(name="SportsGameOdds", enabled=False)
+        _providers_health.last_provider_used = None
+        _providers_health.last_errors = []
 
 
 def _record(**deltas: Any) -> None:
@@ -112,12 +174,54 @@ def _record(**deltas: Any) -> None:
                 setattr(_health, key, value)
 
 
+def _record_provider_event(
+    *,
+    provider: str,
+    enabled: bool | None = None,
+    events_fetched: int | None = None,
+    totals_found: int | None = None,
+    pitcher_props_found: int | None = None,
+    last_success: bool = False,
+    error: str | None = None,
+) -> None:
+    with _providers_lock:
+        target = _providers_health.primary if provider == "Odds-API" else _providers_health.backup
+        if enabled is not None:
+            target.enabled = enabled
+        if events_fetched is not None:
+            target.events_fetched = events_fetched
+        if totals_found is not None:
+            target.totals_found = totals_found
+        if pitcher_props_found is not None:
+            target.pitcher_props_found = pitcher_props_found
+        if last_success:
+            target.last_success_at = datetime.utcnow()
+        if error:
+            target.last_error = error
+            target.last_error_at = datetime.utcnow()
+            _providers_health.last_errors.append(error)
+
+
+def _record_last_provider_used(name: str | None) -> None:
+    with _providers_lock:
+        _providers_health.last_provider_used = name
+
+
 # --- read paths -------------------------------------------------------------
 
 
 def _events_list_key(game_date: str) -> str:
     """Synthetic event_id for the per-day events list row."""
     return f"_events_{game_date}"
+
+
+def _sgo_provider() -> SportsGameOddsProvider | None:
+    settings = get_settings()
+    enabled = bool(settings.sgo_enabled)
+    _record_provider_event(provider="SportsGameOdds", enabled=enabled)
+    if not enabled:
+        return None
+    return SportsGameOddsProvider(settings.sgo_api_key, settings.sgo_base_url)
 
 
 def _load_snapshot(
@@ -338,6 +442,89 @@ async def refresh_mlb_odds_cache(
     """
     result = RefreshResult(refreshed=False, reason="not attempted", game_date=game_date)
 
+    primary_totals = 0
+    primary_props = 0
+    backup_totals = 0
+    backup_props = 0
+    primary_events = 0
+    backup_events = 0
+    used_providers: set[str] = set()
+
+    sgo_provider: SportsGameOddsProvider | None = None
+    sgo_events_raw: list[dict[str, Any]] | None = None
+    sgo_events_norm: list[dict[str, Any]] | None = None
+    sgo_events_by_id: dict[str, dict[str, Any]] = {}
+    sgo_match_by_game: dict[int, dict[str, Any]] = {}
+    sgo_loaded = False
+
+    async def _load_sgo_events() -> list[dict[str, Any]] | None:
+        nonlocal sgo_provider, sgo_events_raw, sgo_events_norm, sgo_events_by_id, sgo_loaded
+        if sgo_loaded:
+            return sgo_events_norm
+        sgo_loaded = True
+        sgo_provider = _sgo_provider()
+        if not sgo_provider:
+            return None
+        try:
+            sgo_events_raw = await sgo_provider.fetch_mlb_events_with_odds(game_date)
+        except SportsGameOddsRateLimited as exc:
+            msg = f"sgo events 429: {exc}"
+            result.errors.append(msg)
+            result.rate_limited += 1
+            _record_provider_event(provider="SportsGameOdds", error=msg)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            msg = f"sgo events failed: {type(exc).__name__}: {exc}"
+            result.errors.append(msg)
+            _record_provider_event(provider="SportsGameOdds", error=msg)
+            return None
+        sgo_events_raw = sgo_events_raw or []
+        sgo_events_norm = [sgo_provider.normalize_event(e) for e in sgo_events_raw]
+        sgo_events_by_id = {str(e.get("eventID") or ""): e for e in sgo_events_raw}
+        _record_provider_event(
+            provider="SportsGameOdds",
+            events_fetched=len(sgo_events_norm),
+            last_success=True,
+        )
+        return sgo_events_norm
+
+    def _payload_empty(payload: dict[str, Any] | None) -> bool:
+        if not payload or not isinstance(payload, dict):
+            return True
+        books = payload.get("bookmakers") or {}
+        return not isinstance(books, dict) or not books
+
+    def _payload_market_flags(payload: dict[str, Any] | None) -> tuple[bool, bool]:
+        from app.services.mlb_odds_analysis import analyze_game_totals
+        from app.services.mlb_prop_odds import normalize_pitcher_strikeout_props
+
+        if not payload:
+            return False, False
+        totals = analyze_game_totals(payload).get("book_count") or 0
+        props = len(normalize_pitcher_strikeout_props(payload))
+        return totals > 0, props > 0
+
+    async def _sgo_payload_for_game(
+        game_pk: int,
+        *,
+        override_event_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        nonlocal sgo_match_by_game
+        events_norm = await _load_sgo_events()
+        if not events_norm or not sgo_provider:
+            return None
+        if not sgo_match_by_game:
+            matches, _unmatched = match_all_games(games, events_norm)
+            for match in matches:
+                if match.matched_event_id:
+                    event = sgo_events_by_id.get(str(match.matched_event_id))
+                    if event:
+                        sgo_match_by_game[match.game_pk] = event
+        event = sgo_match_by_game.get(game_pk)
+        if not event:
+            return None
+        return sgo_provider.normalize_event_odds(event, override_event_id=override_event_id)
+
     if not _refresh_lock.acquire(blocking=False):
         result.reason = "another refresh in progress; reusing cache"
         _record(last_refresh_skipped_reason=result.reason)
@@ -357,29 +544,41 @@ async def refresh_mlb_odds_cache(
                 date_to=game_date,
             )
             _record(live_api_calls=1)
+            _record_provider_event(provider="Odds-API", events_fetched=len(events_payload or []), last_success=True)
         except OddsApiRateLimited as exc:
             _record(rate_limited_count=1, last_rate_limited_at=datetime.utcnow())
             result.errors.append(f"events 429: {exc}")
             result.rate_limited += 1
+            _record_provider_event(provider="Odds-API", error=f"events 429: {exc}")
             events_payload = None
         except Exception as exc:  # noqa: BLE001
             _record(refresh_errors=1, last_refresh_error=f"events: {exc}")
             result.errors.append(f"events failed: {type(exc).__name__}: {exc}")
+            _record_provider_event(provider="Odds-API", error=f"events failed: {type(exc).__name__}: {exc}")
             events_payload = None
 
-        if not isinstance(events_payload, list):
+        events_source = "Odds-API"
+        if not isinstance(events_payload, list) or not events_payload:
             # Couldn't refresh events; if a stale list exists we proceed with
             # IT for matching odds-per-event below. Otherwise we have nothing
             # actionable and bail.
-            stale = get_cached_events_list(db, game_date=game_date, fallback_stale=True)
-            if not stale:
-                result.reason = "events fetch failed and no cached events"
-                _record(last_refresh_skipped_reason=result.reason)
-                return result
-            events = stale
-            result.reason = "events fetch failed; serving stale events"
+            sgo_events = await _load_sgo_events()
+            if sgo_events:
+                events = sgo_events
+                events_source = "SportsGameOdds"
+                backup_events = len(events)
+                result.reason = "events list refreshed (SportsGameOdds fallback)"
+            else:
+                stale = get_cached_events_list(db, game_date=game_date, fallback_stale=True)
+                if not stale:
+                    result.reason = "events fetch failed and no cached events"
+                    _record(last_refresh_skipped_reason=result.reason)
+                    return result
+                events = stale
+                result.reason = "events fetch failed; serving stale events"
         else:
             events = events_payload
+            primary_events = len(events)
             _upsert_snapshot(
                 db,
                 sport=ODDS_MLB_SPORT,
@@ -391,6 +590,17 @@ async def refresh_mlb_odds_cache(
             result.events_cached = 1
             result.refreshed = True
             result.reason = "events list refreshed"
+        if events_source == "SportsGameOdds":
+            _upsert_snapshot(
+                db,
+                sport=ODDS_MLB_SPORT,
+                event_id=_events_list_key(game_date),
+                market_type=MARKET_TYPE_EVENTS_LIST,
+                payload=events,
+                ttl=MLB_EVENTS_LIST_TTL,
+            )
+            result.events_cached = 1
+            result.refreshed = True
         result.events_fetched = len(events)
 
         # ---- 2. per-event odds ----
@@ -400,20 +610,55 @@ async def refresh_mlb_odds_cache(
 
         for match in matched:
             event_id = match.matched_event_id or ""
-            try:
-                payload = await odds.odds(event_id)
-                _record(live_api_calls=1)
-                result.odds_calls += 1
-            except OddsApiRateLimited as exc:
-                _record(rate_limited_count=1, last_rate_limited_at=datetime.utcnow())
-                result.errors.append(f"odds({event_id}) 429: {exc}")
-                result.rate_limited += 1
-                # Leave whatever stale row exists — readers will fall back.
+            payload: dict[str, Any] | None = None
+            provider_used = "Odds-API"
+            if events_source == "SportsGameOdds":
+                if not sgo_provider:
+                    continue
+                raw_event = sgo_events_by_id.get(event_id)
+                if not raw_event:
+                    continue
+                payload = sgo_provider.normalize_event_odds(raw_event)
+                provider_used = "SportsGameOdds"
+            else:
+                try:
+                    payload = await odds.odds(event_id)
+                    _record(live_api_calls=1)
+                    result.odds_calls += 1
+                except OddsApiRateLimited as exc:
+                    _record(rate_limited_count=1, last_rate_limited_at=datetime.utcnow())
+                    result.errors.append(f"odds({event_id}) 429: {exc}")
+                    result.rate_limited += 1
+                    _record_provider_event(provider="Odds-API", error=f"odds({event_id}) 429: {exc}")
+                    payload = None
+                except Exception as exc:  # noqa: BLE001
+                    _record(refresh_errors=1, last_refresh_error=f"odds({event_id}): {exc}")
+                    result.errors.append(f"odds({event_id}) failed: {type(exc).__name__}: {exc}")
+                    _record_provider_event(
+                        provider="Odds-API",
+                        error=f"odds({event_id}) failed: {type(exc).__name__}: {exc}",
+                    )
+                    payload = None
+
+                totals_ok, props_ok = _payload_market_flags(payload)
+                if _payload_empty(payload) or not totals_ok or not props_ok:
+                    sgo_payload = await _sgo_payload_for_game(match.game_pk, override_event_id=event_id)
+                    if sgo_payload:
+                        payload = sgo_payload
+                        provider_used = "SportsGameOdds"
+
+            if not payload:
                 continue
-            except Exception as exc:  # noqa: BLE001
-                _record(refresh_errors=1, last_refresh_error=f"odds({event_id}): {exc}")
-                result.errors.append(f"odds({event_id}) failed: {type(exc).__name__}: {exc}")
-                continue
+
+            totals_ok, props_ok = _payload_market_flags(payload)
+            if provider_used == "Odds-API":
+                primary_totals += int(totals_ok)
+                primary_props += int(props_ok)
+            else:
+                backup_totals += int(totals_ok)
+                backup_props += int(props_ok)
+            used_providers.add(provider_used)
+
             _upsert_snapshot(
                 db,
                 sport=ODDS_MLB_SPORT,
@@ -428,6 +673,26 @@ async def refresh_mlb_odds_cache(
             result.odds_cached += 1
 
         db.commit()
+        if events_source == "SportsGameOdds":
+            backup_events = len(events)
+        _record_provider_event(
+            provider="Odds-API",
+            events_fetched=primary_events,
+            totals_found=primary_totals,
+            pitcher_props_found=primary_props,
+        )
+        _record_provider_event(
+            provider="SportsGameOdds",
+            events_fetched=backup_events,
+            totals_found=backup_totals,
+            pitcher_props_found=backup_props,
+        )
+        if used_providers == {"SportsGameOdds"}:
+            _record_last_provider_used("SportsGameOdds")
+        elif used_providers == {"Odds-API"}:
+            _record_last_provider_used("Odds-API")
+        elif used_providers:
+            _record_last_provider_used("Mixed")
         _record(
             last_refresh_at=datetime.utcnow(),
             last_refresh_event_count=result.events_fetched,

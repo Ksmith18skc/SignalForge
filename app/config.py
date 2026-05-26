@@ -87,6 +87,9 @@ class Settings(BaseSettings):
     odds_api_base_url: str = "https://api.odds-api.io/v3"
     odds_bookmakers: str = "DraftKings,FanDuel,BetMGM,Caesars"
     odds_default_sports: str = "basketball,baseball,american-football,ice-hockey"
+    sgo_api_key: str | None = None
+    sgo_base_url: str = "https://api.sportsgameodds.com/v2"
+    sgo_enabled: bool = False
     mlb_stats_enabled: bool = True
     weather_api_key: str | None = None
     weather_api_base_url: str = "https://api.weatherapi.com/v1"
