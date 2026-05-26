@@ -276,6 +276,10 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
         data_sources_used=payload.get("data_sources_used") or [],
         factors=payload.get("factors") or {},
         generated_for_date=card_date,
+        opening_line=payload.get("line"),
+        current_line=payload.get("line"),
+        recommended_line=payload.get("line"),
+        implied_probability_at_entry=_implied_probability(payload.get("best_price")),
     )
     db.add(edge)
     db.flush()
@@ -359,3 +363,13 @@ def _parse_dt(value: Any) -> datetime | None:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(tzinfo=None)
     except ValueError:
         return None
+
+
+def _implied_probability(price: Any) -> float | None:
+    try:
+        decimal_price = float(price)
+    except (TypeError, ValueError):
+        return None
+    if decimal_price <= 1:
+        return None
+    return round(1 / decimal_price, 4)

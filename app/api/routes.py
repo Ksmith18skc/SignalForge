@@ -53,6 +53,15 @@ from app.services.mlb_edge_engine import (
     latest_daily_card,
     run_daily_mlb_edges,
 )
+from app.services.mlb_performance import (
+    clv_report,
+    grade_edge,
+    performance_by_market,
+    performance_by_score_band,
+    performance_summary,
+    top_factors_by_performance,
+    update_closing_line_fields,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -921,6 +930,93 @@ def mlb_debug_sources(db: Session = Depends(get_db)) -> dict[str, object]:
             "daily_cards": db.scalar(select(func.count(MlbDailyCard.id))) or 0,
         },
     }
+
+
+@router.post("/mlb/edges/{edge_id}/grade")
+def mlb_grade_edge(
+    edge_id: int,
+    payload: dict[str, object],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    edge = db.get(MlbEdge, edge_id)
+    if edge is None:
+        raise HTTPException(status_code=404, detail=f"MLB edge {edge_id} not found")
+    outcome = str(payload.get("win_loss_push") or "").lower()
+    if outcome and outcome not in {"win", "loss", "push"}:
+        raise HTTPException(status_code=400, detail="win_loss_push must be win, loss, or push")
+    grade_edge(
+        edge,
+        result=str(payload.get("result")) if payload.get("result") is not None else None,
+        win_loss_push=outcome or None,
+        opening_line=_optional_float(payload.get("opening_line")),
+        current_line=_optional_float(payload.get("current_line")),
+        closing_line=_optional_float(payload.get("closing_line")),
+        closing_price=_optional_float(payload.get("closing_price")),
+    )
+    db.commit()
+    db.refresh(edge)
+    return edge_to_dict(edge)
+
+
+@router.post("/mlb/edges/update-closing-lines")
+def mlb_update_closing_lines(
+    payload: dict[str, object],
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    updates = payload.get("updates")
+    if not isinstance(updates, list):
+        raise HTTPException(status_code=400, detail="payload must include updates list")
+    updated = 0
+    missing: list[int] = []
+    for row in updates:
+        if not isinstance(row, dict):
+            continue
+        edge_id = row.get("edge_id") or row.get("id")
+        if edge_id is None:
+            continue
+        edge = db.get(MlbEdge, int(edge_id))
+        if edge is None:
+            missing.append(int(edge_id))
+            continue
+        update_closing_line_fields(
+            edge,
+            closing_line=_optional_float(row.get("closing_line")),
+            closing_price=_optional_float(row.get("closing_price")),
+        )
+        updated += 1
+    db.commit()
+    return {"updated": updated, "missing_edge_ids": missing}
+
+
+@router.get("/mlb/performance/summary")
+def mlb_performance_summary(db: Session = Depends(get_db)) -> dict[str, object]:
+    data = performance_summary(db)
+    data["top_factors_by_performance"] = top_factors_by_performance(db)[:10]
+    return data
+
+
+@router.get("/mlb/performance/by-market")
+def mlb_performance_by_market(db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return performance_by_market(db)
+
+
+@router.get("/mlb/performance/by-score-band")
+def mlb_performance_by_score_band(db: Session = Depends(get_db)) -> list[dict[str, object]]:
+    return performance_by_score_band(db)
+
+
+@router.get("/mlb/performance/clv")
+def mlb_performance_clv(db: Session = Depends(get_db)) -> dict[str, object]:
+    return clv_report(db)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid numeric value: {value}") from exc
 
 
 def _mlb_game_payload(game: MlbGame) -> dict[str, object]:

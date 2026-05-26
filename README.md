@@ -265,6 +265,12 @@ Read results:
 | GET | `/mlb/daily-card` | Top 5 totals, top 5 K props, near misses, pass list |
 | GET | `/mlb/games/{game_pk}/edge-summary` | Game-level edge/environment summary |
 | GET | `/mlb/debug/sources` | Provider/cache health for MLB engine |
+| POST | `/mlb/edges/{edge_id}/grade` | Grade an edge result and calculate CLV/ROI |
+| POST | `/mlb/edges/update-closing-lines` | Batch update closing line/price fields |
+| GET | `/mlb/performance/summary` | Backtest summary, win rate, ROI units, average CLV |
+| GET | `/mlb/performance/by-market` | Performance grouped by edge type |
+| GET | `/mlb/performance/by-score-band` | Performance grouped by score band |
+| GET | `/mlb/performance/clv` | Positive/negative CLV report |
 
 Useful env vars:
 
@@ -283,7 +289,24 @@ Score actions:
 - `85+`: Strong candidate
 
 The dashboard includes an **MLB** tab with a run button, current edges, daily
-card, and source health.
+card, source health, CLV report, score-band win rates, ROI by edge type, and
+factor performance.
+
+Grade an edge after the market resolves:
+
+```bash
+curl -X POST http://localhost:8000/mlb/edges/123/grade \
+  -H "Content-Type: application/json" \
+  -d '{
+    "result": "Final 6-4",
+    "win_loss_push": "win",
+    "closing_line": 9,
+    "closing_price": 1.83
+  }'
+```
+
+SignalForge stores entry/open/current/recommended/closing lines, implied
+probabilities, CLV points, CLV percent, and ROI units for later backtesting.
 
 ---
 

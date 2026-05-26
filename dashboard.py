@@ -242,6 +242,30 @@ def fetch_mlb_sources() -> dict[str, Any] | None:
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_mlb_performance() -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "summary": {},
+        "by_market": [],
+        "by_score_band": [],
+        "clv": {},
+    }
+    try:
+        with _client() as c:
+            for key, path in {
+                "summary": "/mlb/performance/summary",
+                "by_market": "/mlb/performance/by-market",
+                "by_score_band": "/mlb/performance/by-score-band",
+                "clv": "/mlb/performance/clv",
+            }.items():
+                r = c.get(path)
+                r.raise_for_status()
+                out[key] = r.json()
+    except httpx.HTTPError:
+        pass
+    return out
+
+
 def trigger_mlb_edge_run() -> dict[str, Any]:
     with _client() as c:
         r = c.post("/mlb/edges/run", timeout=180.0)
@@ -490,6 +514,7 @@ alerts_all = fetch_alerts(limit=200)
 mlb_edges_all = fetch_mlb_edges(limit=100)
 mlb_daily_card = fetch_mlb_daily_card()
 mlb_sources = fetch_mlb_sources()
+mlb_performance = fetch_mlb_performance()
 
 
 # ----------------------------------------------------------------------------
@@ -844,6 +869,39 @@ with tab_mlb:
 
     st.markdown("#### Data source health")
     st.json(mlb_sources or {})
+
+    st.markdown("#### CLV and backtest report")
+    perf_summary = mlb_performance.get("summary") or {}
+    clv = mlb_performance.get("clv") or {}
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    pc1.metric("Graded edges", perf_summary.get("graded_edges") or 0)
+    pc2.metric(
+        "Win rate",
+        "n/a" if perf_summary.get("win_rate") is None else f"{perf_summary.get('win_rate'):.1%}",
+    )
+    pc3.metric("ROI units", f"{perf_summary.get('roi_units') or 0:.2f}")
+    pc4.metric(
+        "Avg CLV",
+        "n/a" if clv.get("average_clv_percent") is None else f"{clv.get('average_clv_percent'):.2%}",
+    )
+
+    perf_tabs = st.tabs(["Score bands", "ROI by type", "CLV", "Factors"])
+    with perf_tabs[0]:
+        st.dataframe(pd.DataFrame(mlb_performance.get("by_score_band") or []), width="stretch", hide_index=True)
+    with perf_tabs[1]:
+        st.dataframe(pd.DataFrame(mlb_performance.get("by_market") or []), width="stretch", hide_index=True)
+    with perf_tabs[2]:
+        clv_cols = st.columns(2)
+        clv_cols[0].markdown("**Top positive CLV**")
+        clv_cols[0].dataframe(pd.DataFrame(clv.get("top_positive") or []), width="stretch", hide_index=True)
+        clv_cols[1].markdown("**Top negative CLV**")
+        clv_cols[1].dataframe(pd.DataFrame(clv.get("top_negative") or []), width="stretch", hide_index=True)
+    with perf_tabs[3]:
+        st.dataframe(
+            pd.DataFrame(perf_summary.get("top_factors_by_performance") or []),
+            width="stretch",
+            hide_index=True,
+        )
 
 with tab_traders:
     st.markdown("#### Add wallet")
