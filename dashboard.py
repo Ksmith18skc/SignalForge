@@ -22,6 +22,27 @@ import httpx
 import pandas as pd
 import streamlit as st
 
+from app.utils.dashboard_format import (
+    SCORE_ACTIONABLE_MIN,
+    SCORE_BUCKETS,
+    SCORE_HIGH_CONV_MIN,
+    SCORE_STRONG_MIN,
+    american_from_price,
+    american_to_implied_probability,
+    compact_time_ago,
+    confidence_label as confidence_label_fn,
+    confidence_word,
+    factor_label as factor_label_fn,
+    format_edge_delta,
+    format_hit_rate,
+    format_price_with_implied_prob,
+    odds_provider_label,
+    score_bucket_label,
+    score_distribution as score_distribution_fn,
+    score_tier as score_tier_fn,
+    score_tier_kind,
+)
+
 API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip("/")
 DEFAULT_TIMEOUT = 10.0
 SCAN_TIMEOUT = 60.0
@@ -199,9 +220,10 @@ div[data-testid="stMetricDelta"] { font-size: 0.75rem !important; }
 }
 .sf-card-row .k { color: var(--muted); margin-right: 6px; }
 .sf-score {
-    font-size: 1.7rem;
+    font-size: 2.1rem;
     font-weight: 800;
     letter-spacing: 0.04em;
+    line-height: 1.05;
 }
 .score-strong { color: var(--gold); }
 .score-bettable { color: var(--green); }
@@ -322,6 +344,86 @@ button[data-baseweb="tab"][aria-selected="true"] {
 }
 hr { border-color: var(--border) !important; }
 code { background: var(--panel-2); color: var(--cyan); padding: 1px 6px; border-radius: 3px; }
+
+/* --- Edge card sub-sections --- */
+.sf-section {
+  margin-top: 8px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.sf-section-title {
+  color: var(--muted);
+  font-size: 0.68rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+}
+.sf-kv {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  column-gap: 10px;
+  row-gap: 2px;
+  font-size: 0.85rem;
+}
+.sf-kv .k { color: var(--muted); }
+.sf-kv .v { color: var(--text); }
+.sf-factor-row {
+  display: grid;
+  grid-template-columns: 170px 1fr 38px;
+  align-items: center;
+  column-gap: 8px;
+  margin-bottom: 2px;
+  font-size: 0.8rem;
+}
+.sf-factor-row .lbl { color: var(--muted); }
+.sf-factor-row .val { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sf-factor-bar {
+  height: 6px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.sf-factor-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+}
+.sf-factor-bar.hi > span { background: var(--gold); }
+.sf-factor-bar.mid > span { background: var(--green); }
+.sf-factor-bar.lo > span { background: var(--muted); }
+.sf-trust {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 0.8rem;
+  color: var(--text);
+}
+.sf-trust .ok { color: var(--green); }
+.sf-trust .warn { color: var(--red); }
+.sf-trust .neutral { color: var(--muted); }
+.sf-bucket-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 50px;
+  align-items: center;
+  column-gap: 8px;
+  font-size: 0.82rem;
+  margin-bottom: 2px;
+}
+.sf-bucket-row .lbl { color: var(--muted); font-variant-numeric: tabular-nums; }
+.sf-bucket-row .val { color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sf-bucket-bar {
+  height: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.sf-bucket-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--purple);
+}
 </style>
 """
 
@@ -685,14 +787,11 @@ def chase_risk_badge(risk: Any) -> str:
 
 
 def confidence_badge(conf: Any) -> str:
-    c = str(conf or "").lower()
-    if c == "high":
-        return badge("High Conf", "gold")
-    if c == "medium":
-        return badge("Med Conf", "purple")
-    if c == "low":
-        return badge("Low Conf", "muted")
-    return badge("Conf ?", "muted")
+    """Confidence word (LOW/MED/HIGH → WATCH/LEAN/STRONG/HIGH CONV). No fake
+    upgrades — this is purely a relabel of the engine's raw 'low|medium|high'
+    so the card never says 'LOW CONF' next to a card under 'Top Actionable'."""
+    label, kind = confidence_word(conf)
+    return badge(label, kind)
 
 
 def status_badge(ok: bool, *, ok_label: str, bad_label: str, neutral: bool = False) -> str:
@@ -749,19 +848,347 @@ def render_link_buttons(links: list[tuple[str, str | None]]) -> str:
 # =============================================================================
 
 
+def _fmt_line(value: Any, *, fmt: str = "{:.1f}") -> str:
+    return fmt_num(value, fmt=fmt) if value is not None else DASH
+
+
+def _factor_bar_color(value: float) -> str:
+    if value >= 75:
+        return "hi"
+    if value >= 60:
+        return "mid"
+    if value >= 40:
+        return ""
+    return "lo"
+
+
+def _render_factor_block(factors: dict[str, Any]) -> str:
+    """Compact 1-line-per-factor block with a tiny horizontal bar. Renames
+    factors via FACTOR_LABELS — never claims they are probabilities."""
+    if not factors:
+        return ""
+    rows: list[str] = []
+    for name, value in factors.items():
+        if value is None:
+            continue
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            continue
+        label = factor_label_fn(name)
+        pct = max(0.0, min(100.0, v))
+        color = _factor_bar_color(pct)
+        rows.append(
+            f"<div class='sf-factor-row'>"
+            f"<span class='lbl'>{label}</span>"
+            f"<span class='sf-factor-bar {color}'><span style='width:{pct:.0f}%'></span></span>"
+            f"<span class='val'>{v:.0f}/100</span>"
+            f"</div>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Edge Composition</div>"
+        + "".join(rows[:8])
+        + "</div>"
+    )
+
+
+def _render_model_vs_market(edge: dict[str, Any]) -> str:
+    """For pitcher K and game total cards: market line, model projection,
+    edge delta, recent form. Never invents a projection."""
+    edge_type = str(edge.get("edge_type") or "")
+    if edge_type not in {"pitcher_strikeouts", "game_total"}:
+        return ""
+    rows: list[tuple[str, str]] = []
+    line = edge.get("line")
+    market_price = edge.get("best_price")
+    if edge_type == "pitcher_strikeouts":
+        proj = (
+            edge.get("projected_strikeouts")
+            or edge.get("model_projected_ks")
+            or edge.get("projected_ks")
+        )
+        recent = (
+            edge.get("recent_strikeouts_per_start")
+            or edge.get("recent_ks_per_start")
+            or (edge.get("statcast_summary") or {}).get("strikeouts_per_start")
+        )
+        rows.append(("Market line", f"{_fmt_line(line)} Ks" if line is not None else DASH))
+        if proj is not None:
+            rows.append(("SignalForge projection", f"{_fmt_line(proj)} Ks"))
+            rows.append(("Edge delta", format_edge_delta(proj, line, unit="Ks")))
+        else:
+            rows.append(("SignalForge projection", "Projection unavailable"))
+        if recent is not None:
+            rows.append(("Recent Ks/start", _fmt_line(recent)))
+        rows.append(("Market price", format_price_with_implied_prob(market_price)))
+    else:
+        env_score = (edge.get("factors") or {}).get("environment")
+        proj = edge.get("projected_total") or edge.get("model_projected_total")
+        rows.append(("Market total", _fmt_line(line) if line is not None else DASH))
+        if proj is not None:
+            rows.append(("SignalForge projected total", _fmt_line(proj)))
+            rows.append(("Edge delta", format_edge_delta(proj, line)))
+        else:
+            note = "Projection unavailable"
+            if env_score is not None:
+                note = "Model projection unavailable; environment score only."
+            rows.append(("SignalForge projected total", note))
+        if env_score is not None:
+            try:
+                rows.append(("Environment rating", f"{float(env_score):.0f}/100"))
+            except (TypeError, ValueError):
+                pass
+        rows.append(("Market price", format_price_with_implied_prob(market_price)))
+    body = "".join(
+        f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows
+    )
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Model vs Market</div>"
+        f"<div class='sf-kv'>{body}</div>"
+        "</div>"
+    )
+
+
+def _render_recent_form(edge: dict[str, Any]) -> str:
+    """Recent-form panel for pitcher K cards. Uses real fields only — when
+    backend doesn't expose them yet, the row reads 'Insufficient history'."""
+    if str(edge.get("edge_type") or "") != "pitcher_strikeouts":
+        return ""
+    line = edge.get("line")
+    summary = edge.get("statcast_summary") or {}
+    last3 = edge.get("last_3_starts_ks") or summary.get("last_3_starts_ks")
+    last5 = edge.get("last_5_starts_ks") or summary.get("last_5_starts_ks")
+    season_kps = edge.get("season_strikeouts_per_start") or summary.get(
+        "season_strikeouts_per_start"
+    )
+    recent_kps = (
+        edge.get("recent_strikeouts_per_start")
+        or edge.get("recent_ks_per_start")
+        or summary.get("strikeouts_per_start")
+    )
+    hits10 = edge.get("hits_last_10_vs_line") or summary.get("hits_last_10_vs_line")
+    att10 = edge.get("attempts_last_10_vs_line") or summary.get(
+        "attempts_last_10_vs_line"
+    )
+    hits5 = edge.get("hits_last_5_vs_line") or summary.get("hits_last_5_vs_line")
+    att5 = edge.get("attempts_last_5_vs_line") or summary.get("attempts_last_5_vs_line")
+
+    def row(label: str, value: str) -> str:
+        return f"<div class='k'>{label}</div><div class='v'>{value}</div>"
+
+    rows: list[str] = []
+    rows.append(
+        row(
+            "Last 3 starts K/start",
+            _fmt_line(last3) if last3 is not None else "Insufficient history",
+        )
+    )
+    rows.append(
+        row(
+            "Last 5 starts K/start",
+            _fmt_line(last5) if last5 is not None else
+            (_fmt_line(recent_kps) if recent_kps is not None else "Insufficient history"),
+        )
+    )
+    rows.append(
+        row(
+            "Season K/start",
+            _fmt_line(season_kps) if season_kps is not None else "Insufficient history",
+        )
+    )
+    if line is not None:
+        rows.append(row(f"Hit rate vs {_fmt_line(line)} (last 5)", format_hit_rate(hits5, att5)))
+        rows.append(row(f"Hit rate vs {_fmt_line(line)} (last 10)", format_hit_rate(hits10, att10)))
+    else:
+        rows.append(row("Hit rate vs line", "hit rate unavailable"))
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Recent Form</div>"
+        f"<div class='sf-kv'>{''.join(rows)}</div>"
+        "</div>"
+    )
+
+
+def _movement_tags(edge: dict[str, Any]) -> list[tuple[str, str]]:
+    """Return movement-related tags (label, kind) only when fields support
+    them. Never invents direction."""
+    tags: list[tuple[str, str]] = []
+    direction = str(edge.get("movement_direction") or "").lower()
+    if direction in {"steam", "steaming"}:
+        tags.append(("STEAM DETECTED", "gold"))
+    if direction == "drift":
+        tags.append(("LINE DRIFT", "purple"))
+    best_price = edge.get("best_price")
+    closing_price = edge.get("closing_price")
+    bp = american_to_implied_probability(best_price)
+    cp = american_to_implied_probability(closing_price)
+    if bp is not None and cp is not None and abs(bp - cp) >= 0.005:
+        if bp < cp:
+            tags.append(("PRICE WORSENING", "red"))
+        else:
+            tags.append(("PRICE IMPROVING", "green"))
+    return tags
+
+
+def _render_movement_clv(edge: dict[str, Any]) -> str:
+    opening_line = edge.get("opening_line")
+    current_line = edge.get("current_line")
+    closing_line = edge.get("closing_line")
+    best_price = edge.get("best_price")
+    closing_price = edge.get("closing_price")
+    clv_points = edge.get("clv_points")
+    clv_percent = edge.get("clv_percent")
+    graded = bool(edge.get("graded_at") or edge.get("win_loss_push"))
+
+    rows: list[tuple[str, str]] = []
+    has_line = any(v is not None for v in (opening_line, current_line, closing_line))
+    if has_line:
+        start = _fmt_line(opening_line)
+        mid = _fmt_line(current_line)
+        end = _fmt_line(closing_line) if closing_line is not None else (
+            "pending" if not graded else DASH
+        )
+        rows.append(("Line", f"{start} → {mid} → {end}"))
+    if best_price is not None or closing_price is not None:
+        sp = american_from_price(best_price) or DASH
+        cp = american_from_price(closing_price) if closing_price is not None else (
+            "pending" if not graded else DASH
+        )
+        rows.append(("Price", f"{sp} → {cp}"))
+    if clv_percent is not None or clv_points is not None:
+        points = (
+            f"{float(clv_points):+.1f} pts" if clv_points is not None else DASH
+        )
+        pct = fmt_pct(clv_percent) if clv_percent is not None else DASH
+        rows.append(("CLV", f"{points} · {pct}"))
+    else:
+        rows.append(
+            ("CLV", "pending" if not graded else "Closing line not captured yet")
+        )
+
+    if not has_line and best_price is None and closing_price is None and clv_percent is None:
+        return (
+            "<div class='sf-section'>"
+            "<div class='sf-section-title'>Market Movement & CLV</div>"
+            "<div class='sf-meta'>Movement unavailable</div>"
+            "</div>"
+        )
+
+    body = "".join(f"<div class='k'>{k}</div><div class='v'>{v}</div>" for k, v in rows)
+    tags = _movement_tags(edge)
+    tag_html = "".join(badge(t, kind) for t, kind in tags)
+    tag_block = f"<div style='margin-top:4px;'>{tag_html}</div>" if tag_html else ""
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Market Movement & CLV</div>"
+        f"<div class='sf-kv'>{body}</div>"
+        f"{tag_block}"
+        "</div>"
+    )
+
+
+def _render_trust(edge: dict[str, Any], *, odds_source: str, fallback: bool) -> str:
+    """Trust panel: data fresh / odds source / book count / Statcast / warnings."""
+    fresh = not bool(edge.get("odds_stale"))
+    data_age = edge.get("odds_data_age_minutes")
+    odds_fresh_label = "Odds fresh" if fresh else "Odds stale"
+    fresh_cls = "ok" if fresh else "warn"
+    if data_age is not None:
+        odds_fresh_label += f" ({data_age}m)"
+
+    factors = edge.get("factors") or {}
+    book_count = (
+        edge.get("book_count")
+        or factors.get("book_count")
+        or len({(r or {}).get("bookmaker") for r in (edge.get("rows") or []) if r})
+    )
+    try:
+        book_count_int = int(book_count) if book_count else 0
+    except (TypeError, ValueError):
+        book_count_int = 0
+    book_label = f"{book_count_int} books" if book_count_int else "books ?"
+    book_cls = "ok" if book_count_int >= 2 else "neutral"
+
+    sources = [str(s) for s in (edge.get("data_sources_used") or [])]
+    statcast_ok = any("statcast" in s.lower() for s in sources)
+    statcast_label = "Cached Statcast" if statcast_ok else "Statcast missing"
+    statcast_cls = "ok" if statcast_ok else "neutral"
+    if str(edge.get("edge_type") or "") == "game_total":
+        statcast_label = "Statcast n/a"
+        statcast_cls = "neutral"
+
+    warnings = edge.get("warnings") or []
+    warn_label = f"{len(warnings)} warnings" if warnings else "no warnings"
+    warn_cls = "warn" if warnings else "ok"
+
+    chase = str(edge.get("chase_risk") or "").lower()
+    chase_label = f"chase: {chase or '?'}"
+    chase_cls = "warn" if chase == "high" else ("neutral" if chase == "medium" else "ok")
+
+    market_scope = str(edge.get("market_scope") or "")
+    scope_label = market_scope.replace("_", " ").title() if market_scope else None
+
+    source_label = f"src: {odds_source}"
+    source_cls = "neutral" if fallback else "ok"
+
+    pieces: list[str] = [
+        f"<span class='{fresh_cls}'>{'✓' if fresh else '⚠'} {odds_fresh_label}</span>",
+        f"<span class='{source_cls}'>{'✓' if not fallback else '⚠'} {source_label}</span>",
+        f"<span class='{book_cls}'>{'✓' if book_cls == 'ok' else '·'} {book_label}</span>",
+        f"<span class='{statcast_cls}'>{'✓' if statcast_cls == 'ok' else '·'} {statcast_label}</span>",
+        f"<span class='{warn_cls}'>{'✓' if not warnings else '⚠'} {warn_label}</span>",
+        f"<span class='{chase_cls}'>· {chase_label}</span>",
+    ]
+    if scope_label:
+        pieces.append(f"<span class='neutral'>· {scope_label}</span>")
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Trust</div>"
+        f"<div class='sf-trust'>{''.join(pieces)}</div>"
+        "</div>"
+    )
+
+
 def render_edge_card(edge: dict[str, Any]) -> None:
-    """Dense MLB edge card — title row, score/price strip, top reasons, action."""
+    """Dense MLB edge card. Sections:
+        1. Header (matchup + side/line + score)
+        2. Label + chips (HIGH CONV / ACTIONABLE WATCH / PASS / WATCH SETUP)
+        3. Sportsbook line (book · price + implied prob)
+        4. Model vs Market
+        5. Recent Form (pitcher K only)
+        6. Edge Composition (factor bars)
+        7. Market Movement & CLV
+        8. Reasons + warnings
+        9. Trust panel
+    """
     score = edge.get("score")
-    tier, tier_kind = tier_for_score(score)
-    card_kind = card_kind_for_tier(tier)
+    label, label_kind = confidence_label_fn(
+        score,
+        edge.get("action"),
+        edge.get("confidence"),
+    )
+    # Map new tier kinds back to the existing left-border CSS class.
+    card_kind = {
+        "gold": "gold",
+        "green": "green",
+        "purple": "purple",
+        "red": "red",
+        "cyan": "",
+        "muted": "",
+    }.get(label_kind, "")
 
     market = edge.get("market") or DASH
     matchup = matchup_from_market(market)
     side = (edge.get("side") or DASH).title()
     line = edge.get("line")
-    line_str = fmt_num(line, fmt="{:.1f}") if line is not None else DASH
+    line_str = _fmt_line(line)
     book = edge.get("best_book") or DASH
-    price = fmt_price(edge.get("best_price"))
+    best_price = edge.get("best_price")
+    price_label = format_price_with_implied_prob(best_price)
     action = edge.get("action") or DASH
     edge_type = edge.get("edge_type") or ""
 
@@ -769,104 +1196,70 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     game_date = edge.get("game_date")
     event_label = fmt_event_time(game_start) if game_start else (game_date or DASH)
     created_at = edge.get("created_at")
-    updated_at = edge.get("graded_at")
     odds_captured_at = edge.get("odds_snapshot_captured_at")
     best_book_at = edge.get("best_book_updated_at")
-    odds_source_raw = str(edge.get("odds_snapshot_source") or "odds_api").lower()
-    odds_source = "SportsGameOdds" if "sports" in odds_source_raw else "Odds-API.io"
+    odds_source, fallback = odds_provider_label(edge.get("odds_snapshot_source"))
     data_age = edge.get("odds_data_age_minutes")
     data_age_label = f"{data_age}m" if data_age is not None else DASH
     odds_stale = bool(edge.get("odds_stale"))
 
-    opening_line = edge.get("opening_line")
-    current_line = edge.get("current_line")
-    closing_line = edge.get("closing_line")
-    best_price = edge.get("best_price")
-    closing_price = edge.get("closing_price")
-    clv_percent = edge.get("clv_percent")
-    movement_lines: list[str] = []
-    if opening_line is not None or current_line is not None or closing_line is not None:
-        start_line = fmt_num(opening_line, fmt="{:.1f}") if opening_line is not None else DASH
-        end_line = fmt_num(closing_line or current_line, fmt="{:.1f}") if (closing_line or current_line) is not None else DASH
-        movement_lines.append(f"Line: {start_line} → {end_line}")
-    if best_price is not None or closing_price is not None:
-        start_price = fmt_price(best_price) if best_price is not None else DASH
-        end_price = fmt_price(closing_price) if closing_price is not None else DASH
-        movement_lines.append(f"Price: {start_price} → {end_price}")
-    if clv_percent is not None:
-        movement_lines.append(f"CLV: {fmt_pct(clv_percent)}")
-    movement_block = (
-        " · ".join(movement_lines)
-        if movement_lines
-        else "movement unavailable"
-    )
-
     reasons = (edge.get("reasons") or [])[:3]
     warnings = edge.get("warnings") or []
-    sources = edge.get("data_sources_used") or []
     factors = edge.get("factors") or {}
-    factor_lines = []
-    for key, value in factors.items():
-        if value is None:
-            continue
-        label = str(key).replace("_", " ").title()
-        if isinstance(value, (int, float)):
-            factor_lines.append(f"+ {label}: {float(value):.0f}/100")
-        else:
-            factor_lines.append(f"+ {label}: {value}")
-    factor_block = (
-        "<div class='sf-card-row'><span class='k'>EDGE FACTORS</span></div>"
-        + "<div class='sf-card-row sf-meta'>" + "<br/>".join(factor_lines[:5]) + "</div>"
-        if factor_lines else ""
-    )
 
-    badges = " ".join([
-        badge(tier, tier_kind),
+    badges = " ".join(filter(None, [
+        badge(label, label_kind),
         confidence_badge(edge.get("confidence")),
         chase_risk_badge(edge.get("chase_risk")),
         badge(edge_type.replace("_", " "), "cyan") if edge_type else "",
-        badge("Stale Odds", "gold") if odds_stale else "",
-    ])
+        badge("FALLBACK ODDS SOURCE", "purple") if fallback else "",
+        badge("Stale Odds", "red") if odds_stale else "",
+    ]))
     warn_badges = " ".join(badge(w[:34], "red") for w in warnings[:3])
-    source_badges = " ".join(badge(s, "purple") for s in sources[:4])
 
     reasons_html = (
         "<ul class='sf-reasons'>" +
         "".join(f"<li>{r}</li>" for r in reasons) +
         "</ul>"
     ) if reasons else "<div class='sf-meta'>No supporting reasons returned.</div>"
-    warnings_html = (
-        "<div class='sf-card-row'><span class='k'>Warnings:</span>"
-        + "; ".join(warnings[:3])
-        + "</div>"
-    ) if warnings else ""
+
+    factor_section = _render_factor_block(factors)
+    model_section = _render_model_vs_market(edge)
+    form_section = _render_recent_form(edge)
+    movement_section = _render_movement_clv(edge)
+    trust_section = _render_trust(edge, odds_source=odds_source, fallback=fallback)
 
     body = f"""
     <div class="sf-card {card_kind}">
       <div class="sf-card-head">
         <div>
           <div class="sf-card-title">{matchup}</div>
-                    <div class="sf-card-sub">{side} {line_str} · {market}</div>
-                      <div class="sf-card-sub">Event: {event_label} · Signal: {fmt_relative(created_at)} · Updated: {fmt_relative(updated_at)} · Resolve: {DASH}</div>
+          <div class="sf-card-sub">{side} {line_str} · {market}</div>
+          <div class="sf-card-sub">Event: {event_label} · Signal: {fmt_relative(created_at)} · Odds: {fmt_relative(odds_captured_at)} · Age: {data_age_label}</div>
         </div>
         <div style="text-align:right;">
-                    <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
-                      <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
-          <div class="sf-card-sub">{book} · {price}</div>
+          <div class="sf-score {score_class(score)}">{fmt_score(score)}</div>
+          <div class="score-bar"><span class="{score_bar_class(score)}" style="width:{score_percent(score)}%"></span></div>
+          <div class="sf-card-sub">{book} · {price_label}</div>
         </div>
       </div>
       <div>{badges}</div>
-            <div class="sf-card-row"><span class="k">Odds:</span>{odds_source} · Snapshot: {fmt_relative(odds_captured_at)} · Best book: {fmt_relative(best_book_at)} · Data age: {data_age_label}</div>
-    <div class="sf-card-row"><span class="k">Movement:</span>{movement_block}</div>
-            {factor_block}
-      {reasons_html}
-            {warnings_html}
-      <div class="sf-card-row"><span class="k">Action:</span>{action}</div>
-      <div class="sf-card-row" style="margin-top:6px;">{source_badges}{warn_badges}</div>
-            {render_link_buttons([
-                ("Open Market", edge.get("market_url")),
-                ("Source", edge.get("source_url")),
-            ])}
+      <div class="sf-card-row"><span class="k">Action:</span>{action} · <span class="k">Best book updated:</span>{fmt_relative(best_book_at)}</div>
+      {model_section}
+      {form_section}
+      {factor_section}
+      {movement_section}
+      <div class="sf-section">
+        <div class="sf-section-title">Reasons</div>
+        {reasons_html}
+        {('<div class="sf-card-row"><span class="k">Warnings:</span>' + '; '.join(warnings[:3]) + '</div>') if warnings else ''}
+        <div style="margin-top:4px;">{warn_badges}</div>
+      </div>
+      {trust_section}
+      {render_link_buttons([
+          ("Open Market", edge.get("market_url")),
+          ("Source", edge.get("source_url")),
+      ])}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
@@ -967,6 +1360,106 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
                 ),
                 unsafe_allow_html=True,
             )
+
+
+def render_score_distribution(edges: list[dict[str, Any]], *, threshold: float = SCORE_HIGH_CONV_MIN) -> None:
+    """Render score-bucket bars + summary stats (top, median, std, count
+    above threshold). Helps explain why few high-conviction cards appear."""
+    if not edges:
+        render_empty_state(
+            "NO SCORE DATA",
+            "Run the MLB edge scan to populate score distribution.",
+        )
+        return
+    scores = []
+    for e in edges:
+        s = _as_float(e.get("score"))
+        if s is not None:
+            scores.append(s)
+    if not scores:
+        render_empty_state(
+            "NO SCORE DATA",
+            "Edges exist but none carry a numeric score.",
+        )
+        return
+    counts = score_distribution_fn(scores)
+    max_count = max(counts.values()) or 1
+    rows: list[str] = []
+    for _, _, label in SCORE_BUCKETS:
+        n = counts.get(label, 0)
+        width = int(round(100 * n / max_count)) if max_count else 0
+        rows.append(
+            "<div class='sf-bucket-row'>"
+            f"<span class='lbl'>{label}</span>"
+            f"<span class='sf-bucket-bar'><span style='width:{width}%'></span></span>"
+            f"<span class='val'>{n}</span>"
+            "</div>"
+        )
+    top = max(scores)
+    sorted_scores = sorted(scores)
+    mid = len(sorted_scores) // 2
+    median = (
+        sorted_scores[mid]
+        if len(sorted_scores) % 2
+        else 0.5 * (sorted_scores[mid - 1] + sorted_scores[mid])
+    )
+    mean = sum(scores) / len(scores)
+    variance = sum((s - mean) ** 2 for s in scores) / len(scores)
+    stdev = variance ** 0.5
+    above = sum(1 for s in scores if s >= threshold)
+
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Top score today", f"{top:.1f}")
+    metric_cols[1].metric("Median score", f"{median:.1f}")
+    metric_cols[2].metric("Std deviation", f"{stdev:.1f}")
+    metric_cols[3].metric(
+        f"Above {int(threshold)}",
+        above,
+        delta=f"of {len(scores)}",
+        delta_color="off",
+    )
+    st.markdown(
+        "<div class='sf-card'>"
+        "<div class='sf-section-title'>Score Distribution</div>"
+        + "".join(rows)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_why_no_high_conviction(
+    edges: list[dict[str, Any]], *, threshold: float = SCORE_HIGH_CONV_MIN
+) -> None:
+    """Compact diagnostic block — only renders when the high-conviction
+    count is zero. Counts come from the returned edges so we never invent
+    numbers."""
+    if not edges:
+        return
+    high_conv = [e for e in edges if (_as_float(e.get("score")) or 0.0) >= threshold]
+    if high_conv:
+        return
+    scores = [s for s in (_as_float(e.get("score")) for e in edges) if s is not None]
+    top = max(scores) if scores else 0.0
+    downgraded = sum(1 for e in edges if (e.get("warnings") or []))
+    missing_history = sum(
+        1
+        for e in edges
+        for w in (e.get("warnings") or [])
+        if "statcast" in str(w).lower() or "history" in str(w).lower()
+    )
+    high_chase = sum(1 for e in edges if str(e.get("chase_risk") or "").lower() == "high")
+
+    body = (
+        "<div class='sf-card'>"
+        "<div class='sf-section-title'>Why no high-conviction edges?</div>"
+        f"<div class='sf-card-row'>Top score today: <b>{top:.1f}</b></div>"
+        f"<div class='sf-card-row'>Required threshold: <b>{int(threshold)}</b></div>"
+        f"<div class='sf-card-row'>Edges downgraded by warnings: <b>{downgraded}</b></div>"
+        f"<div class='sf-card-row'>Edges missing history: <b>{missing_history}</b></div>"
+        f"<div class='sf-card-row'>High chase risk: <b>{high_chase}</b></div>"
+        "</div>"
+    )
+    st.markdown(body, unsafe_allow_html=True)
 
 
 def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callable]] | None = None) -> None:
@@ -1449,7 +1942,11 @@ with st.sidebar:
     st.markdown("<div class='sf-divider'></div>", unsafe_allow_html=True)
     st.markdown("**Wallet display**")
     show_full_wallet = st.checkbox("Show full wallet addresses", value=False)
-    show_pass_candidates = st.checkbox("Show pass candidates", value=False)
+    # Off by default — Pass-action edges should not dominate the terminal.
+    # Flip on for full-slate inspection in MLB Terminal and Wallet Flow.
+    show_pass_candidates = st.checkbox(
+        "Show pass candidates in terminal", value=False
+    )
     debug_mode = st.checkbox("Show raw JSON in Debug tab", value=True)
 
     st.markdown("<div class='sf-divider'></div>", unsafe_allow_html=True)
@@ -1618,8 +2115,10 @@ with tab_command:
         st.markdown("### TOP ACTIONABLE OPPORTUNITIES")
         top_decisions = sorted(
             [
-                e for e in mlb_actionable
-                if (e.get("score") or 0) >= 65 and not e.get("odds_stale")
+                e for e in mlb_edges_all
+                if (e.get("score") or 0) >= SCORE_ACTIONABLE_MIN
+                and str(e.get("action") or "").lower() != "pass"
+                and not e.get("odds_stale")
             ],
             key=lambda e: e.get("score") or 0,
             reverse=True,
@@ -1636,13 +2135,15 @@ with tab_command:
                     ("Refresh odds cache", action_refresh_odds_cache),
                 ],
             )
+        # If nothing crossed the high-conviction bar, explain why using
+        # only real counts derived from the returned edges.
+        render_why_no_high_conviction(mlb_edges_all)
 
         st.markdown("### Watchlist Candidates")
         watchlist_candidates = [
             e for e in mlb_edges_all
-            if (e.get("score") or 0) >= 60
-            and (e.get("score") or 0) < 75
-            and str(e.get("action") or "").lower() == "watch"
+            if SCORE_ACTIONABLE_MIN <= (e.get("score") or 0) < SCORE_STRONG_MIN
+            and str(e.get("action") or "").lower().startswith("watch")
         ][:5]
         if watchlist_candidates:
             for edge in watchlist_candidates:
@@ -1650,7 +2151,7 @@ with tab_command:
         else:
             render_empty_state(
                 "MARKET SILENT",
-                "No watchlist candidates in the 60-74 band right now.",
+                f"No watchlist candidates in the {SCORE_ACTIONABLE_MIN}-{SCORE_STRONG_MIN - 1} band right now.",
                 actions=[("Refresh odds cache", action_refresh_odds_cache)],
             )
 
@@ -1755,37 +2256,60 @@ with tab_mlb:
             actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
         )
 
+    st.markdown("### Score Distribution")
+    render_score_distribution(mlb_edges_all)
+
     st.markdown("### All Edges")
     if mlb_edges_all:
-        df_edges = pd.DataFrame([
-            {
-                "score": e.get("score"),
-                "tier": tier_for_score(e.get("score"))[0],
-                "action": e.get("action"),
-                "confidence": e.get("confidence"),
-                "type": (e.get("edge_type") or "").replace("_", " "),
-                "market": e.get("market"),
-                "side": (e.get("side") or "").title(),
-                "line": e.get("line"),
-                "best_book": e.get("best_book") or DASH,
-                "best_price": fmt_price(e.get("best_price")),
-                "chase_risk": e.get("chase_risk"),
-                "warnings": "; ".join((e.get("warnings") or [])[:3]),
-            }
-            for e in mlb_edges_all
-        ])
-        df_edges = df_edges.fillna(DASH)
-        st.dataframe(
-            df_edges,
-            use_container_width=True,
-            hide_index=True,
-            height=min(420, 60 + 32 * max(len(df_edges), 1)),
-            column_config={
-                "score": st.column_config.NumberColumn("score", format="%.1f"),
-                "line": st.column_config.NumberColumn("line", format="%.1f"),
-                "best_price": st.column_config.TextColumn("best_price (US)"),
-            },
+        # Sidebar toggle decides whether the terminal hides Pass-action edges.
+        # Off by default to keep the terminal decision-first; flip on for
+        # full-slate inspection.
+        terminal_rows = (
+            mlb_edges_all
+            if show_pass_candidates
+            else [e for e in mlb_edges_all if str(e.get("action") or "").lower() != "pass"]
         )
+        if not terminal_rows:
+            render_empty_state(
+                "NO NON-PASS EDGES",
+                "All current edges grade as Pass. Toggle 'Show pass candidates' in the sidebar to inspect them.",
+            )
+        else:
+            df_edges = pd.DataFrame([
+                {
+                    "score": e.get("score"),
+                    "label": confidence_label_fn(e.get("score"), e.get("action"), e.get("confidence"))[0],
+                    "action": e.get("action"),
+                    "confidence": confidence_word(e.get("confidence"))[0],
+                    "type": (e.get("edge_type") or "").replace("_", " "),
+                    "market": e.get("market"),
+                    "side": (e.get("side") or "").title(),
+                    "line": e.get("line"),
+                    "best_book": e.get("best_book") or DASH,
+                    "best_price": american_from_price(e.get("best_price")) or DASH,
+                    "implied_prob": (
+                        f"{american_to_implied_probability(e.get('best_price')) * 100:.1f}%"
+                        if american_to_implied_probability(e.get("best_price")) is not None
+                        else DASH
+                    ),
+                    "chase_risk": e.get("chase_risk"),
+                    "warnings": "; ".join((e.get("warnings") or [])[:3]),
+                }
+                for e in terminal_rows
+            ])
+            df_edges = df_edges.fillna(DASH)
+            st.dataframe(
+                df_edges,
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 60 + 32 * max(len(df_edges), 1)),
+                column_config={
+                    "score": st.column_config.NumberColumn("score", format="%.1f"),
+                    "line": st.column_config.NumberColumn("line", format="%.1f"),
+                    "best_price": st.column_config.TextColumn("best price (US)"),
+                    "implied_prob": st.column_config.TextColumn("implied %"),
+                },
+            )
     else:
         render_empty_state(
             "NO MLB EDGES",
@@ -1899,6 +2423,10 @@ with tab_perf:
     with perf_actions[1]:
         if st.button("Grade MLB results", use_container_width=True):
             action_grade_mlb_results()
+
+    st.markdown("### Today's Score Distribution")
+    render_score_distribution(mlb_edges_all)
+    render_why_no_high_conviction(mlb_edges_all)
 
     graded = perf_summary.get("graded_edges") or 0
     if not graded:
