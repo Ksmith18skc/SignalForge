@@ -33,7 +33,7 @@ from app.utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 20.0
+REQUEST_TIMEOUT = 45.0
 
 
 @contextmanager
@@ -62,6 +62,22 @@ def _single_instance_lock():
 
 def _api_base() -> str:
     return get_settings().api_url.rstrip("/")
+
+
+async def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    last_exc: httpx.HTTPError | None = None
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=15.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for _ in range(2):
+            try:
+                response = await client.get(f"{_api_base()}{path}", params=params)
+                response.raise_for_status()
+                return response.json()
+            except httpx.TimeoutException as exc:
+                last_exc = exc
+            except httpx.HTTPError:
+                raise
+    raise last_exc or httpx.ReadTimeout("SignalForge API request timed out")
 
 
 def _money(value: Any) -> str:
@@ -208,10 +224,7 @@ bot = SignalForgeBot()
 async def sf_status(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True, ephemeral=True)
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(f"{_api_base()}/bot/status")
-            response.raise_for_status()
-            status = response.json()
+        status = await _get_json("/bot/status")
     except httpx.HTTPError as exc:
         await interaction.followup.send(f"SignalForge status check failed: `{type(exc).__name__}: {exc}`")
         return
@@ -265,16 +278,10 @@ async def sf_high_conviction(
             return
 
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            params: dict[str, Any] = {"limit": limit, "hours": hours}
-            if parsed_event_date:
-                params["event_date_from"] = parsed_event_date
-            response = await client.get(
-                f"{_api_base()}/bot/high-conviction",
-                params=params,
-            )
-            response.raise_for_status()
-            payload = response.json()
+        params: dict[str, Any] = {"limit": limit, "hours": hours}
+        if parsed_event_date:
+            params["event_date_from"] = parsed_event_date
+        payload = await _get_json("/bot/high-conviction", params=params)
     except httpx.HTTPError as exc:
         await interaction.followup.send(f"High-conviction lookup failed: `{type(exc).__name__}: {exc}`")
         return
@@ -320,13 +327,7 @@ async def search(
 ) -> None:
     await interaction.response.defer(thinking=True)
     try:
-        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-            response = await client.get(
-                f"{_api_base()}/bot/search",
-                params={"market_url": market_url, "limit": limit},
-            )
-            response.raise_for_status()
-            payload = response.json()
+        payload = await _get_json("/bot/search", params={"market_url": market_url, "limit": limit})
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:500]
         await interaction.followup.send(f"Market search failed: HTTP {exc.response.status_code} `{detail}`")
