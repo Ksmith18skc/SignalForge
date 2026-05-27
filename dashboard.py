@@ -32,7 +32,9 @@ from app.utils.dashboard_format import (
     SCORE_STRONG_MIN,
     american_from_price,
     american_to_implied_probability,
+    build_consensus_wallets,
     compact_time_ago,
+    consensus_wallets_chips_html,
     confidence_label as confidence_label_fn,
     confidence_word,
     edge_vs_market,
@@ -1873,21 +1875,13 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
     ])
 
     consensus_traders = signal.get("consensus_traders") or []
-    tag_values: list[str] = []
-    for t in consensus_traders[:4]:
-        size = t.get("size_usd")
-        size_label = fmt_money(size) if size is not None else "$—"
-        tag_values.append(f"{t.get('name') or DASH} · {size_label}")
-    remaining = max(0, len(consensus_traders) - 4)
-    if remaining:
-        tag_values.append(f"+{remaining} more")
-    tag_badges = " ".join(badge(f"[{tag}]", "muted") for tag in tag_values) if tag_values else badge("[—]", "muted")
-    consensus_summary = (
-        f"{signal.get('consensus_wallets', 0)} wallets · "
-        f"{fmt_money(signal.get('consensus_total_size'))} tracked · "
-        f"largest {signal.get('consensus_largest', DASH)} · "
-        f"{signal.get('consensus_direction', DASH)}"
-    )
+    # Collapsed summary: top 3 unique wallets by total size (one chip each).
+    consensus_chips = consensus_wallets_chips_html(consensus_traders, limit=3)
+    extra_wallets = max(0, len(consensus_traders) - 3)
+    if consensus_chips and extra_wallets:
+        consensus_chips = consensus_chips.replace(
+            "</div>", f"<span class='sf-badge sf-badge-muted'>+{extra_wallets} more</span></div>"
+        )
 
     pills_html = " ".join(filter(None, [
         _pill(tier, tier_kind),
@@ -1958,13 +1952,14 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
       </div>
       <div style="margin-bottom:4px;">{pills_html}</div>
       {sharp_block}
+      {consensus_chips}
       {('<div class="sf-card-row sf-meta">' + reason + '</div>') if reason else ''}
       {market_links}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
 
-    if len(consensus_traders) > 4:
+    if len(consensus_traders) > 3:
         # market_id+side+outcome is not unique: the same signal renders in both
         # the Wallets tab and the Positions tab, and aggregated positions can
         # share a side/outcome across signals. Append a monotonic suffix.
@@ -1972,15 +1967,14 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             f"consensus-{signal.get('market_id')}-{signal.get('side')}-"
             f"{signal.get('outcome')}-{next(_WIDGET_KEY_COUNTER)}"
         )
-        with st.expander("Consensus wallets (full list)", expanded=False, key=expander_key):
+        with st.expander(
+            f"Consensus wallets (full list · {len(consensus_traders)})",
+            expanded=False,
+            key=expander_key,
+        ):
+            # One clean HTML block, rendered once — no nested/escaped badges.
             st.markdown(
-                " ".join(
-                    badge(
-                        f"[{t.get('name') or DASH} · {fmt_money(t.get('size_usd')) if t.get('size_usd') is not None else '$—'}]",
-                        "muted",
-                    )
-                    for t in consensus_traders
-                ),
+                consensus_wallets_chips_html(consensus_traders),
                 unsafe_allow_html=True,
             )
 
@@ -2539,21 +2533,13 @@ def aggregate_signals_to_positions(signals: list[dict[str, Any]]) -> list[dict[s
         avg_entry = (num / den) if den else None
         latest_sig = max(grouped, key=lambda s: str(s.get("created_at") or ""))
         types = sorted({str(s.get("signal_type")) for s in grouped if s.get("signal_type")})
-        consensus_traders = []
-        for sig in grouped:
-            name = sig.get("trader_nickname") or shorten_wallet(sig.get("wallet"))
-            consensus_traders.append(
-                {
-                    "name": name or DASH,
-                    "size_usd": _as_float(sig.get("size_usd")),
-                }
-            )
-        consensus_traders = sorted(
-            consensus_traders,
-            key=lambda t: (t.get("size_usd") or 0.0),
-            reverse=True,
-        )
-        total_tracked = sum(t.get("size_usd") or 0.0 for t in consensus_traders)
+        # One consensus row per unique wallet — fills are aggregated, never
+        # rendered as separate entries.
+        consensus_traders = build_consensus_wallets(grouped)
+        # `size_usd` kept as an alias of total for downstream card formatting.
+        for t in consensus_traders:
+            t["size_usd"] = t.get("total_size_usd")
+        total_tracked = sum(t.get("total_size_usd") or 0.0 for t in consensus_traders)
         largest = consensus_traders[0]["name"] if consensus_traders else DASH
         direction = " ".join(
             [str(first.get("side") or ""), str(first.get("outcome") or _market_label(first))]

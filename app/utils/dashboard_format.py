@@ -8,6 +8,7 @@ only — they never mutate edge state.
 
 from __future__ import annotations
 
+import html
 from datetime import datetime, timezone
 from typing import Any
 
@@ -628,3 +629,129 @@ def format_money_short(value: Any, *, default: str = DASH) -> str:
     if a >= 1_000:
         return f"{sign}${a / 1_000:.0f}k"
     return f"{sign}${a:.0f}"
+
+
+# ---------------------------------------------------------------------------
+# Consensus-wallet aggregation
+#
+# A "fill" is one trade/signal row. Smart-money cards must show one row per
+# *unique wallet* (aggregating that wallet's many fills), never one row per
+# fill — otherwise the same trader appears repeatedly with many sizes.
+# ---------------------------------------------------------------------------
+
+
+def _short_addr(addr: str | None) -> str:
+    if not addr:
+        return DASH
+    if len(addr) <= 14:
+        return addr
+    return f"{addr[:6]}…{addr[-4:]}"
+
+
+def _fill_key(fill: dict[str, Any]) -> tuple[str, str, str]:
+    """Identity for grouping fills: prefer wallet_address, fall back to
+    trader_id, then scope by market_slug + outcome (case-insensitive)."""
+    wallet = (fill.get("wallet") or fill.get("wallet_address") or "").strip().lower()
+    if not wallet:
+        tid = fill.get("trader_id")
+        wallet = f"trader:{tid}" if tid is not None else ""
+    market = (fill.get("market_slug") or fill.get("market_id") or "").__str__().strip().lower()
+    outcome = (fill.get("outcome") or "").strip().lower()
+    return (wallet, market, outcome)
+
+
+def build_consensus_wallets(fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse per-fill rows into one consensus row per unique wallet.
+
+    Grouped by (wallet_address|trader_id, market_slug, outcome). Aggregates:
+      * total_size_usd  – Σ size_usd (gross)
+      * avg_entry       – size-weighted average entry price
+      * fill_count      – number of fills merged
+      * first_seen_at / last_seen_at
+      * net_side        – BUY/SELL after netting signed notional
+      * net_size_usd    – signed Σ (BUY +, SELL −)
+
+    Sorted by total_size_usd descending.
+    """
+    grouped: dict[tuple[str, str, str], dict[str, Any]] = {}
+    order: list[tuple[str, str, str]] = []
+    for fill in fills or []:
+        key = _fill_key(fill)
+        size = _to_float(fill.get("size_usd")) or 0.0
+        price = _to_float(fill.get("entry_price") or fill.get("price"))
+        side = str(fill.get("side") or "").strip().upper()
+        signed = -size if side == "SELL" else size
+        ts = fill.get("created_at") or fill.get("timestamp")
+        ts_str = str(ts) if ts is not None else ""
+
+        agg = grouped.get(key)
+        if agg is None:
+            agg = {
+                "name": fill.get("trader_nickname")
+                or fill.get("name")
+                or _short_addr(fill.get("wallet") or fill.get("wallet_address")),
+                "wallet_address": fill.get("wallet") or fill.get("wallet_address"),
+                "trader_id": fill.get("trader_id"),
+                "tier": fill.get("tier"),
+                "profile_url": fill.get("trader_url") or fill.get("profile_url"),
+                "market_url": fill.get("market_url"),
+                "outcome": fill.get("outcome"),
+                "total_size_usd": 0.0,
+                "_num": 0.0,   # Σ price*size for the weighted average
+                "_den": 0.0,
+                "net_size_usd": 0.0,
+                "fill_count": 0,
+                "first_seen_at": ts_str or None,
+                "last_seen_at": ts_str or None,
+            }
+            grouped[key] = agg
+            order.append(key)
+
+        agg["total_size_usd"] += size
+        agg["net_size_usd"] += signed
+        agg["fill_count"] += 1
+        if price is not None and size > 0:
+            agg["_num"] += price * size
+            agg["_den"] += size
+        if ts_str:
+            if not agg["first_seen_at"] or ts_str < agg["first_seen_at"]:
+                agg["first_seen_at"] = ts_str
+            if not agg["last_seen_at"] or ts_str > agg["last_seen_at"]:
+                agg["last_seen_at"] = ts_str
+
+    rows: list[dict[str, Any]] = []
+    for key in order:
+        agg = grouped[key]
+        den = agg.pop("_den")
+        num = agg.pop("_num")
+        agg["avg_entry"] = round(num / den, 4) if den else None
+        agg["total_size_usd"] = round(agg["total_size_usd"], 2)
+        agg["net_side"] = "BUY" if agg["net_size_usd"] >= 0 else "SELL"
+        agg["net_size_usd"] = round(agg["net_size_usd"], 2)
+        agg["wallet_short"] = _short_addr(agg.get("wallet_address"))
+        rows.append(agg)
+
+    rows.sort(key=lambda r: r.get("total_size_usd") or 0.0, reverse=True)
+    return rows
+
+
+def consensus_wallets_chips_html(wallets: list[dict[str, Any]], *, limit: int | None = None) -> str:
+    """Render consensus wallets as a single clean HTML chip row.
+
+    All dynamic text is HTML-escaped so trader names can never inject markup,
+    and each chip is emitted once (no nested/escaped badge strings). Returns
+    an empty string when there is nothing to show.
+    """
+    if not wallets:
+        return ""
+    shown = wallets[: limit] if limit else wallets
+    chips: list[str] = []
+    for w in shown:
+        name = html.escape(str(w.get("name") or DASH))
+        size = format_money_short(w.get("total_size_usd"))
+        fills = int(w.get("fill_count") or 0)
+        fill_label = f" ×{fills}" if fills > 1 else ""
+        chips.append(
+            f"<span class='sf-badge sf-badge-muted'>{name} · {size}{fill_label}</span>"
+        )
+    return f"<div class='sf-chips'>{''.join(chips)}</div>"

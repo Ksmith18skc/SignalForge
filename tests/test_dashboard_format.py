@@ -13,7 +13,9 @@ from app.utils.dashboard_format import (
     SCORE_BUCKETS,
     american_from_price,
     american_to_implied_probability,
+    build_consensus_wallets,
     compact_time_ago,
+    consensus_wallets_chips_html,
     confidence_label,
     confidence_word,
     edge_vs_market,
@@ -403,3 +405,100 @@ class TestWalletAlignment:
     def test_missing_or_zero(self):
         assert wallet_alignment_percent(None, 4) is None
         assert wallet_alignment_percent(2, 0) is None
+
+
+class TestBuildConsensusWallets:
+    def _fill(self, **kw):
+        base = {
+            "trader_nickname": "LaBradfordSmith22",
+            "wallet": "0xabc",
+            "trader_id": 1,
+            "market_slug": "mlb-stl-mil-2026-05-26",
+            "outcome": "St. Louis Cardinals",
+            "side": "BUY",
+            "size_usd": 100.0,
+            "entry_price": 0.50,
+            "created_at": "2026-05-26T10:00:00",
+        }
+        base.update(kw)
+        return base
+
+    def test_same_trader_many_fills_appears_once(self):
+        fills = [self._fill(size_usd=10.0) for _ in range(10)]
+        rows = build_consensus_wallets(fills)
+        assert len(rows) == 1
+        assert rows[0]["fill_count"] == 10
+        assert rows[0]["total_size_usd"] == 100.0
+
+    def test_avg_entry_is_size_weighted(self):
+        fills = [
+            self._fill(size_usd=100.0, entry_price=0.40),
+            self._fill(size_usd=300.0, entry_price=0.60),
+        ]
+        rows = build_consensus_wallets(fills)
+        # (0.40*100 + 0.60*300) / 400 = 0.55
+        assert rows[0]["avg_entry"] == 0.55
+
+    def test_buy_sell_netting(self):
+        fills = [
+            self._fill(side="BUY", size_usd=100.0),
+            self._fill(side="SELL", size_usd=40.0),
+        ]
+        rows = build_consensus_wallets(fills)
+        assert rows[0]["total_size_usd"] == 140.0   # gross
+        assert rows[0]["net_size_usd"] == 60.0      # 100 - 40
+        assert rows[0]["net_side"] == "BUY"
+        # Net flips to SELL when sells dominate.
+        sells = [self._fill(side="BUY", size_usd=10.0), self._fill(side="SELL", size_usd=90.0)]
+        assert build_consensus_wallets(sells)[0]["net_side"] == "SELL"
+
+    def test_duplicate_nickname_same_wallet_merges(self):
+        # Same wallet, two different trader_id rows, mixed case address.
+        fills = [
+            self._fill(trader_id=1, wallet="0xABC"),
+            self._fill(trader_id=2, wallet="0xabc"),
+        ]
+        rows = build_consensus_wallets(fills)
+        assert len(rows) == 1
+        assert rows[0]["fill_count"] == 2
+
+    def test_missing_wallet_falls_back_to_trader_id(self):
+        fills = [
+            self._fill(wallet=None, trader_id=7),
+            self._fill(wallet=None, trader_id=7),
+            self._fill(wallet=None, trader_id=9),
+        ]
+        rows = build_consensus_wallets(fills)
+        assert len(rows) == 2
+        assert sorted(r["fill_count"] for r in rows) == [1, 2]
+
+    def test_sorted_by_total_size_desc(self):
+        fills = [
+            self._fill(wallet="0xsmall", size_usd=50.0),
+            self._fill(wallet="0xbig", size_usd=500.0),
+        ]
+        rows = build_consensus_wallets(fills)
+        assert rows[0]["wallet_address"] == "0xbig"
+
+
+class TestConsensusWalletsChipsHtml:
+    def test_no_raw_html_from_trader_name(self):
+        rows = build_consensus_wallets([
+            {"trader_nickname": "<script>x</script>", "wallet": "0xa",
+             "size_usd": 100.0, "side": "BUY", "market_slug": "m", "outcome": "Over"},
+        ])
+        out = consensus_wallets_chips_html(rows)
+        assert "<script>" not in out          # name markup never leaks
+        assert "&lt;script&gt;" in out         # it is escaped instead
+        assert out.count("sf-chips") == 1      # one real wrapper, rendered once
+
+    def test_limit_caps_chip_count(self):
+        rows = build_consensus_wallets([
+            {"wallet": f"0x{i}", "size_usd": float(100 - i), "side": "BUY",
+             "market_slug": "m", "outcome": "Over"}
+            for i in range(6)
+        ])
+        assert consensus_wallets_chips_html(rows, limit=3).count("<span") == 3
+
+    def test_empty_returns_empty_string(self):
+        assert consensus_wallets_chips_html([]) == ""
