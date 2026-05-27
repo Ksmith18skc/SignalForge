@@ -3639,6 +3639,216 @@ with tab_health:
     hc3.metric("DB rollbacks", ingest.get("db_rollbacks", 0))
     hc4.metric("Trades inserted", ingest.get("trades_inserted", 0))
 
+    # --- Falcon adaptive learning controls ---------------------------------
+    with st.expander("Falcon adaptive learning", expanded=False):
+        agents_payload = safe_get("/falcon/agents", default={})
+        learning_stats = safe_get("/falcon/learning/stats", default={})
+        scheduler_status = safe_get("/falcon/learning/scheduler", default={})
+        agents = agents_payload.get("agents") or []
+
+        cols = st.columns(4)
+        cols[0].metric("Wired agents", len(agents))
+        cols[1].metric(
+            "Tracked wallets (learned)",
+            len(learning_stats.get("wallets") or []),
+        )
+        cols[2].metric(
+            "Adaptive factor rows",
+            len(learning_stats.get("adaptive_weights") or []),
+        )
+        cols[3].metric(
+            "Calibration bands",
+            len(learning_stats.get("calibration_bands") or []),
+        )
+
+        ctrl = st.columns(3)
+        with ctrl[0]:
+            if st.button("Backfill tracked wallets", use_container_width=True):
+                with st.spinner("Calling Wallet 360 for every tracked wallet..."):
+                    try:
+                        result = api_post(
+                            "/falcon/learning/backfill", timeout=MLB_RUN_TIMEOUT,
+                        )
+                    except ApiError as exc:
+                        render_api_error(exc, prefix="Falcon backfill failed")
+                        result = None
+                if result is not None:
+                    st.success(
+                        f"Backfilled {result.get('wallets_backfilled', 0)} "
+                        f"of {result.get('wallets_seen', 0)} wallets · "
+                        f"specialisations={result.get('specialisations_written', 0)} · "
+                        f"unavailable={result.get('wallets_unavailable', 0)}"
+                    )
+                    if result.get("errors"):
+                        with st.expander("Backfill errors"):
+                            for err in result["errors"]:
+                                st.code(err, language="text")
+                    st.cache_data.clear()
+                    st.rerun()
+        with ctrl[1]:
+            if st.button("Recompute learning", use_container_width=True):
+                with st.spinner("Recomputing weights, bands, tiers..."):
+                    try:
+                        result = api_post(
+                            "/falcon/learning/recompute", timeout=MLB_RUN_TIMEOUT,
+                        )
+                    except ApiError as exc:
+                        render_api_error(exc, prefix="Falcon recompute failed")
+                        result = None
+                if result is not None:
+                    fw = (result.get("factor_weights") or {})
+                    cb = (result.get("calibration") or {})
+                    tr = (result.get("tiers") or {})
+                    st.success(
+                        f"Recomputed · weights updated={fw.get('weights_updated', 0)} "
+                        f"(below min sample={fw.get('weights_below_min_sample', 0)}) · "
+                        f"bands={cb.get('bands_updated', 0)} · "
+                        f"tiers written={tr.get('tiers_written', 0)}"
+                    )
+                    st.cache_data.clear()
+                    st.rerun()
+        with ctrl[2]:
+            if st.button("Trigger scheduler tick", use_container_width=True):
+                with st.spinner("Running one scheduler tick..."):
+                    try:
+                        result = api_post(
+                            "/falcon/learning/scheduler/tick", timeout=MLB_RUN_TIMEOUT,
+                        )
+                    except ApiError as exc:
+                        render_api_error(exc, prefix="Scheduler tick failed")
+                        result = None
+                if result is not None:
+                    if result.get("error"):
+                        st.warning(f"Scheduler tick error: {result['error']}")
+                    else:
+                        st.success("Scheduler tick complete.")
+                    st.cache_data.clear()
+
+        st.markdown("**Wired Falcon agents**")
+        if agents:
+            agent_rows = [
+                {"name": a["name"], "label": a["label"], "id": a["id"]}
+                for a in agents
+            ]
+            st.dataframe(
+                pd.DataFrame(agent_rows),
+                use_container_width=True, hide_index=True,
+                height=min(360, 60 + 28 * len(agent_rows)),
+            )
+        else:
+            st.caption("Agent registry unavailable.")
+
+        st.markdown("**Adaptive factor weights**")
+        weights = learning_stats.get("adaptive_weights") or []
+        if weights:
+            st.dataframe(
+                pd.DataFrame(weights),
+                use_container_width=True, hide_index=True,
+                height=min(320, 60 + 28 * len(weights)),
+            )
+        else:
+            st.caption("No graded factor attribution yet — weights are using the static prior.")
+
+        st.markdown("**Calibration bands**")
+        bands = learning_stats.get("calibration_bands") or []
+        if bands:
+            st.dataframe(
+                pd.DataFrame(bands),
+                use_container_width=True, hide_index=True,
+                height=min(280, 60 + 28 * len(bands)),
+            )
+        else:
+            st.caption("Not enough graded signals to calibrate yet.")
+
+        st.markdown("**Tracked wallets (learned)**")
+        wallets_rows = learning_stats.get("wallets") or []
+        if wallets_rows:
+            st.dataframe(
+                pd.DataFrame(wallets_rows),
+                use_container_width=True, hide_index=True,
+                height=min(360, 60 + 28 * len(wallets_rows)),
+            )
+        else:
+            st.caption("No wallet stats yet — run backfill or wait for first graded signal.")
+
+        st.markdown("**Scheduler status**")
+        st.json(scheduler_status, expanded=False)
+
+        st.markdown("**Per-signal Falcon Intelligence**")
+        st.caption(
+            "Enter a signal ID to see the full factor breakdown, contributing "
+            "wallets, regime snapshot, and calibrated probability."
+        )
+        explain_id = st.text_input("Signal ID", key="falcon_explain_signal_id")
+        if explain_id.strip():
+            try:
+                sig_id_int = int(explain_id.strip())
+            except ValueError:
+                st.warning("Signal ID must be an integer.")
+            else:
+                explain_payload = safe_get(
+                    f"/falcon/learning/explain/{sig_id_int}", default=None,
+                )
+                if not explain_payload:
+                    st.info(f"No learning rows for signal #{sig_id_int} (not graded yet, or signal not found).")
+                else:
+                    head = st.columns(3)
+                    head[0].metric("Raw score", fmt_num(explain_payload.get("raw_score"), fmt="{:.1f}"))
+                    cal = explain_payload.get("calibrated_probability")
+                    head[1].metric(
+                        "Calibrated prob",
+                        fmt_pct(cal) if cal is not None else "—",
+                    )
+                    wallets_block = explain_payload.get("wallets") or {}
+                    head[2].metric(
+                        "Elite disagreement",
+                        wallets_block.get("elite_disagreement_count", 0),
+                    )
+
+                    factors_block = explain_payload.get("factors") or {}
+                    factor_rows = factors_block.get("rows") or []
+                    if factor_rows:
+                        st.markdown("Factors")
+                        flat = []
+                        for fr in factor_rows:
+                            adaptive = fr.get("adaptive") or {}
+                            flat.append({
+                                "factor": fr.get("factor_name"),
+                                "value": fr.get("value"),
+                                "weight": fr.get("weight"),
+                                "adaptive_weight": adaptive.get("current_weight"),
+                                "predictive_power": adaptive.get("predictive_power"),
+                                "sample": adaptive.get("sample_size"),
+                            })
+                        st.dataframe(pd.DataFrame(flat), use_container_width=True, hide_index=True)
+
+                    wallet_rows = wallets_block.get("rows") or []
+                    if wallet_rows:
+                        st.markdown("Contributing wallets")
+                        st.dataframe(
+                            pd.DataFrame([
+                                {
+                                    "wallet": (w.get("wallet_address") or "")[:16] + "…",
+                                    "side": w.get("side"),
+                                    "tier": w.get("tier"),
+                                    "win_rate": w.get("win_rate"),
+                                    "roi": w.get("roi"),
+                                    "avg_clv": w.get("avg_clv"),
+                                    "sample": w.get("sample_size"),
+                                }
+                                for w in wallet_rows
+                            ]),
+                            use_container_width=True, hide_index=True,
+                        )
+
+                    regime_block = explain_payload.get("regime") or {}
+                    if regime_block.get("available"):
+                        st.markdown("Market regime")
+                        st.json(regime_block.get("summary") or {}, expanded=False)
+                    if explain_payload.get("conflict"):
+                        st.markdown("Conflict / contrarian flags")
+                        st.json(explain_payload["conflict"], expanded=False)
+
     st.markdown("### Provider status")
     provs = providers_block
     badges_html = " ".join([

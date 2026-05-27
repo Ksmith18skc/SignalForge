@@ -2023,6 +2023,158 @@ async def falcon_test(
     }
 
 
+# ---------------------------- falcon learning -------------------------------
+
+
+@router.get("/falcon/agents")
+def falcon_agents_status() -> dict[str, object]:
+    """Registry of wired Falcon agents + the live last-call telemetry."""
+    from app.providers.falcon_agents import all_specs
+
+    health = get_falcon_health()
+    return {
+        "agents": [
+            {"name": s.name, "label": s.label, "id": s.id}
+            for s in all_specs()
+        ],
+        "health": health.as_dict(),
+    }
+
+
+@router.post("/falcon/learning/backfill")
+async def falcon_learning_backfill(
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Backfill ``wallet_learning_stats`` for every tracked wallet via
+    Wallet 360 (581). Idempotent — re-running is safe."""
+    s = get_settings()
+    if not s.has_falcon_credentials():
+        raise HTTPException(
+            status_code=400, detail="SIGNALFORGE_FALCON_API_KEY is not set",
+        )
+    from app.services.falcon_learning import backfill_tracked_wallets
+
+    wallets = [
+        (t.wallet_address, t.nickname)
+        for t in db.scalars(select(Trader)) if t.wallet_address
+    ]
+    falcon = FalconProvider(s.falcon_api_key, s.falcon_base_url)
+    summary = await backfill_tracked_wallets(db, falcon, wallets)
+    return summary.as_dict()
+
+
+@router.post("/falcon/learning/recompute")
+def falcon_learning_recompute(db: Session = Depends(get_db)) -> dict[str, object]:
+    """Run a full retraining pass: factor weights + calibration + tiers."""
+    from app.services.falcon_retraining import run_full_retraining
+
+    return run_full_retraining(db).as_dict()
+
+
+@router.get("/falcon/learning/stats")
+def falcon_learning_stats(
+    limit: int = 100,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Current wallet learning rows + headline counts."""
+    from app.models import (
+        AdaptiveFactorWeight,
+        ConfidenceBandLearning,
+        WalletLearningStats,
+        WalletTierHistory,
+    )
+
+    wallets = list(
+        db.scalars(
+            select(WalletLearningStats)
+            .order_by(desc(WalletLearningStats.confidence_weight))
+            .limit(limit)
+        )
+    )
+    weights = list(db.scalars(select(AdaptiveFactorWeight)))
+    bands = list(db.scalars(select(ConfidenceBandLearning)))
+    tier_counts: dict[str, int] = {}
+    for tier in db.execute(
+        select(WalletTierHistory.tier, func.count())
+        .where(WalletTierHistory.sport.is_(None))
+        .group_by(WalletTierHistory.tier)
+    ).all():
+        tier_counts[tier[0]] = int(tier[1])
+
+    return {
+        "wallets": [
+            {
+                "wallet_address": w.wallet_address,
+                "wallet_name": w.wallet_name,
+                "total_signals": w.total_signals,
+                "wins": w.wins,
+                "losses": w.losses,
+                "roi": w.roi,
+                "avg_clv": w.avg_clv,
+                "confidence_weight": w.confidence_weight,
+                "sample_size": w.sample_size,
+                "last_seen": w.last_seen.isoformat() if w.last_seen else None,
+            }
+            for w in wallets
+        ],
+        "adaptive_weights": [
+            {
+                "factor_name": r.factor_name,
+                "sport": r.sport,
+                "market_type": r.market_type,
+                "current_weight": r.current_weight,
+                "predictive_power": r.predictive_power,
+                "rolling_roi": r.rolling_roi,
+                "rolling_clv": r.rolling_clv,
+                "sample_size": r.sample_size,
+                "confidence": r.confidence,
+            }
+            for r in weights
+        ],
+        "calibration_bands": [
+            {
+                "sport": b.sport,
+                "market_type": b.market_type,
+                "score_min": b.score_min,
+                "score_max": b.score_max,
+                "signals": b.signals,
+                "win_rate": b.win_rate,
+                "calibrated_probability": b.calibrated_probability,
+            }
+            for b in bands
+        ],
+        "tier_distribution": tier_counts,
+    }
+
+
+@router.get("/falcon/learning/explain/{signal_id}")
+def falcon_learning_explain(
+    signal_id: int,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    from app.services.falcon_signal_explainer import explain_signal
+
+    payload = explain_signal(db, signal_id)
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"signal {signal_id} not found")
+    return payload
+
+
+@router.get("/falcon/learning/scheduler")
+def falcon_learning_scheduler() -> dict[str, object]:
+    from app.services.falcon_scheduler import get_scheduler_status
+
+    return get_scheduler_status()
+
+
+@router.post("/falcon/learning/scheduler/tick")
+async def falcon_learning_scheduler_tick() -> dict[str, object]:
+    """Run one retraining tick on demand. Useful when the heartbeat is off."""
+    from app.services.falcon_scheduler import trigger_recompute
+
+    return await trigger_recompute()
+
+
 # ---------------------------- dashboard -------------------------------------
 
 

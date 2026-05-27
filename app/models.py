@@ -382,6 +382,342 @@ class MlbEdgeFactor(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+# ---------------------------------------------------------------------------
+# Falcon adaptive-learning subsystem
+#
+# Persistent, append-or-upsert tables that feed the adaptive scoring,
+# calibration, tiering, and explainability layers. None of these tables
+# replace existing signal/trade tables — they sit alongside as a learning
+# substrate.
+# ---------------------------------------------------------------------------
+
+
+class WalletLearningStats(Base):
+    """Per-wallet rolling performance stats.
+
+    One row per wallet. Updated by ``falcon_learning`` on backfill (from
+    Wallet 360 + Polymarket PnL) and by ``falcon_retraining`` after every
+    signal grading cycle. Bayesian-smoothed metrics ensure single graded
+    signals can't flip a wallet's tier.
+    """
+
+    __tablename__ = "wallet_learning_stats"
+
+    wallet_address: Mapped[str] = mapped_column(String(128), primary_key=True)
+    wallet_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    total_signals: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    pushes: Mapped[int] = mapped_column(Integer, default=0)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Direction-specific accuracy (BUY / SELL aka fade).
+    sharp_side_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    fade_accuracy: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Brier-style calibration error (lower is better; None until sample exists).
+    calibration_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    # Bayesian-smoothed confidence-weight in [0, 1].
+    confidence_weight: Mapped[float] = mapped_column(Float, default=0.5)
+    last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class WalletMarketSpecialization(Base):
+    """Per-(wallet, sport, market_type) performance row.
+
+    Lets the engine reason about "elite in MLB totals, weak in NBA spreads"
+    rather than collapsing a wallet to a single tier.
+    """
+
+    __tablename__ = "wallet_market_specialization"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wallet_address: Mapped[str] = mapped_column(String(128), index=True)
+    sport: Mapped[str] = mapped_column(String(32), index=True)
+    market_type: Mapped[str] = mapped_column(String(64), index=True)
+    signals: Mapped[int] = mapped_column(Integer, default=0)
+    roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Fraction of signals on the favored side (0 = always underdog, 1 = always favored).
+    side_bias: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volatility_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # 0..1 specialisation; combines sample weight + ROI dominance vs other markets.
+    specialization_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class WalletTierHistory(Base):
+    """Snapshot of a wallet's tier at a moment in time.
+
+    Append-only — each retraining cycle inserts a new row so tier movement
+    is auditable. ``tier`` is one of: elite, trusted, neutral, weak, fade.
+    """
+
+    __tablename__ = "wallet_tier_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wallet_address: Mapped[str] = mapped_column(String(128), index=True)
+    tier: Mapped[str] = mapped_column(String(16), index=True)
+    sport: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    market_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    rolling_roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rolling_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class WalletBehaviorProfile(Base):
+    """Behavioural archetype tagging.
+
+    Populated by the deterministic SignalForge clusterer (Wallet 360 + PnL
+    features). One row per wallet × archetype label so a wallet can carry
+    multiple tags ("sharp_steam", "contrarian_sniper", etc).
+    """
+
+    __tablename__ = "wallet_behavior_profiles"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    wallet_address: Mapped[str] = mapped_column(String(128), index=True)
+    archetype: Mapped[str] = mapped_column(String(64), index=True)
+    score: Mapped[float] = mapped_column(Float, default=0.0)
+    features: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    source: Mapped[str] = mapped_column(String(32), default="signalforge")
+    last_updated: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class SignalFactorAttribution(Base):
+    """One row per (signal, factor) at signal-emit time.
+
+    Captures both the raw factor value (0..1) and the adaptive weight the
+    factor carried for this signal's context. After grading, ``realized_pnl``
+    / ``win_loss_push`` / ``clv_points`` are backfilled and the
+    ``falcon_retraining`` job re-derives factor effectiveness.
+    """
+
+    __tablename__ = "signal_factor_attribution"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"), index=True)
+    factor_name: Mapped[str] = mapped_column(String(64), index=True)
+    factor_value: Mapped[float] = mapped_column(Float)
+    factor_weight: Mapped[float] = mapped_column(Float)
+    sport: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    market_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    win_loss_push: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    realized_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clv_points: Mapped[float | None] = mapped_column(Float, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    graded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class SignalWalletContribution(Base):
+    """Which wallets contributed to a signal and at what weight."""
+
+    __tablename__ = "signal_wallet_contributions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[int] = mapped_column(ForeignKey("signals.id"), index=True)
+    wallet_address: Mapped[str] = mapped_column(String(128), index=True)
+    contribution_weight: Mapped[float] = mapped_column(Float, default=0.0)
+    side: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    size_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    entry_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class SignalLearningSnapshot(Base):
+    """Per-signal context snapshot: factors, regime, conflict, calibrated prob.
+
+    Stored as a JSON blob so the explainer panel can replay the exact context
+    the engine saw when it emitted the signal, even after factor weights
+    have shifted.
+    """
+
+    __tablename__ = "signal_learning_snapshots"
+
+    signal_id: Mapped[int] = mapped_column(
+        ForeignKey("signals.id"), primary_key=True,
+    )
+    sport: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    market_type: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    raw_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibrated_probability: Mapped[float | None] = mapped_column(Float, nullable=True)
+    factor_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    regime_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    conflict_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
+class AdaptiveFactorWeight(Base):
+    """Adaptive weight for ``(factor_name, sport, market_type)`` triple.
+
+    ``current_weight`` is what the scorer multiplies the factor value by.
+    Updated in place by ``falcon_retraining``. ``sample_size`` < ``min_sample``
+    means the scorer should fall back to the static ScoringWeights default.
+    """
+
+    __tablename__ = "adaptive_factor_weights"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    factor_name: Mapped[str] = mapped_column(String(64), index=True)
+    sport: Mapped[str] = mapped_column(String(32), default="*", index=True)
+    market_type: Mapped[str] = mapped_column(String(64), default="*", index=True)
+    rolling_roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    rolling_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    predictive_power: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    sample_size: Mapped[int] = mapped_column(Integer, default=0)
+    current_weight: Mapped[float] = mapped_column(Float, default=1.0)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class ConfidenceBandLearning(Base):
+    """Score-band → calibrated probability mapping.
+
+    Bins raw signal score (0..100) into bands and tracks the realised win
+    rate so the dashboard can show a calibrated probability next to the raw
+    score. Score bands are inclusive of ``score_min`` and exclusive of
+    ``score_max`` (e.g. [70, 75)).
+    """
+
+    __tablename__ = "confidence_band_learning"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    sport: Mapped[str] = mapped_column(String(32), default="*", index=True)
+    market_type: Mapped[str] = mapped_column(String(64), default="*", index=True)
+    score_min: Mapped[float] = mapped_column(Float)
+    score_max: Mapped[float] = mapped_column(Float)
+    signals: Mapped[int] = mapped_column(Integer, default=0)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    calibrated_probability: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class SignalRegimeSnapshot(Base):
+    """Immutable per-signal market-regime snapshot.
+
+    One row per ``signal_id`` (primary key). Once a snapshot is written it
+    is **never updated** — callers that try to re-persist see the existing
+    row returned unchanged. This is what makes the regime context an
+    auditable historical record: a follow-up retraining pass can re-derive
+    bucket statistics from the same raw inputs every time.
+
+    Captured asynchronously by ``falcon_regime_capture`` immediately after a
+    signal is emitted. Partial data (some agents unavailable) is allowed —
+    ``components`` records what landed and ``enrichment_status`` summarises
+    the fan-out result.
+    """
+
+    __tablename__ = "signal_regime_snapshots"
+
+    signal_id: Mapped[int] = mapped_column(
+        ForeignKey("signals.id"), primary_key=True,
+    )
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+    # Spec'd top-level fields.
+    market_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    line_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    line_acceleration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    volatility_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    orderflow_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    steam_state: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    sentiment_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    orderbook_imbalance: Mapped[float | None] = mapped_column(Float, nullable=True)
+    consensus_concentration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    elite_disagreement_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    whale_activity_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    candlestick_state: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Conflict flags carried over from the contrarian regime detector.
+    conflict_flags: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+
+    # Final bucket label the engine assigned. Used for per-regime learning.
+    regime_classification: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+
+    # What the fan-out actually produced.
+    components: Mapped[dict[str, bool] | None] = mapped_column(JSON, default=dict)
+    enrichment_status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | partial | complete | failed
+    errors: Mapped[list[str] | None] = mapped_column(JSON, default=list)
+
+    # Full agent payloads preserved verbatim so retraining never needs to
+    # re-issue the original calls.
+    raw_payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+
+
+class RegimeLearningStats(Base):
+    """Per-regime-classification realised performance.
+
+    Refreshed by ``falcon_retraining.recompute_regime_learning_stats`` after
+    every grading pass. Lets the explainer answer "historical ROI of similar
+    regimes" without scanning the snapshot table at request time.
+    """
+
+    __tablename__ = "regime_learning_stats"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    regime_classification: Mapped[str] = mapped_column(String(64), index=True)
+    sport: Mapped[str] = mapped_column(String(32), default="*", index=True)
+    market_type: Mapped[str] = mapped_column(String(64), default="*", index=True)
+    signals: Mapped[int] = mapped_column(Integer, default=0)
+    wins: Mapped[int] = mapped_column(Integer, default=0)
+    losses: Mapped[int] = mapped_column(Integer, default=0)
+    pushes: Mapped[int] = mapped_column(Integer, default=0)
+    avg_roi: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_clv: Mapped[float | None] = mapped_column(Float, nullable=True)
+    positive_clv_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    win_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow, onupdate=_utcnow, index=True,
+    )
+
+
+class SignalRegimeFeatures(Base):
+    """Per-signal market-regime snapshot from Falcon agents.
+
+    Derived from Polymarket Candles (568) + Orderbook (572) + Trades (556)
+    + Social Pulse (585) + Market Insights (575). Stored as both summary
+    columns (cheap to query/filter) and a raw JSON payload (full audit).
+    """
+
+    __tablename__ = "signal_regime_features"
+
+    signal_id: Mapped[int] = mapped_column(
+        ForeignKey("signals.id"), primary_key=True,
+    )
+    spread_size: Mapped[float | None] = mapped_column(Float, nullable=True)
+    underdog_flag: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    favorite_flag: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    line_movement_velocity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    steam_timing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    market_volatility: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wallet_disagreement_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    late_movement_flag: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    consensus_concentration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    liquidity_regime: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    public_sharp_divergence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    sentiment_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    raw_payload: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+
+
 class MlbFinalScore(Base):
     """Persisted final-score table.
 

@@ -1,20 +1,14 @@
-"""FalconProvider — Quickstart agent dispatcher only.
+"""FalconProvider — Quickstart agent dispatcher.
 
-Falcon exposes a single POST endpoint that takes an `agent_id` + `params` and
-returns whatever that agent produces. There are many `agent_id`s; SignalForge
-currently wires three:
+Falcon exposes a single POST endpoint that takes an ``agent_id`` + ``params``
+and returns whatever that agent produces. The agent IDs themselves live in
+``app.providers.falcon_agents`` so a deploy can repoint a capability via env
+var without a code change.
 
-  * 584 — Leaderboard (top traders)
-  * 581 — Wallet 360 (single-wallet recent activity)
-  * 556 — Recent trades (single-wallet trade history)
-
-Other capabilities the marketing site advertised (cross-market comparison,
-sentiment signals, market metadata) don't have proven agent_ids yet — those
-BaseProvider methods route directly to MockProvider so they don't make Falcon
-HTTP calls and don't pollute the health success rate.
-
-Use `/falcon-test` to dump the raw shape of any agent response, then refine the
-parsers below to extract the fields the rest of SignalForge consumes.
+Helpers below cover every wired agent. When a payload doesn't match the shape
+we expect (Falcon ships frequent schema iterations), helpers log the raw shape
+at debug level and return a typed ``FalconResult`` with ``available=False`` so
+callers can degrade gracefully instead of crashing.
 """
 
 from __future__ import annotations
@@ -22,16 +16,48 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
 import httpx
 
 from app.providers.base import BaseProvider, ProviderSource
+from app.providers.falcon_agents import Agent
 from app.providers.mock import MockProvider
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class FalconResult:
+    """Typed partial-result wrapper for any agent call.
+
+    Callers always get a non-None object. ``available`` tells you whether the
+    response carried usable data; ``reason`` explains why not when False. The
+    raw envelope is preserved on ``raw`` so a debug endpoint or test can
+    inspect what Falcon actually returned without re-issuing the call.
+    """
+
+    agent_id: int
+    available: bool
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    summary: dict[str, Any] | None = None
+    raw: Any | None = None
+    reason: str | None = None
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "available": self.available,
+            "row_count": self.row_count,
+            "summary": self.summary,
+            "reason": self.reason,
+        }
 
 
 def _unwrap_first_row(envelope: Any) -> dict[str, Any]:
@@ -280,10 +306,11 @@ class FalconProvider(BaseProvider):
     # The only endpoint we hit. Everything is dispatched via agent_id.
     PATH_AGENT = "/api/v2/semantic/retrieve/parameterized"
 
-    # Known agents.
-    AGENT_LEADERBOARD = 584
-    AGENT_WALLET_360 = 581
-    AGENT_RECENT_TRADES = 556
+    # Legacy aliases kept for backward compatibility with /falcon-test callers.
+    # Prefer ``Agent.WALLET_360`` etc. from ``app.providers.falcon_agents``.
+    AGENT_LEADERBOARD = Agent.SCORE_LEADERBOARD
+    AGENT_WALLET_360 = Agent.WALLET_360
+    AGENT_RECENT_TRADES = Agent.POLYMARKET_TRADES
 
     def __init__(self, api_key: str | None, base_url: str, timeout: float = 10.0) -> None:
         self._api_key = api_key
@@ -513,22 +540,261 @@ class FalconProvider(BaseProvider):
 
         return trades
 
-    # --- everything else: direct mock — no Falcon HTTP call -----------------
-    # These have no proven agent_ids yet. Routing them through Falcon would
-    # only generate failures that drag down the success rate without changing
-    # the resulting (mock) data.
+    # ----------------------------------------------------------------------
+    # Typed helpers for the wider agent set.
+    #
+    # Each helper:
+    #   * calls ``query_agent`` with the registered ID
+    #   * normalises the envelope into rows + summary
+    #   * returns ``FalconResult(available=False, reason=...)`` on any
+    #     schema mismatch or empty payload, never raising
+    # ----------------------------------------------------------------------
+
+    async def _query_typed(
+        self,
+        agent_id: int,
+        params: dict[str, Any] | None,
+        *,
+        label: str,
+        limit: int = 100,
+    ) -> FalconResult:
+        raw = await self.query_agent(agent_id, params=params or {}, limit=limit)
+        if raw is None:
+            return FalconResult(
+                agent_id=agent_id, available=False, raw=None,
+                reason=f"{label}: empty or error response",
+            )
+        rows = _unwrap_rows(raw)
+        summary = _unwrap_first_row(raw) if not rows else None
+        if not rows and not summary:
+            logger.debug("Falcon %s returned unexpected envelope shape: %s", label, _shape(raw))
+            return FalconResult(
+                agent_id=agent_id, available=False, raw=raw,
+                reason=f"{label}: schema not understood (no rows / no summary)",
+            )
+        return FalconResult(
+            agent_id=agent_id, available=True, rows=rows, summary=summary, raw=raw,
+        )
+
+    async def fetch_polymarket_markets(
+        self, *, query: str | None = None, limit: int = 50,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if query:
+            params["query"] = query
+        return await self._query_typed(
+            Agent.POLYMARKET_MARKETS, params, label="polymarket_markets", limit=limit,
+        )
+
+    async def fetch_polymarket_trades(
+        self, *, wallet: str | None = None, market_slug: str | None = None, limit: int = 100,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if wallet:
+            if not _is_wallet_address(wallet):
+                return FalconResult(
+                    agent_id=Agent.POLYMARKET_TRADES, available=False,
+                    reason="polymarket_trades: wallet must be a 0x-prefixed address",
+                )
+            params["proxy_wallet"] = wallet
+        if market_slug:
+            params["market_slug"] = market_slug
+        return await self._query_typed(
+            Agent.POLYMARKET_TRADES, params, label="polymarket_trades", limit=limit,
+        )
+
+    async def fetch_polymarket_candles(
+        self, *, market_slug: str, interval: str = "1h", limit: int = 200,
+    ) -> FalconResult:
+        return await self._query_typed(
+            Agent.POLYMARKET_CANDLES,
+            {"market_slug": market_slug, "interval": interval},
+            label="polymarket_candles", limit=limit,
+        )
+
+    async def fetch_polymarket_orderbook(
+        self, *, market_slug: str, side: str | None = None,
+    ) -> FalconResult:
+        params: dict[str, Any] = {"market_slug": market_slug}
+        if side:
+            params["side"] = side
+        return await self._query_typed(
+            Agent.POLYMARKET_ORDERBOOK, params, label="polymarket_orderbook", limit=50,
+        )
+
+    async def fetch_polymarket_pnl(
+        self, *, wallet: str, window_days: int = 30,
+    ) -> FalconResult:
+        if not _is_wallet_address(wallet):
+            return FalconResult(
+                agent_id=Agent.POLYMARKET_PNL, available=False,
+                reason="polymarket_pnl: wallet must be a 0x-prefixed address",
+            )
+        return await self._query_typed(
+            Agent.POLYMARKET_PNL,
+            {"proxy_wallet": wallet, "window_days": str(window_days)},
+            label="polymarket_pnl", limit=50,
+        )
+
+    async def fetch_polymarket_leaderboard(
+        self, *, window_days: int = 7, limit: int = 100,
+    ) -> FalconResult:
+        return await self._query_typed(
+            Agent.POLYMARKET_LEADERBOARD,
+            {"window_days": str(window_days)},
+            label="polymarket_leaderboard", limit=limit,
+        )
+
+    async def fetch_score_leaderboard(
+        self, *, window_days: int = 15, limit: int = 100,
+    ) -> FalconResult:
+        return await self._query_typed(
+            Agent.SCORE_LEADERBOARD,
+            {"window_days": str(window_days)},
+            label="score_leaderboard", limit=limit,
+        )
+
+    async def fetch_wallet_360(
+        self, *, wallet: str, window_days: int = 7, limit: int = 100,
+    ) -> FalconResult:
+        if not _is_wallet_address(wallet):
+            return FalconResult(
+                agent_id=Agent.WALLET_360, available=False,
+                reason="wallet_360: wallet must be a 0x-prefixed address",
+            )
+        return await self._query_typed(
+            Agent.WALLET_360,
+            {"proxy_wallet": wallet, "window_days": str(window_days)},
+            label="wallet_360", limit=limit,
+        )
+
+    async def fetch_market_insights(
+        self, *, market_slug: str | None = None, query: str | None = None, limit: int = 25,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if market_slug:
+            params["market_slug"] = market_slug
+        if query:
+            params["query"] = query
+        return await self._query_typed(
+            Agent.MARKET_INSIGHTS, params, label="market_insights", limit=limit,
+        )
+
+    async def fetch_kalshi_markets(
+        self, *, query: str | None = None, limit: int = 50,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if query:
+            params["query"] = query
+        return await self._query_typed(
+            Agent.KALSHI_MARKETS, params, label="kalshi_markets", limit=limit,
+        )
+
+    async def fetch_kalshi_trades(
+        self, *, market_slug: str | None = None, limit: int = 100,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if market_slug:
+            params["market_slug"] = market_slug
+        return await self._query_typed(
+            Agent.KALSHI_TRADES, params, label="kalshi_trades", limit=limit,
+        )
+
+    async def fetch_social_pulse(
+        self, *, market_slug: str | None = None, query: str | None = None, limit: int = 25,
+    ) -> FalconResult:
+        params: dict[str, Any] = {}
+        if market_slug:
+            params["market_slug"] = market_slug
+        if query:
+            params["query"] = query
+        return await self._query_typed(
+            Agent.SOCIAL_PULSE, params, label="social_pulse", limit=limit,
+        )
+
+    # ----------------------------------------------------------------------
+    # BaseProvider overrides — promote real Falcon helpers where we have them
+    # and continue to fall back to MockProvider only when a capability still
+    # has no registered agent.
+    # ----------------------------------------------------------------------
 
     async def get_market_data(self, market_slug: str) -> dict[str, Any]:
+        """Agent 574 (Polymarket Markets). Returns enriched market metadata;
+        falls back to MockProvider when the agent payload is unusable."""
+        result = await self.fetch_polymarket_markets(query=market_slug, limit=5)
+        if result.available:
+            row = result.summary or (result.rows[0] if result.rows else None)
+            if row:
+                return {
+                    "slug": row.get("market_slug") or row.get("slug") or market_slug,
+                    "title": row.get("market_title") or row.get("title"),
+                    "category": row.get("category"),
+                    "liquidity_usd": _to_float(row.get("liquidity_usd") or row.get("liquidity"), None),
+                    "volume_24h_usd": _to_float(row.get("volume_24h_usd") or row.get("volume_24h"), None),
+                    "yes_price": _to_float(row.get("yes_price") or row.get("last_price"), None),
+                    "no_price": _to_float(row.get("no_price"), None),
+                    "source": self.source.value,
+                    "_raw": row,
+                }
         return await self._fallback.get_market_data(market_slug)
 
     async def get_orderbook(self, market_slug: str) -> dict[str, Any]:
+        """Agent 572 (Polymarket Orderbook). Falls back to mock on schema miss."""
+        result = await self.fetch_polymarket_orderbook(market_slug=market_slug)
+        if result.available:
+            return {
+                "slug": market_slug,
+                "rows": result.rows,
+                "summary": result.summary,
+                "source": self.source.value,
+            }
         return await self._fallback.get_orderbook(market_slug)
 
     async def get_cross_market_comparison(self, topic: str) -> list[dict[str, Any]]:
+        """Combines Polymarket Markets 574 + Kalshi Markets 565 results."""
+        poly = await self.fetch_polymarket_markets(query=topic, limit=10)
+        kalshi = await self.fetch_kalshi_markets(query=topic, limit=10)
+        rows: list[dict[str, Any]] = []
+        for row in (poly.rows if poly.available else []):
+            rows.append({"platform": "polymarket", **row})
+        for row in (kalshi.rows if kalshi.available else []):
+            rows.append({"platform": "kalshi", **row})
+        if rows:
+            return rows
         return await self._fallback.get_cross_market_comparison(topic)
 
     async def get_sentiment_signals(self, market_slug: str) -> dict[str, Any]:
+        """Agent 585 (Social Pulse)."""
+        result = await self.fetch_social_pulse(market_slug=market_slug)
+        if result.available:
+            return {
+                "slug": market_slug,
+                "rows": result.rows,
+                "summary": result.summary,
+                "source": self.source.value,
+            }
         return await self._fallback.get_sentiment_signals(market_slug)
 
     async def list_active_markets(self, limit: int = 25) -> list[dict[str, Any]]:
+        result = await self.fetch_polymarket_markets(limit=limit)
+        if result.available and result.rows:
+            return result.rows
         return await self._fallback.list_active_markets(limit)
+
+
+def _shape(payload: Any, depth: int = 0) -> Any:
+    """Compact representation of a JSON payload's shape for debug logging.
+
+    Lists collapse to ``[<element_shape>]`` (no element values), dicts keep
+    keys but recurse into values. Capped at depth 3 so we don't blow up logs
+    on deeply nested envelopes.
+    """
+    if depth > 3:
+        return type(payload).__name__
+    if isinstance(payload, dict):
+        return {k: _shape(v, depth + 1) for k, v in payload.items()}
+    if isinstance(payload, list):
+        if not payload:
+            return []
+        return [_shape(payload[0], depth + 1)]
+    return type(payload).__name__

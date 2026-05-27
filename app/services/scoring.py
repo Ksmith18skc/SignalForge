@@ -18,6 +18,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from sqlalchemy.orm import Session
+
 from app.config import ScoringWeights, get_settings
 from app.models import Market, Trader
 
@@ -114,10 +116,25 @@ def _price_inefficiency(price_gap: float) -> float:
 def score_signal(
     inputs: ScoreInputs,
     weights: ScoringWeights | None = None,
+    *,
+    db: Session | None = None,
+    sport: str | None = None,
+    market_type: str | None = None,
+    conviction_penalty: float = 0.0,
 ) -> ScoreBreakdown:
-    """Compute the weighted score. Returns a breakdown and total on 0-100."""
-    w = weights or get_settings().scoring
+    """Compute the weighted score. Returns a breakdown and total on 0-100.
 
+    When ``db`` is provided, per-factor weights are looked up via
+    ``falcon_retraining.adaptive_weight_for`` and applied multiplicatively
+    against the static prior. Below the per-scope sample threshold the
+    static prior is used unchanged.
+
+    ``conviction_penalty`` (0..0.5) is subtracted from the final score after
+    weighting — used by the contrarian-conflict regime to mark crowded /
+    elite-disagreement signals as lower conviction without changing the
+    underlying factor values.
+    """
+    w = weights or get_settings().scoring
     components = {
         "wallet_quality": _wallet_quality(inputs.trader),
         "multi_wallet_consensus": _multi_wallet_consensus(
@@ -127,13 +144,28 @@ def score_signal(
         "entry_timing": _entry_timing(inputs.entry_price, inputs.current_price),
         "price_inefficiency": _price_inefficiency(inputs.price_gap),
     }
+    static_weights = {
+        "wallet_quality": w.wallet_quality,
+        "multi_wallet_consensus": w.multi_wallet_consensus,
+        "liquidity": w.liquidity,
+        "entry_timing": w.entry_timing,
+        "price_inefficiency": w.price_inefficiency,
+    }
+    if db is not None:
+        from app.services.falcon_retraining import adaptive_weight_for
 
-    total = (
-        components["wallet_quality"] * w.wallet_quality
-        + components["multi_wallet_consensus"] * w.multi_wallet_consensus
-        + components["liquidity"] * w.liquidity
-        + components["entry_timing"] * w.entry_timing
-        + components["price_inefficiency"] * w.price_inefficiency
-    ) * 100.0
+        effective_weights = {
+            name: adaptive_weight_for(db, name, sport=sport, market_type=market_type)
+            for name in static_weights
+        }
+    else:
+        effective_weights = static_weights
 
-    return ScoreBreakdown(total=_clip(total, 0, 100), **components)
+    total = sum(components[name] * effective_weights[name] for name in components) * 100.0
+    if conviction_penalty:
+        total -= conviction_penalty * 100.0
+    breakdown = ScoreBreakdown(total=_clip(total, 0, 100), **components)
+    # Stash effective weights on the breakdown so callers can persist them
+    # at signal-emit time without re-deriving the lookup.
+    breakdown.__dict__["effective_weights"] = effective_weights
+    return breakdown
