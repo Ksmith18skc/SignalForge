@@ -7,7 +7,7 @@ import re
 import smtplib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 from typing import Literal
 
@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.models import Alert, Signal, Trade, Trader
-from app.services.card_date import parse_slug_date
+from app.services.card_date import TZ_ARIZONA, parse_slug_date
 from app.utils.dashboard_format import (
     american_to_implied_probability,
     confidence_label,
@@ -92,7 +92,15 @@ def market_expiration_reason(
       2. `Market.end_date` is in the past (with `grace_hours` slack for late
          settlement of live markets — without it, a market mid-game could be
          marked done if its `end_date` is the scheduled first-pitch time).
-      3. Event date parsed out of the slug is before today's UTC date.
+      3. The slug's game date is before today's Arizona card date.
+
+    The slug encodes the *Arizona* calendar date of the game (the same card
+    date the dashboard and scanner use), so it must be compared against the
+    Arizona date — not UTC. Comparing against `datetime.utcnow().date()` marked
+    every evening game "expired" the instant UTC rolled past midnight (5pm
+    Arizona), killing alerts for games that were just tipping off.
+
+    `now` is a naive UTC datetime (as produced by `datetime.utcnow()`).
 
     Returns None when the market is still in-play or its lifecycle can't be
     determined (we'd rather alert on an unknown-state market than silently
@@ -107,7 +115,8 @@ def market_expiration_reason(
     if market.end_date is not None and market.end_date + timedelta(hours=grace_hours) < now:
         return f"market end_date {market.end_date.isoformat()} already passed"
     event_date = event_date_from_slug(market.slug)
-    if event_date is not None and event_date < now.date():
+    arizona_today = now.replace(tzinfo=timezone.utc).astimezone(TZ_ARIZONA).date()
+    if event_date is not None and event_date < arizona_today:
         return f"event date {event_date.isoformat()} in the past"
     return None
 

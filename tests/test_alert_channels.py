@@ -543,6 +543,30 @@ def test_market_expiration_reason_passes_today_event(db_session):
     assert reason is None
 
 
+def test_market_expiration_reason_allows_live_game_after_utc_rollover(db_session):
+    """Regression: an evening Arizona game whose slug date is "today" must not
+    be flagged expired just because UTC has crossed midnight into the next day.
+    2026-05-27 02:30 UTC == 2026-05-26 19:30 Arizona, so a game dated
+    2026-05-26 is still in-play."""
+    market = Market(slug="nba-sas-okc-2026-05-26-spread-home-5pt5", title="m", yes_price=0.5)
+    db_session.add(market)
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Spurs",
+        entry_price=0.29,
+        size_usd=2_000,
+        score=82,
+        source="Falcon",
+    )
+    signal.market = market
+
+    reason = market_expiration_reason(signal, now=datetime(2026, 5, 27, 2, 30, 0))
+    assert reason is None
+
+
 def test_market_expiration_reason_flags_inactive_market(db_session):
     market = Market(slug="any-market", title="m", yes_price=0.5, is_active=False)
     db_session.add(market)
@@ -567,10 +591,12 @@ def test_alert_decision_rejects_expired_market(db_session):
     """The scanner can still emit signals after a game finishes (lag, late
     trade ingestion). The webhook must never fire for those events."""
     now = datetime.utcnow()
-    yesterday = (now - timedelta(days=1)).date().isoformat()
+    # Two days back so the game is unambiguously past in Arizona terms,
+    # regardless of where the UTC clock sits relative to the Arizona date.
+    past_day = (now - timedelta(days=2)).date().isoformat()
     market = Market(
-        slug=f"mlb-mia-tor-{yesterday}-spread-home-1pt5",
-        title=f"mlb-mia-tor-{yesterday}-spread-home-1pt5",
+        slug=f"mlb-mia-tor-{past_day}-spread-home-1pt5",
+        title=f"mlb-mia-tor-{past_day}-spread-home-1pt5",
         yes_price=0.37,
         volume_24h_usd=30_000,
         liquidity_usd=10_000,
