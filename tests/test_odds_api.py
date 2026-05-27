@@ -111,3 +111,54 @@ async def test_odds_provider_compare_lines(monkeypatch):
     ]
     assert result["best_by_outcome"]["over"]["bookmaker"] == "FanDuel"
     assert len(result["rows"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_odds_provider_events_omits_empty_league(monkeypatch):
+    calls = []
+
+    class _Response:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return []
+
+    class _Client:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, params=None):
+            calls.append((url, params))
+            return _Response()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    provider = OddsApiProvider("key", "https://api.odds-api.io/v3", "DraftKings")
+
+    await provider.events(
+        "mlb",
+        league=None,
+        date_from="2026-05-25T07:00:00Z",
+        date_to="2026-05-26T06:59:59Z",
+    )
+
+    assert calls == [
+        (
+            "https://api.odds-api.io/v3/events",
+            {
+                "sport": "mlb",
+                "from": "2026-05-25T07:00:00Z",
+                "to": "2026-05-26T06:59:59Z",
+                "apiKey": "key",
+            },
+        )
+    ]

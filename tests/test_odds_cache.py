@@ -89,10 +89,12 @@ class _StubOdds:
         self.events_raises = events_raises
         self.odds_raises = odds_raises
         self.events_calls = 0
+        self.events_args: list[tuple[Any, dict[str, Any]]] = []
         self.odds_calls = 0
 
     async def events(self, sport, **kwargs):
         self.events_calls += 1
+        self.events_args.append((sport, dict(kwargs)))
         if self.events_raises is not None:
             raise self.events_raises
         return self.events_payload
@@ -128,6 +130,23 @@ def test_refresh_uses_minimal_api_calls(db_session) -> None:
     cached_events = get_cached_events_list(db_session, game_date="2026-05-25")
     assert cached_events is not None and len(cached_events) == 2
     assert get_cached_event_odds(db_session, "ev_a") is not None
+
+
+def test_refresh_requests_current_odds_api_mlb_params(db_session) -> None:
+    odds = _StubOdds()
+
+    asyncio.run(refresh_mlb_odds_cache(db_session, odds, _games(), game_date="2026-05-25"))
+
+    assert odds.events_args == [
+        (
+            "mlb",
+            {
+                "league": None,
+                "date_from": "2026-05-25T07:00:00Z",
+                "date_to": "2026-05-26T06:59:59Z",
+            },
+        )
+    ]
 
 
 def test_consecutive_refreshes_within_ttl_reuse_cache(db_session) -> None:

@@ -347,9 +347,10 @@ async def test_debug_events_endpoint_runs_refresh_and_returns_cached_payload(
     # First call: cache empty → refresh runs once.
     result = await mlb_debug_odds_events(game_date="2026-05-25", live=False, db=db_session)
 
-    assert captured["sport"] == "baseball"
-    assert captured["kwargs"]["league"] == "MLB"
-    assert captured["kwargs"]["date_from"] == "2026-05-25"
+    assert captured["sport"] == "mlb"
+    assert captured["kwargs"]["league"] is None
+    assert captured["kwargs"]["date_from"] == "2026-05-25T07:00:00Z"
+    assert captured["kwargs"]["date_to"] == "2026-05-26T06:59:59Z"
     assert result["count"] == 3
     assert result["events"][0]["id"] == "ev_yankees_redsox"
 

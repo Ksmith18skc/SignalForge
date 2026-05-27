@@ -36,10 +36,10 @@ from app.services.mlb_totals_model import total_edges
 logger = logging.getLogger(__name__)
 
 
-# Odds-API sport/league params for MLB. Kept here (not config) because they're
-# vendor identifiers, not user preferences.
-ODDS_MLB_SPORT = "baseball"
-ODDS_MLB_LEAGUE = "MLB"
+# Odds-API sport/league params for MLB. Kept here as compatibility exports for
+# debug routes/tests; the cache owns the vendor request shape.
+ODDS_MLB_SPORT = odds_cache.ODDS_MLB_SPORT
+ODDS_MLB_LEAGUE = odds_cache.ODDS_MLB_LEAGUE
 
 
 async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> dict[str, Any]:

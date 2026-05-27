@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date as date_cls, datetime, time, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import delete, select
@@ -40,6 +40,7 @@ from app.providers.sportsgameodds import (
     SportsGameOddsProvider,
     SportsGameOddsRateLimited,
 )
+from app.services.card_date import TZ_ARIZONA
 from app.services.mlb_odds_matching import MatchResult, match_all_games
 
 logger = logging.getLogger(__name__)
@@ -58,8 +59,10 @@ MLB_EVENTS_LIST_TTL = timedelta(minutes=30)
 # this we give up and report "missing odds" — the data is too stale to trust.
 MLB_STALE_GRACE = timedelta(hours=2)
 
-ODDS_MLB_SPORT = "baseball"
-ODDS_MLB_LEAGUE = "MLB"
+# Odds-API.io v3 treats MLB as a sport slug. Sending the old
+# sport=baseball&league=MLB shape now returns HTTP 400.
+ODDS_MLB_SPORT = "mlb"
+ODDS_MLB_LEAGUE: str | None = None
 
 MARKET_TYPE_EVENTS_LIST = "events_list"
 MARKET_TYPE_EVENT_ODDS = "event_odds"
@@ -463,6 +466,23 @@ def _events_list_fresh(db: Session, game_date: str) -> bool:
     return _snapshot_is_fresh(snap)
 
 
+def odds_api_event_window(game_date: str) -> tuple[str, str]:
+    """Return the Arizona card-date window as UTC RFC3339 timestamps."""
+    card = date_cls.fromisoformat(game_date)
+    start_local = datetime.combine(card, time.min, tzinfo=TZ_ARIZONA)
+    end_local = start_local + timedelta(days=1) - timedelta(seconds=1)
+    return _rfc3339_utc(start_local), _rfc3339_utc(end_local)
+
+
+def _rfc3339_utc(value: datetime) -> str:
+    return (
+        value.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 async def refresh_mlb_odds_cache(
     db: Session,
     odds: OddsApiProvider,
@@ -578,11 +598,12 @@ async def refresh_mlb_odds_cache(
 
         # ---- 1. events list ----
         try:
+            date_from, date_to = odds_api_event_window(game_date)
             events_payload = await odds.events(
                 ODDS_MLB_SPORT,
                 league=ODDS_MLB_LEAGUE,
-                date_from=game_date,
-                date_to=game_date,
+                date_from=date_from,
+                date_to=date_to,
             )
             _record(live_api_calls=1)
             _record_provider_event(provider="Odds-API", events_fetched=len(events_payload or []), last_success=True)
