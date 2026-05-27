@@ -74,6 +74,7 @@ from app.services.mlb_performance import (
     arizona_window,
     clv_report,
     grade_edge,
+    lookup_edge_score_band,
     performance_by_market,
     performance_by_score_band,
     performance_diagnostics,
@@ -1571,6 +1572,22 @@ def _edge_payload_with_context(db: Session, edge: MlbEdge) -> dict[str, object]:
             age_minutes = int((now - snap.captured_at).total_seconds() / 60) if snap.captured_at else None
             payload["odds_data_age_minutes"] = age_minutes
             payload["odds_stale"] = bool(age_minutes is not None and age_minutes > MLB_TOTALS_TTL.total_seconds() / 60)
+
+    # --- explainability: history + calibration for the card's #4/#5 sections.
+    band = lookup_edge_score_band(db, edge_type=edge.edge_type, score=edge.score)
+    payload["score_band_performance"] = band
+    payload["calibrated_probability"] = band.get("calibrated_probability")
+    # SignalForge fair probability when the model exposes one (often None until
+    # the projection is calibrated); the card falls back to calibrated prob.
+    factors = edge.factors or {}
+    for key in ("model_probability", "fair_probability", "model_prob", "p_fair"):
+        val = factors.get(key) if isinstance(factors, dict) else None
+        if val is not None:
+            try:
+                payload["sf_fair_probability"] = float(val)
+            except (TypeError, ValueError):
+                pass
+            break
     return payload
 
 
@@ -1806,6 +1823,30 @@ async def mlb_debug_ingest_final_scores(
     target = date or arizona_today()
     mlb = MlbStatsApiProvider()
     return await ingest_final_scores_for_date(db, mlb, date=target)
+
+
+@router.post("/mlb/history/backfill")
+async def mlb_history_backfill(
+    start_date: str,
+    end_date: str,
+    skip_wallets: bool = False,
+) -> dict[str, object]:
+    """Grade edges across a date window + recompute the learning layer.
+
+    Populates the data the card history/calibration sections read: graded
+    ``mlb_edges`` (via the grading script) plus calibration bands / wallet
+    tiers / regime stats (via full retraining). Falcon wallet backfill is
+    best-effort and skipped when the API is unavailable.
+    """
+    from scripts.backfill_mlb_history import run_async as backfill_run
+
+    try:
+        return await backfill_run(
+            start_date=start_date, end_date=end_date, skip_wallets=skip_wallets,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("MLB history backfill failed")
+        raise HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}") from exc
 
 
 @router.post("/mlb/edges/{edge_id}/grade")

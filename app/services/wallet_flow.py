@@ -52,7 +52,7 @@ class _WalletAgg:
     markets: set[str] = field(default_factory=set)
 
 
-def _empty_context(reason: str, debug: dict[str, Any]) -> dict[str, Any]:
+def _empty_context(reason: str, debug: dict[str, Any], *, execution: dict[str, Any] | None = None) -> dict[str, Any]:
     debug = {**debug, "no_match_reason": reason}
     return {
         "consensus_pct": None,
@@ -66,8 +66,41 @@ def _empty_context(reason: str, debug: dict[str, Any]) -> dict[str, Any]:
         "elite_wallet_agreement": 0,
         "elite_wallet_disagreement": 0,
         "confidence_adjustment": 0.0,
+        "execution": execution,
         "tags": ["NO WALLET DATA"],
         "debug": debug,
+    }
+
+
+def _execution_block(markets: list[Market], key: wmr.NormalizedKey) -> dict[str, Any] | None:
+    """Best executable market for the edge side: closest line, then liquidity.
+
+    For a binary total market, YES == Over and NO == Under, so the price for
+    the edge's side is the matching leg. Returns ``None`` when no priced market
+    is available so the card shows "not listed" rather than a fake quote.
+    """
+    priced = [m for m in markets if m.yes_price is not None or m.no_price is not None]
+    if not priced:
+        return None
+
+    def _rank(m: Market) -> tuple[float, float]:
+        parsed = wmr.parse_market_slug(m.slug)
+        line_gap = abs((parsed.line if parsed and parsed.line is not None else 999) - (key.line or 0))
+        return (line_gap, -(m.liquidity_usd or 0.0))
+
+    best = sorted(priced, key=_rank)[0]
+    side = (key.side or "").lower()
+    side_price = best.yes_price if side == "over" else best.no_price if side == "under" else None
+    return {
+        "platform": best.platform,
+        "market_url": wmr.market_url_for(best.slug, best.platform),
+        "yes_price": best.yes_price,
+        "no_price": best.no_price,
+        "side": key.side,
+        "side_price": side_price,
+        # Polymarket prices already read as probabilities in [0, 1].
+        "implied_prob": round(float(side_price), 4) if side_price is not None else None,
+        "liquidity_usd": best.liquidity_usd,
     }
 
 
@@ -166,6 +199,10 @@ def build_wallet_context(
     if not matched:
         return _empty_context("no wallet market matched the edge key", debug)
 
+    # Best executable market is known as soon as we have a matched market —
+    # surface it even when no tracked wallet has traded it yet.
+    execution = _execution_block(matched, key)
+
     market_ids = [m.id for m in matched]
     market_by_id = {m.id: m for m in matched}
     trades = list(
@@ -174,7 +211,9 @@ def build_wallet_context(
         )
     )
     if not trades:
-        return _empty_context("matched market(s) have no tracked-wallet trades", debug)
+        return _empty_context(
+            "matched market(s) have no tracked-wallet trades", debug, execution=execution
+        )
 
     # Aggregate per trader across matched markets.
     aggs: dict[int, _WalletAgg] = {}
@@ -244,7 +283,9 @@ def build_wallet_context(
             opposing_wallets.append(contributor)
 
     if not aligned_wallets and not opposing_wallets:
-        return _empty_context("trades present but none align with the edge side", debug)
+        return _empty_context(
+            "trades present but none align with the edge side", debug, execution=execution
+        )
 
     aligned_wallets.sort(key=lambda w: w["size_usd"], reverse=True)
     opposing_wallets.sort(key=lambda w: w["size_usd"], reverse=True)
@@ -278,6 +319,7 @@ def build_wallet_context(
         "elite_wallet_agreement": elite_agreement,
         "elite_wallet_disagreement": elite_disagreement,
         "confidence_adjustment": adjustment,
+        "execution": execution,
         "tags": tags,
         "debug": debug,
     }

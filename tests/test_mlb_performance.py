@@ -11,6 +11,7 @@ from app.services.mlb_performance import (
     arizona_yesterday,
     clv_report,
     grade_edge,
+    lookup_edge_score_band,
     performance_by_market,
     performance_by_score_band,
     performance_diagnostics,
@@ -87,6 +88,43 @@ def test_performance_reports_group_by_market_and_score_band(db_session):
     assert any(row["edge_type"] == "game_total" for row in by_market)
     assert any(row["score_band"] == "85+" for row in by_band)
     assert clv["edges_with_clv"] == 2
+
+
+def test_lookup_edge_score_band_aggregates_similar_graded_edges(db_session):
+    # Three graded game_total edges in the 85+ band: 2 wins, 1 loss.
+    edges = [
+        _edge(game_pk=1, score=86, best_price=2.0, recommended_line=8.5),
+        _edge(game_pk=2, score=88, best_price=2.0, recommended_line=8.5),
+        _edge(game_pk=3, score=90, best_price=2.0, recommended_line=8.5),
+    ]
+    grade_edge(edges[0], closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    grade_edge(edges[1], closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    grade_edge(edges[2], closing_line=4.0, closing_price=1.8, win_loss_push="loss")
+    db_session.add_all(edges)
+    db_session.commit()
+
+    band = lookup_edge_score_band(db_session, edge_type="game_total", score=87)
+    assert band["score_band"] == "85+"
+    assert band["sample_size"] == 3
+    assert band["wins"] == 2 and band["losses"] == 1
+    assert band["win_rate"] == round(2 / 3, 4)
+    # Laplace-smoothed: (2+1)/(3+2) = 0.6.
+    assert band["calibrated_probability"] == 0.6
+
+
+def test_lookup_edge_score_band_respects_edge_type_and_empty(db_session):
+    e = _edge(game_pk=1, score=86, best_price=2.0, recommended_line=8.5)
+    grade_edge(e, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    db_session.add(e)
+    db_session.commit()
+
+    # Different edge type → no matching history.
+    other = lookup_edge_score_band(db_session, edge_type="pitcher_strikeouts", score=86)
+    assert other["sample_size"] == 0
+    assert other["calibrated_probability"] is None
+    # Empty band (no graded edges < 65).
+    empty = lookup_edge_score_band(db_session, edge_type="game_total", score=50)
+    assert empty["sample_size"] == 0
 
 
 def test_edge_serialization_includes_measurement_fields():

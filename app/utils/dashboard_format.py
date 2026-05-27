@@ -735,6 +735,171 @@ def build_consensus_wallets(fills: list[dict[str, Any]]) -> list[dict[str, Any]]
     return rows
 
 
+# ---------------------------------------------------------------------------
+# Edge-card intelligence helpers
+#
+# Pure derivations shared by the edge card and the watchlist card so the
+# "what is this / can I execute it / why trust it / what's the risk" logic
+# lives in one tested place.
+# ---------------------------------------------------------------------------
+
+# Factor score (0-100) at/above which the sportsbook price edge is "real".
+_SPORTSBOOK_EDGE_MIN = 70.0
+# Movement factor at/above which we call it a steam move.
+_STEAM_MOVE_MIN = 72.0
+# Matched-market liquidity below which we flag low liquidity.
+_LOW_LIQUIDITY_USD = 2_500.0
+
+
+def conviction_tier(score: Any) -> tuple[str, str]:
+    """(`label`, `kind`) conviction tier for a score — wraps `score_tier`."""
+    return score_tier(score), score_tier_kind(score)
+
+
+def edge_source_stack(edge: dict[str, Any]) -> list[tuple[str, str]]:
+    """Top-level signal-source indicators: where the edge comes from.
+
+    Returns ``(label, kind)`` pairs (kind = pill colour). Order reflects
+    decision priority: confirmation first, then risk/quality flags.
+    """
+    factors = edge.get("factors") or {}
+    wc = edge.get("wallet_context") or {}
+    tags = set(wc.get("tags") or [])
+    out: list[tuple[str, str]] = []
+
+    odds_edge = _to_float(factors.get("odds_edge"))
+    if odds_edge is not None and odds_edge >= _SPORTSBOOK_EDGE_MIN:
+        out.append(("SPORTSBOOK EDGE", "green"))
+    if "WALLET CONFIRMED" in tags:
+        out.append(("WALLET CONFIRMED", "green"))
+    if (wc.get("elite_wallet_disagreement") or 0) > 0:
+        out.append(("ELITE DISAGREEMENT", "red"))
+    movement = _to_float(factors.get("movement"))
+    if movement is not None and movement >= _STEAM_MOVE_MIN:
+        out.append(("STEAM MOVE", "purple"))
+    execution = wc.get("execution") or {}
+    if execution.get("implied_prob") is not None:
+        out.append(("PREDICTION-MARKET EDGE", "cyan"))
+    if "CROWDED SIDE" in tags:
+        out.append(("CROWDED CONSENSUS", "purple"))
+    if edge.get("odds_stale"):
+        out.append(("STALE ODDS", "red"))
+    # Model-only: nothing external corroborates the model's projection.
+    sportsbook_ok = odds_edge is not None and odds_edge >= _SPORTSBOOK_EDGE_MIN
+    wallet_present = int(wc.get("tracked_wallet_count") or 0) > 0
+    if not sportsbook_ok and not wallet_present and not execution.get("implied_prob"):
+        out.append(("MODEL ONLY", "muted"))
+    return out
+
+
+def edge_risk_flags(edge: dict[str, Any]) -> list[tuple[str, str]]:
+    """Explicit risk indicators present on the edge (only the ones that apply)."""
+    factors = edge.get("factors") or {}
+    wc = edge.get("wallet_context") or {}
+    tags = set(wc.get("tags") or [])
+    execution = wc.get("execution") or {}
+    out: list[tuple[str, str]] = []
+
+    if edge.get("odds_stale"):
+        out.append(("Stale odds", "red"))
+    if int(wc.get("tracked_wallet_count") or 0) == 0:
+        out.append(("No wallet confirmation", "muted"))
+    if "CROWDED SIDE" in tags:
+        out.append(("Crowded side", "purple"))
+    if (wc.get("elite_wallet_disagreement") or 0) > 0:
+        out.append(("Sharp disagreement", "red"))
+    liq = _to_float(execution.get("liquidity_usd"))
+    if liq is not None and liq < _LOW_LIQUIDITY_USD:
+        out.append(("Low liquidity", "purple"))
+    if str(edge.get("chase_risk") or "").lower() == "high":
+        out.append(("Late adverse movement", "red"))
+    return out
+
+
+def format_score_contributions(
+    contributions: dict[str, Any] | None,
+    *,
+    wallet_adjustment: Any = None,
+) -> list[tuple[str, float, str]]:
+    """`(label, signed_points, kind)` rows, largest magnitude first.
+
+    ``kind`` is green for positive, red for negative, muted for ~zero. The
+    wallet ``confidence_adjustment`` is appended as its own line when nonzero.
+    """
+    rows: list[tuple[str, float, str]] = []
+    for name, value in (contributions or {}).items():
+        pts = _to_float(value)
+        if pts is None:
+            continue
+        rows.append((factor_label(name), round(pts, 2), _signed_kind(pts)))
+    adj = _to_float(wallet_adjustment)
+    if adj is not None and abs(adj) >= 0.01:
+        rows.append(("Wallet flow", round(adj, 2), _signed_kind(adj)))
+    rows.sort(key=lambda r: abs(r[1]), reverse=True)
+    return rows
+
+
+def _signed_kind(points: float) -> str:
+    if points > 0.05:
+        return "green"
+    if points < -0.05:
+        return "red"
+    return "muted"
+
+
+def executable_edge_rows(edge: dict[str, Any]) -> list[dict[str, Any]]:
+    """One row per venue with its price + implied probability, for the
+    execution section. Missing venues are omitted (no fake quotes)."""
+    rows: list[dict[str, Any]] = []
+    wc = edge.get("wallet_context") or {}
+    execution = wc.get("execution") or {}
+    platform = str(execution.get("platform") or "").lower()
+    if execution.get("side_price") is not None:
+        label = "Kalshi" if platform == "kalshi" else "Polymarket"
+        rows.append({
+            "venue": label,
+            "price": execution.get("side_price"),
+            "implied_prob": execution.get("implied_prob"),
+            "url": execution.get("market_url"),
+        })
+    sb_implied = american_to_implied_probability(edge.get("best_price"))
+    if sb_implied is not None:
+        rows.append({
+            "venue": f"Sportsbook ({edge.get('best_book') or 'book'})",
+            "price": edge.get("best_price"),
+            "implied_prob": sb_implied,
+            "url": edge.get("source_url"),
+        })
+    return rows
+
+
+def best_executable_edge(edge: dict[str, Any]) -> dict[str, Any] | None:
+    """Best edge vs the SignalForge fair probability across venues.
+
+    edge_pct = fair_prob − venue_implied (positive = value). Returns the
+    venue with the largest positive edge, or ``None`` when there's no fair
+    probability to compare against (honest "uncalibrated" state).
+    """
+    fair = _to_float(
+        edge.get("sf_fair_probability")
+        or edge.get("model_probability")
+        or edge.get("calibrated_probability")
+    )
+    if fair is None:
+        return None
+    best: dict[str, Any] | None = None
+    for row in executable_edge_rows(edge):
+        implied = _to_float(row.get("implied_prob"))
+        if implied is None:
+            continue
+        edge_pct = round((fair - implied) * 100, 1)
+        if best is None or edge_pct > best["edge_pct"]:
+            best = {"venue": row["venue"], "edge_pct": edge_pct,
+                    "fair_prob": round(fair, 4), "implied_prob": round(implied, 4),
+                    "url": row.get("url")}
+    return best
+
+
 def consensus_wallets_chips_html(wallets: list[dict[str, Any]], *, limit: int | None = None) -> str:
     """Render consensus wallets as a single clean HTML chip row.
 

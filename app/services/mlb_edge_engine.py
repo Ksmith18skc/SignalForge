@@ -25,7 +25,19 @@ from app.providers.odds_api import OddsApiProvider
 from app.providers.weather_api import WeatherApiProvider
 from app.services import odds_cache
 from app.services.mlb_edge import statcast_context
-from app.services.mlb_edge_scoring import classify_edge, edge_to_dict
+from app.services.mlb_edge_scoring import (
+    PITCHER_K_WEIGHTS,
+    TOTAL_WEIGHTS,
+    classify_edge,
+    edge_to_dict,
+)
+
+# Maps an edge_type to the weight map its score was built from, so persisted
+# MlbEdgeFactor rows carry the real weight (not a 0.0 placeholder).
+_WEIGHTS_FOR_EDGE_TYPE = {
+    "game_total": TOTAL_WEIGHTS,
+    "pitcher_strikeouts": PITCHER_K_WEIGHTS,
+}
 from app.services.mlb_environment import score_environment
 from app.services.mlb_odds_analysis import analyze_game_totals
 from app.services.mlb_odds_matching import MatchResult
@@ -527,6 +539,7 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
         data_sources_used=payload.get("data_sources_used") or [],
         factors=payload.get("factors") or {},
         wallet_context=payload.get("wallet_context") or None,
+        score_contributions=payload.get("score_contributions") or None,
         generated_for_date=card_date,
         opening_line=payload.get("line"),
         current_line=payload.get("line"),
@@ -539,8 +552,18 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
     )
     db.add(edge)
     db.flush()
+    contributions = payload.get("score_contributions") or {}
+    weights = _WEIGHTS_FOR_EDGE_TYPE.get(payload["edge_type"], {})
     for name, value in (edge.factors or {}).items():
-        db.add(MlbEdgeFactor(edge_id=edge.id, name=name, value=float(value), weight=0.0))
+        db.add(
+            MlbEdgeFactor(
+                edge_id=edge.id,
+                name=name,
+                value=float(value),
+                weight=float(weights.get(name, 0.0)),
+                note=(f"{contributions[name]:+.2f} pts" if name in contributions else None),
+            )
+        )
     return edge
 
 

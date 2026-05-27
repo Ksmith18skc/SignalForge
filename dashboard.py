@@ -11,6 +11,7 @@ Launch: `streamlit run dashboard.py`.
 
 from __future__ import annotations
 
+import html
 import os
 import re
 import time
@@ -32,9 +33,15 @@ from app.utils.dashboard_format import (
     SCORE_STRONG_MIN,
     american_from_price,
     american_to_implied_probability,
+    best_executable_edge,
     build_consensus_wallets,
     compact_time_ago,
     consensus_wallets_chips_html,
+    conviction_tier,
+    edge_risk_flags,
+    edge_source_stack,
+    executable_edge_rows,
+    format_score_contributions,
     confidence_label as confidence_label_fn,
     confidence_word,
     edge_vs_market,
@@ -415,6 +422,15 @@ button[data-baseweb="tab"][aria-selected="true"] {
 .sf-meta { color: var(--muted); font-size: 0.78rem; }
 .sf-link { color: var(--cyan); text-decoration: none; }
 .sf-link:hover { text-decoration: underline; }
+.sf-source-stack { margin: 6px 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.sf-best-edge { margin-top: 6px; font-size: 0.82rem; }
+.sf-contrib-row { display: flex; justify-content: space-between; font-size: 0.82rem; margin: 1px 0; }
+.sf-contrib-pts { font-variant-numeric: tabular-nums; font-weight: 600; }
+.sf-contrib-pts.green { color: var(--green); }
+.sf-contrib-pts.red { color: var(--red); }
+.sf-contrib-pts.muted { color: var(--muted); }
+.sf-technical { margin-top: 6px; }
+.sf-technical > summary { cursor: pointer; list-style: revert; }
 .sf-wallet-row { font-size: 0.82rem; margin: 2px 0; }
 .sf-wallet-debug { margin-top: 6px; }
 .sf-wallet-debug summary { cursor: pointer; }
@@ -1703,6 +1719,143 @@ def _render_wallet_debug(ctx: dict[str, Any]) -> str:
     )
 
 
+def _render_source_stack(edge: dict[str, Any]) -> str:
+    """#1 Edge source stack — where the edge comes from (top-level pills)."""
+    sources = edge_source_stack(edge)
+    if not sources:
+        return ""
+    pills = " ".join(_pill(label, kind) for label, kind in sources)
+    return f"<div class='sf-source-stack'>{pills}</div>"
+
+
+def _pct(value: Any) -> str:
+    v = _as_float(value)
+    return f"{v * 100:.1f}%" if v is not None else DASH
+
+
+def _render_execution(edge: dict[str, Any]) -> str:
+    """#2 Execution — venue prices, sportsbook implied, SF fair, best edge."""
+    rows = executable_edge_rows(edge)
+    best = best_executable_edge(edge)
+    sf_fair = _as_float(edge.get("sf_fair_probability") or edge.get("calibrated_probability"))
+
+    cells: list[str] = []
+    have_pm = any("Polymarket" in r["venue"] or "Kalshi" in r["venue"] for r in rows)
+    for r in rows:
+        price = r.get("price")
+        price_str = f"{price:.2f}" if isinstance(price, (int, float)) else DASH
+        venue = html.escape(str(r["venue"]))
+        url = r.get("url")
+        venue_html = f"<a class='sf-link' href='{url}' target='_blank' rel='noopener'>{venue}</a>" if url else venue
+        cells.append(
+            f"<div class='sf-price-cell'><div class='lbl'>{venue_html}</div>"
+            f"<div class='val'>{price_str} · {_pct(r.get('implied_prob'))}</div></div>"
+        )
+    if not have_pm:
+        cells.append(
+            "<div class='sf-price-cell'><div class='lbl'>Kalshi / Polymarket</div>"
+            "<div class='val sf-meta'>not listed</div></div>"
+        )
+    cells.append(
+        "<div class='sf-price-cell'><div class='lbl'>SF fair prob</div>"
+        f"<div class='val purple'>{_pct(sf_fair) if sf_fair is not None else 'uncalibrated'}</div></div>"
+    )
+
+    best_html = ""
+    if best:
+        kind = "green" if best["edge_pct"] > 0 else "red"
+        best_venue = html.escape(str(best["venue"]))
+        best_pill = _pill(f"{best['edge_pct']:+.1f} pts @ {best_venue}", kind)
+        best_html = f"<div class='sf-best-edge'>Best executable edge: {best_pill}</div>"
+
+    return (
+        "<div class='sf-section'><div class='sf-section-title'>Execution</div>"
+        f"<div class='sf-price-grid'>{''.join(cells)}</div>{best_html}</div>"
+    )
+
+
+def _render_history(edge: dict[str, Any]) -> str:
+    """#4 Historical regime performance — record of similar graded edges."""
+    band = edge.get("score_band_performance") or {}
+    sample = int(band.get("sample_size") or 0)
+    if sample == 0:
+        return (
+            "<div class='sf-section'><div class='sf-section-title'>Historical performance</div>"
+            "<div class='sf-meta'>Not enough graded history yet for similar signals.</div></div>"
+        )
+    wr = band.get("win_rate")
+    roi = band.get("roi_units")
+    clv = band.get("avg_clv_points")
+    grid = (
+        "<div class='sf-price-grid'>"
+        f"<div class='sf-price-cell'><div class='lbl'>Win rate</div><div class='val'>{_pct(wr)}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>ROI (u/edge)</div><div class='val'>{roi if roi is not None else DASH}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>Avg CLV</div><div class='val'>{clv if clv is not None else DASH}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>Sample</div><div class='val'>{sample}</div></div>"
+        "</div>"
+    )
+    return (
+        "<div class='sf-section'><div class='sf-section-title'>Historical performance "
+        f"<span class='sf-meta'>· {html.escape(str(band.get('edge_type') or ''))} {html.escape(str(band.get('score_band') or ''))}</span>"
+        f"</div>{grid}</div>"
+    )
+
+
+def _render_score_interpretation(edge: dict[str, Any]) -> str:
+    """#5 Score interpretation — conviction tier + calibrated hit probability."""
+    tier_label, tier_kind = conviction_tier(edge.get("score"))
+    calibrated = _as_float(edge.get("calibrated_probability"))
+    band = edge.get("score_band_performance") or {}
+    cal_str = _pct(calibrated) if calibrated is not None else "uncalibrated"
+    record = ""
+    if int(band.get("sample_size") or 0) > 0:
+        record = (
+            f"<span class='sf-meta'> · band record {band.get('wins', 0)}-"
+            f"{band.get('losses', 0)}-{band.get('pushes', 0)}</span>"
+        )
+    return (
+        "<div class='sf-section'><div class='sf-section-title'>Score interpretation</div>"
+        f"<div>{_pill(tier_label, tier_kind)} "
+        f"<span class='sf-meta'>calibrated hit prob: {cal_str}</span>{record}</div></div>"
+    )
+
+
+def _render_risk_flags(edge: dict[str, Any]) -> str:
+    """#6 Risk factors — explicit chips, only those that apply."""
+    flags = edge_risk_flags(edge)
+    if not flags:
+        return (
+            "<div class='sf-section'><div class='sf-section-title'>Risk factors</div>"
+            "<div class='sf-meta'>No notable risk flags.</div></div>"
+        )
+    chips = " ".join(_pill(label, kind) for label, kind in flags)
+    return (
+        "<div class='sf-section'><div class='sf-section-title'>Risk factors</div>"
+        f"<div>{chips}</div></div>"
+    )
+
+
+def _render_score_decomposition(edge: dict[str, Any]) -> str:
+    """#7 Score decomposition — additive +/- point contributions."""
+    wc = edge.get("wallet_context") or {}
+    rows = format_score_contributions(
+        edge.get("score_contributions"),
+        wallet_adjustment=wc.get("confidence_adjustment"),
+    )
+    if not rows:
+        return ""
+    items = "".join(
+        f"<div class='sf-contrib-row'><span class='lbl'>{html.escape(label)}</span>"
+        f"<span class='sf-contrib-pts {kind}'>{pts:+.1f}</span></div>"
+        for label, pts, kind in rows
+    )
+    base = "<div class='sf-meta'>Baseline 50 + contributions ≈ score</div>"
+    return (
+        "<div class='sf-section'><div class='sf-section-title'>Score decomposition</div>"
+        f"{items}{base}</div>"
+    )
+
+
 def render_edge_card(edge: dict[str, Any]) -> None:
     """Premium edge card. Single source of truth for the visual hierarchy
     used across Command Center, MLB Terminal, Daily Card."""
@@ -1768,36 +1921,26 @@ def render_edge_card(edge: dict[str, Any]) -> None:
             f"<div class='val'>{sb_implied * 100:.1f}%</div></div>"
         )
 
-    # Pill chips — gold reserved for HIGH CONV, color hierarchy strict.
-    pills: list[str] = [_pill(label, label_kind)]
-    confidence_label_str, confidence_kind = confidence_word(edge.get("confidence"))
-    if confidence_label_str != label and confidence_kind != "muted":
-        pills.append(_pill(confidence_label_str, confidence_kind))
-    chase = str(edge.get("chase_risk") or "").lower()
-    if chase == "high":
-        pills.append(_pill("AVOID CHASE", "red"))
-    if odds_stale:
-        pills.append(_pill("STALE", "red"))
-    if fallback:
-        pills.append(_pill("FALLBACK", "purple"))
-    pill_html = " ".join(pills)
-
     reasons = (edge.get("reasons") or [])[:3]
     factors = edge.get("factors") or {}
 
-    factor_section = render_factor_bars(factors)
-    price_section = render_market_price_block(edge)
-    model_section = _render_model_vs_market(edge)
-    form_section = _render_recent_form(edge)
-    movement_section = _render_movement_clv(edge)
-    trust_section = render_trust_tags(edge, odds_source=odds_source, fallback=fallback)
-    wallet_section = render_wallet_flow_section(edge)
-    time_block = render_time_context(edge)
+    # --- Prioritized sections (#10 visual hierarchy) ---
+    source_stack = _render_source_stack(edge)          # 1
+    execution_section = _render_execution(edge)        # 2
+    wallet_section = render_wallet_flow_section(edge)  # 3
+    history_section = _render_history(edge)            # 4
+    interp_section = _render_score_interpretation(edge)  # 5
+    risk_section = _render_risk_flags(edge)            # 6
+    decomp_section = _render_score_decomposition(edge)  # 7
+    time_block = render_time_context(edge)             # 8
+    links_html = render_link_buttons([                 # 9
+        ("Market", (edge.get("wallet_context") or {}).get("execution", {}).get("market_url") if isinstance((edge.get("wallet_context") or {}).get("execution"), dict) else None),
+        ("Sportsbook", edge.get("source_url")),
+        ("Edge detail", edge.get("market_url")),
+    ])
 
     reasons_html = ""
     if reasons:
-        # Dedupe near-identical reasons (the engine sometimes echoes the
-        # same fact in two ways). Keeps the bullet list under three.
         seen: set[str] = set()
         deduped: list[str] = []
         for r in reasons:
@@ -1808,14 +1951,24 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         if deduped:
             reasons_html = (
                 "<ul class='sf-reasons'>"
-                + "".join(f"<li>{r}</li>" for r in deduped[:3])
+                + "".join(f"<li>{html.escape(str(r))}</li>" for r in deduped[:3])
                 + "</ul>"
             )
 
-    links_html = render_link_buttons([
-        ("Market", edge.get("market_url")),
-        ("Source", edge.get("source_url")),
-    ])
+    # Technical factors demoted into a collapsed block (was the primary view).
+    technical = (
+        render_market_price_block(edge)
+        + _render_model_vs_market(edge)
+        + _render_recent_form(edge)
+        + _render_movement_clv(edge)
+        + render_factor_bars(factors)
+        + ("<div class='sf-section'><div class='sf-section-title'>Why we like it</div>" + reasons_html + "</div>" if reasons_html else "")
+        + "<div class='sf-section'>" + render_trust_tags(edge, odds_source=odds_source, fallback=fallback) + "</div>"
+    )
+    technical_block = (
+        "<details class='sf-technical'><summary class='sf-section-title'>Technical factors</summary>"
+        f"{technical}</details>"
+    )
 
     body = f"""
     <div class="sf-card {card_kind}">
@@ -1829,16 +1982,15 @@ def render_edge_card(edge: dict[str, Any]) -> None:
           {''.join(prob_row_parts)}
         </div>
       </div>
-      <div style="margin-bottom:4px;">{pill_html}</div>
-      {price_section}
-      {model_section}
-      {form_section}
-      {factor_section}
-      {movement_section}
+      {source_stack}
+      {execution_section}
       {wallet_section}
-      {('<div class="sf-section"><div class="sf-section-title">Why we like it</div>' + reasons_html + '</div>') if reasons_html else ''}
-      <div class="sf-section">{trust_section}</div>
+      {history_section}
+      {interp_section}
+      {risk_section}
+      {decomp_section}
       {links_html}
+      {technical_block}
     </div>
     """
     st.markdown(body, unsafe_allow_html=True)
@@ -1883,11 +2035,20 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             "</div>", f"<span class='sf-badge sf-badge-muted'>+{extra_wallets} more</span></div>"
         )
 
-    pills_html = " ".join(filter(None, [
+    # Source-stack style indicators derived from the signal's own consensus
+    # data (the watchlist card is wallet-first, so these are honest, not edge
+    # fields borrowed from the MLB cards).
+    _wallets = int(signal.get("consensus_wallets") or 0)
+    source_pills = [
         _pill(tier, tier_kind),
         _pill(f"SRC {source}", "purple" if source == "Falcon" else "cyan") if source else "",
         _pill(side, "green" if side in {"YES", "BUY"} else ("red" if side in {"NO", "SELL"} else "muted")) if side else "",
-    ]))
+    ]
+    if _wallets >= 2:
+        source_pills.append(_pill("WALLET CONFIRMED", "green"))
+    if _wallets >= 5:
+        source_pills.append(_pill("CROWDED CONSENSUS", "purple"))
+    pills_html = " ".join(filter(None, source_pills))
 
     event_label = event_date or (fmt_event_time(market_end) if market_end else DASH)
     updated_label = fmt_relative(market_updated)

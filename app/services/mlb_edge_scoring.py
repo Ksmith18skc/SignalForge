@@ -34,6 +34,25 @@ def weighted_score(factors: dict[str, float], weights: dict[str, float]) -> floa
     return round(min(raw, 95.0), 2)
 
 
+def additive_contributions(
+    factors: dict[str, float],
+    weights: dict[str, float],
+    *,
+    baseline: float = 50.0,
+) -> dict[str, float]:
+    """Decompose a weighted score into additive per-factor point contributions.
+
+    Each factor contributes ``(value - baseline) * weight`` so the contributions
+    sum to ``score - baseline`` — i.e. how many points above/below a neutral 50
+    each factor pushed the edge. Lets the card show "+12 sportsbook edge / −6
+    crowded consensus" instead of opaque 0–100 bars.
+    """
+    return {
+        name: round((_clamp(factors.get(name, baseline)) - baseline) * weight, 2)
+        for name, weight in weights.items()
+    }
+
+
 def classify_edge(score: float, warnings: list[str] | None = None) -> dict[str, str]:
     warnings = warnings or []
     if score < 65:
@@ -101,6 +120,7 @@ def edge_to_dict(edge: Any) -> dict[str, Any]:
         "data_sources_used": edge.data_sources_used or [],
         "factors": edge.factors or {},
         "wallet_context": edge.wallet_context or None,
+        "score_contributions": edge.score_contributions or None,
         "generated_for_date": edge.generated_for_date,
         "opening_line": edge.opening_line,
         "current_line": edge.current_line,

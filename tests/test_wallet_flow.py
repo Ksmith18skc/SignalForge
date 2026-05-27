@@ -162,6 +162,40 @@ def test_prior_date_positions_excluded(db_session):
     assert "NO WALLET DATA" in ctx["tags"]
 
 
+def test_execution_block_populated_from_priced_market(db_session):
+    _seed_game(db_session)
+    market = _add_total_market(db_session, "mlb-nyy-kc-2026-05-27-total-10pt5")
+    market.yes_price = 0.41   # Over
+    market.no_price = 0.59    # Under
+    market.liquidity_usd = 5000.0
+    tr = _add_trader(db_session, "surf", "0xabc")
+    db_session.add(Trade(trader_id=tr.id, market_id=market.id, side="BUY",
+                         outcome="Under", price=0.55, size_usd=300.0, source="polymarket"))
+    db_session.flush()
+
+    ctx = build_wallet_context(
+        db_session, edge=_edge_dict(side="under"), home_team="Kansas City Royals",
+        away_team="New York Yankees", card_date=CARD_DATE,
+    )
+    ex = ctx["execution"]
+    assert ex is not None
+    assert ex["platform"] == "polymarket"
+    assert ex["side"] == "under"
+    assert ex["side_price"] == 0.59          # Under leg = no_price
+    assert ex["implied_prob"] == 0.59
+    assert ex["market_url"].endswith("mlb-nyy-kc-2026-05-27-total-10pt5")
+
+
+def test_execution_none_when_no_market(db_session):
+    _seed_game(db_session)
+    db_session.flush()
+    ctx = build_wallet_context(
+        db_session, edge=_edge_dict(), home_team="Kansas City Royals",
+        away_team="New York Yankees", card_date=CARD_DATE,
+    )
+    assert ctx["execution"] is None
+
+
 def test_pitcher_k_edge_gets_no_wallet_data(db_session):
     _seed_game(db_session)
     db_session.flush()

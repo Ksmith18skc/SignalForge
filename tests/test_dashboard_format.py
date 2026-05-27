@@ -13,9 +13,15 @@ from app.utils.dashboard_format import (
     SCORE_BUCKETS,
     american_from_price,
     american_to_implied_probability,
+    best_executable_edge,
     build_consensus_wallets,
     compact_time_ago,
     consensus_wallets_chips_html,
+    conviction_tier,
+    edge_risk_flags,
+    edge_source_stack,
+    executable_edge_rows,
+    format_score_contributions,
     confidence_label,
     confidence_word,
     edge_vs_market,
@@ -479,6 +485,109 @@ class TestBuildConsensusWallets:
         ]
         rows = build_consensus_wallets(fills)
         assert rows[0]["wallet_address"] == "0xbig"
+
+
+class TestEdgeSourceStack:
+    def test_sportsbook_and_wallet_and_risk_tags(self):
+        edge = {
+            "factors": {"odds_edge": 95, "movement": 75},
+            "odds_stale": True,
+            "wallet_context": {
+                "tracked_wallet_count": 3,
+                "elite_wallet_disagreement": 1,
+                "tags": ["WALLET CONFIRMED", "CROWDED SIDE"],
+                "execution": {"implied_prob": 0.56},
+            },
+        }
+        labels = [lbl for lbl, _ in edge_source_stack(edge)]
+        assert "SPORTSBOOK EDGE" in labels
+        assert "WALLET CONFIRMED" in labels
+        assert "ELITE DISAGREEMENT" in labels
+        assert "STEAM MOVE" in labels
+        assert "PREDICTION-MARKET EDGE" in labels
+        assert "CROWDED CONSENSUS" in labels
+        assert "STALE ODDS" in labels
+
+    def test_model_only_when_no_corroboration(self):
+        edge = {"factors": {"odds_edge": 50, "movement": 50}, "wallet_context": {"tracked_wallet_count": 0}}
+        labels = [lbl for lbl, _ in edge_source_stack(edge)]
+        assert labels == ["MODEL ONLY"]
+
+
+class TestEdgeRiskFlags:
+    def test_flags_present(self):
+        edge = {
+            "odds_stale": True,
+            "chase_risk": "high",
+            "wallet_context": {
+                "tracked_wallet_count": 0,
+                "elite_wallet_disagreement": 2,
+                "tags": ["CROWDED SIDE"],
+                "execution": {"liquidity_usd": 100.0},
+            },
+        }
+        labels = [lbl for lbl, _ in edge_risk_flags(edge)]
+        assert "Stale odds" in labels
+        assert "No wallet confirmation" in labels
+        assert "Crowded side" in labels
+        assert "Sharp disagreement" in labels
+        assert "Low liquidity" in labels
+        assert "Late adverse movement" in labels
+
+    def test_no_flags_clean_edge(self):
+        edge = {"odds_stale": False, "chase_risk": "low",
+                "wallet_context": {"tracked_wallet_count": 3, "tags": ["WALLET CONFIRMED"]}}
+        assert edge_risk_flags(edge) == []
+
+
+class TestConvictionTier:
+    def test_high_conv(self):
+        assert conviction_tier(90) == ("HIGH CONV", "gold")
+
+    def test_pass(self):
+        assert conviction_tier(40) == ("PASS", "muted")
+
+
+class TestScoreContributions:
+    def test_sorted_signed_and_wallet_line(self):
+        contribs = {"odds_edge": 13.5, "data_quality": -1.0, "movement": 0.0}
+        rows = format_score_contributions(contribs, wallet_adjustment=-5.0)
+        # Largest magnitude first; wallet line included.
+        assert rows[0][0] == "Sportsbook price edge" and rows[0][1] == 13.5 and rows[0][2] == "green"
+        labels = [r[0] for r in rows]
+        assert "Wallet flow" in labels
+        wallet_row = next(r for r in rows if r[0] == "Wallet flow")
+        assert wallet_row[1] == -5.0 and wallet_row[2] == "red"
+
+    def test_zero_wallet_adjustment_omitted(self):
+        rows = format_score_contributions({"odds_edge": 5.0}, wallet_adjustment=0.0)
+        assert all(r[0] != "Wallet flow" for r in rows)
+
+
+class TestExecutableEdge:
+    def _edge(self):
+        return {
+            "best_price": 2.40, "best_book": "FanDuel", "source_url": "http://sb",
+            "calibrated_probability": 0.62,
+            "wallet_context": {"execution": {"platform": "polymarket", "side_price": 0.50,
+                                             "implied_prob": 0.50, "market_url": "http://pm"}},
+        }
+
+    def test_rows_include_pm_and_sportsbook(self):
+        rows = executable_edge_rows(self._edge())
+        venues = [r["venue"] for r in rows]
+        assert "Polymarket" in venues
+        assert any("Sportsbook" in v for v in venues)
+
+    def test_best_edge_picks_largest_positive(self):
+        best = best_executable_edge(self._edge())
+        # fair 0.62; sportsbook implied 1/2.4=0.4167 → +20.3; PM 0.50 → +12.0.
+        assert best["venue"].startswith("Sportsbook")
+        assert best["edge_pct"] == 20.3
+
+    def test_no_fair_prob_returns_none(self):
+        edge = {"best_price": 2.4, "wallet_context": {}}
+        assert best_executable_edge(edge) is None
 
 
 class TestConsensusWalletsChipsHtml:

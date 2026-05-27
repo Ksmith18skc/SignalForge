@@ -364,6 +364,9 @@ class MlbEdge(Base):
     # Tracked-wallet consensus + contributors joined to this edge at scan time.
     # Nullable: pitcher-K edges and totals with no wallet market stay None.
     wallet_context: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Additive per-factor point contributions (sum ≈ score − 50). Powers the
+    # card's "+12 / −6" score decomposition. Nullable for pre-migration rows.
+    score_contributions: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
     generated_for_date: Mapped[str] = mapped_column(String(10), index=True)
     opening_line: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_line: Mapped[float | None] = mapped_column(Float, nullable=True)

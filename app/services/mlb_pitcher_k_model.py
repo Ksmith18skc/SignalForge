@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.mlb_edge_scoring import (
     PITCHER_K_WEIGHTS,
+    additive_contributions,
     chase_risk,
     classify_edge,
     data_quality_score,
@@ -105,6 +106,7 @@ def _pitcher_edge(
         "warnings": _dedupe(warnings),
         "data_sources_used": ["MLB StatsAPI", "WeatherAPI", "Cached Statcast", "Odds-API.io"],
         "factors": factors,
+        "score_contributions": additive_contributions(factors, PITCHER_K_WEIGHTS),
     }
 
 

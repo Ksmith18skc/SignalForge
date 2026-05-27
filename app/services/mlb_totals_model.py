@@ -6,6 +6,7 @@ from typing import Any
 
 from app.services.mlb_edge_scoring import (
     TOTAL_WEIGHTS,
+    additive_contributions,
     chase_risk,
     classify_edge,
     data_quality_score,
@@ -95,6 +96,7 @@ def _total_edge(
         "warnings": list(dict.fromkeys(warnings)),
         "data_sources_used": ["MLB StatsAPI", "WeatherAPI", "Odds-API.io", "SignalForge smart money"],
         "factors": factors,
+        "score_contributions": additive_contributions(factors, TOTAL_WEIGHTS),
     }
 
 

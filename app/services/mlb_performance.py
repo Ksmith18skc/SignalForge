@@ -137,6 +137,64 @@ def performance_by_score_band(
     )
 
 
+def lookup_edge_score_band(
+    db: Session,
+    *,
+    edge_type: str | None,
+    score: float | None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> dict[str, Any]:
+    """Historical record of *similar* graded edges — same ``edge_type`` and
+    score band — for the card's history + calibration sections.
+
+    Returns win_rate / roi / avg_clv / sample_size plus a Laplace-smoothed
+    ``calibrated_probability`` (MLB-edge-native analog of the Falcon-signal
+    ``lookup_calibrated_probability``). All fields are ``None`` / 0 when no
+    comparable graded edges exist yet, so the card can show an honest
+    "not enough graded history" state rather than a fabricated number.
+    """
+    band = score_band(float(score)) if score is not None else None
+    empty = {
+        "edge_type": edge_type,
+        "score_band": band,
+        "sample_size": 0,
+        "wins": 0,
+        "losses": 0,
+        "pushes": 0,
+        "win_rate": None,
+        "roi_units": None,
+        "avg_clv_points": None,
+        "calibrated_probability": None,
+    }
+    if band is None:
+        return empty
+    edges = [
+        e
+        for e in _graded_edges(db, start_date=start_date, end_date=end_date)
+        if (edge_type is None or e.edge_type == edge_type) and score_band(e.score) == band
+    ]
+    if not edges:
+        return empty
+    wins = sum(1 for e in edges if e.win_loss_push == "win")
+    losses = sum(1 for e in edges if e.win_loss_push == "loss")
+    pushes = sum(1 for e in edges if e.win_loss_push == "push")
+    decided = wins + losses
+    return {
+        "edge_type": edge_type,
+        "score_band": band,
+        "sample_size": len(edges),
+        "wins": wins,
+        "losses": losses,
+        "pushes": pushes,
+        "win_rate": round(wins / decided, 4) if decided else None,
+        "roi_units": round(sum(e.roi_units or 0.0 for e in edges) / len(edges), 4),
+        "avg_clv_points": _avg(e.clv_points for e in edges),
+        # Laplace smoothing keeps small samples honest.
+        "calibrated_probability": round((wins + 1) / (decided + 2), 4) if decided else None,
+    }
+
+
 def clv_report(
     db: Session,
     *,

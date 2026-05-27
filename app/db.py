@@ -174,6 +174,7 @@ def _ensure_mlb_edge_validation_columns() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "is_valid", "BOOLEAN DEFAULT 1")
         _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
         _add_sqlite_column_if_missing("mlb_edges", "wallet_context", "JSON")
+        _add_sqlite_column_if_missing("mlb_edges", "score_contributions", "JSON")
         return
     if dialect.startswith("postgres"):
         statements = [
@@ -182,6 +183,7 @@ def _ensure_mlb_edge_validation_columns() -> None:
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS is_valid BOOLEAN DEFAULT TRUE",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS validation_reason TEXT",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS wallet_context JSONB",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS score_contributions JSONB",
         ]
         try:
             with engine.begin() as conn:
