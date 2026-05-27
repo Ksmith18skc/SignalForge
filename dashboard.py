@@ -75,6 +75,10 @@ RETRY_PATH_PREFIXES = (
     "/mlb/edges/run",
 )
 _EMPTY_STATE_COUNTER = count()
+# Per-render monotonic counter for widget keys that would otherwise collide
+# when the same signal/position is rendered in more than one tab (Wallets +
+# Positions both call render_wallet_card) or aggregated across signals.
+_WIDGET_KEY_COUNTER = count()
 
 
 # =============================================================================
@@ -1770,7 +1774,13 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
     st.markdown(body, unsafe_allow_html=True)
 
     if len(consensus_traders) > 4:
-        expander_key = f"consensus-{signal.get('market_id')}-{signal.get('side')}-{signal.get('outcome')}"
+        # market_id+side+outcome is not unique: the same signal renders in both
+        # the Wallets tab and the Positions tab, and aggregated positions can
+        # share a side/outcome across signals. Append a monotonic suffix.
+        expander_key = (
+            f"consensus-{signal.get('market_id')}-{signal.get('side')}-"
+            f"{signal.get('outcome')}-{next(_WIDGET_KEY_COUNTER)}"
+        )
         with st.expander("Consensus wallets (full list)", expanded=False, key=expander_key):
             st.markdown(
                 " ".join(
