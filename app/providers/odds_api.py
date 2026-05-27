@@ -4,15 +4,31 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
+
+from app.utils.redaction import redact_url, sanitize_text
 
 logger = logging.getLogger(__name__)
 
 
 class OddsApiError(RuntimeError):
     """Raised for Odds-API configuration or upstream failures."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        sanitized_url: str | None = None,
+        error_body_preview: str | None = None,
+    ) -> None:
+        super().__init__(sanitize_text(message))
+        self.status_code = status_code
+        self.sanitized_url = sanitized_url
+        self.error_body_preview = error_body_preview
 
 
 class OddsApiRateLimited(OddsApiError):
@@ -23,8 +39,18 @@ class OddsApiRateLimited(OddsApiError):
     Retry-After header (seconds) when present so consumers can pace retries.
     """
 
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        sanitized_url: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=429,
+            sanitized_url=sanitized_url,
+        )
         self.retry_after = retry_after
 
 
@@ -46,6 +72,39 @@ class OddsApiProvider:
     @property
     def default_bookmakers(self) -> list[str]:
         return self._bookmakers
+
+    def preview_events_request(
+        self,
+        sport: str,
+        *,
+        league: str | None = None,
+        status: str | None = None,
+        bookmaker: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int | None = None,
+        skip: int | None = None,
+        include_auth: bool = True,
+    ) -> dict[str, Any]:
+        """Return the normalized request shape without making a network call."""
+        params = self._event_params(
+            sport,
+            league=league,
+            status=status,
+            bookmaker=bookmaker,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            skip=skip,
+            include_auth=include_auth,
+        )
+        request_url = httpx.URL(f"{self._base_url}/events", params=params)
+        return {
+            "method": "GET",
+            "url": redact_url(str(request_url)),
+            "params": params,
+            "headers": {},
+        }
 
     def _auth_params(self, params: dict[str, Any] | None = None) -> dict[str, Any]:
         if not self._api_key:
@@ -73,11 +132,28 @@ class OddsApiProvider:
         delay = 1.0
         last_status: int | None = None
         last_retry_after: float | None = None
+        last_url: str | None = None
         for attempt in range(max_retries + 1):
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            limits = httpx.Limits(max_connections=2, max_keepalive_connections=1)
+            try:
+                client_factory = httpx.AsyncClient(timeout=self._timeout, limits=limits)
+            except TypeError:
+                client_factory = httpx.AsyncClient(timeout=self._timeout)
+            async with client_factory as client:
                 response = await client.get(f"{self._base_url}{path}", params=query)
+            last_url = _response_url(response, fallback=f"{self._base_url}{path}")
             if response.status_code != 429:
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    body = _response_text(response)
+                    raise OddsApiError(
+                        (
+                            f"Odds-API HTTP {response.status_code} on {path}; "
+                            f"url={redact_url(last_url)}; body={sanitize_text(body, limit=300)}"
+                        ),
+                        status_code=response.status_code,
+                        sanitized_url=redact_url(last_url),
+                        error_body_preview=sanitize_text(body, limit=500),
+                    )
                 return response.json()
             # 429 — back off.
             last_status = 429
@@ -99,6 +175,7 @@ class OddsApiProvider:
         raise OddsApiRateLimited(
             f"Odds-API returned 429 on {path} after {max_retries + 1} attempts",
             retry_after=last_retry_after,
+            sanitized_url=redact_url(last_url),
         )
 
     async def sports(self) -> list[dict[str, Any]]:
@@ -122,16 +199,18 @@ class OddsApiProvider:
         bookmaker: str | None = None,
         date_from: str | None = None,
         date_to: str | None = None,
+        limit: int | None = None,
+        skip: int | None = None,
     ) -> list[dict[str, Any]]:
-        params = _clean_params(
-            {
-                "sport": sport,
-                "league": league,
-                "status": status,
-                "bookmaker": bookmaker,
-                "from": date_from,
-                "to": date_to,
-            }
+        params = self._event_params(
+            sport,
+            league=league,
+            status=status,
+            bookmaker=bookmaker,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            skip=skip,
         )
         return await self._get("/events", params)
 
@@ -211,6 +290,82 @@ class OddsApiProvider:
             "best_by_outcome": best_by_outcome,
         }
 
+    def _event_params(
+        self,
+        sport: str,
+        *,
+        league: str | None = None,
+        status: str | None = None,
+        bookmaker: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        limit: int | None = None,
+        skip: int | None = None,
+        include_auth: bool = True,
+    ) -> dict[str, Any]:
+        normalized_sport = _normalize_sport(sport)
+        params = _clean_params(
+            {
+                "sport": normalized_sport,
+                "league": league,
+                "status": status,
+                "bookmaker": bookmaker,
+                "from": _normalize_date_value(date_from),
+                "to": _normalize_date_value(date_to),
+                "limit": _validate_int_param(limit, "limit"),
+                "skip": _validate_int_param(skip, "skip", minimum=0),
+            }
+        )
+        if include_auth:
+            return self._auth_params(params)
+        return params
+
+
+def _normalize_sport(sport: str) -> str:
+    value = str(sport or "").strip().lower()
+    if not value:
+        raise OddsApiError("sport is required for Odds-API events requests")
+    if value in {"mlb", "baseball"}:
+        return "baseball"
+    return value
+
+
+def _normalize_date_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return text
+    if len(text) == 10 and text[4] == "-" and text[7] == "-":
+        return text
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return text
+    if parsed.tzinfo is None:
+        return parsed.replace(microsecond=0).isoformat()
+    return (
+        parsed.astimezone(timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _validate_int_param(value: int | None, name: str, *, minimum: int | None = 1) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OddsApiError(f"{name} must be an integer") from exc
+    if minimum is not None and parsed < minimum:
+        raise OddsApiError(f"{name} must be >= {minimum}")
+    return parsed
+
 
 def _split_csv(value: str | list[str] | None) -> list[str]:
     if value is None:
@@ -226,6 +381,23 @@ def _bookmaker_param(value: str | list[str] | None) -> str:
 
 def _clean_params(params: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in params.items() if value not in (None, "", [])}
+
+
+def _response_url(response: Any, *, fallback: str) -> str:
+    url = getattr(response, "url", None)
+    if url:
+        return str(url)
+    request = getattr(response, "request", None)
+    if request is not None and getattr(request, "url", None):
+        return str(request.url)
+    return fallback
+
+
+def _response_text(response: Any) -> str:
+    try:
+        return str(response.text)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _to_float(value: Any) -> float | None:

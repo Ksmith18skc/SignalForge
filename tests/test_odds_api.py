@@ -70,6 +70,20 @@ def test_odds_provider_requires_key_for_auth_endpoints():
         provider._auth_params({"sport": "basketball"})
 
 
+def test_odds_provider_preview_normalizes_mlb_to_baseball():
+    provider = OddsApiProvider("key", "https://api.odds-api.io/v3", "DraftKings")
+
+    preview = provider.preview_events_request(
+        "mlb",
+        date_from="2026-05-25T07:00:00Z",
+        date_to="2026-05-26T06:59:59Z",
+        include_auth=False,
+    )
+
+    assert "sport=baseball" in preview["url"]
+    assert "apiKey" not in preview["url"]
+
+
 @pytest.mark.asyncio
 async def test_odds_provider_compare_lines(monkeypatch):
     calls = []
@@ -85,7 +99,7 @@ async def test_odds_provider_compare_lines(monkeypatch):
             return _sample_odds_payload()
 
     class _Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         async def __aenter__(self):
@@ -128,7 +142,7 @@ async def test_odds_provider_events_omits_empty_league(monkeypatch):
             return []
 
     class _Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         async def __aenter__(self):
@@ -155,7 +169,7 @@ async def test_odds_provider_events_omits_empty_league(monkeypatch):
         (
             "https://api.odds-api.io/v3/events",
             {
-                "sport": "mlb",
+                "sport": "baseball",
                 "from": "2026-05-25T07:00:00Z",
                 "to": "2026-05-26T06:59:59Z",
                 "apiKey": "key",

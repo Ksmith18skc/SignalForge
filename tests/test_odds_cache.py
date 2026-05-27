@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models import OddsSnapshot
-from app.providers.odds_api import OddsApiRateLimited
+from app.providers.odds_api import OddsApiError, OddsApiRateLimited
 from app.services import odds_cache
 from app.services.odds_cache import (
     MARKET_TYPE_EVENT_ODDS,
@@ -139,14 +139,41 @@ def test_refresh_requests_current_odds_api_mlb_params(db_session) -> None:
 
     assert odds.events_args == [
         (
-            "mlb",
+            "baseball",
             {
                 "league": None,
                 "date_from": "2026-05-25T07:00:00Z",
                 "date_to": "2026-05-26T06:59:59Z",
+                "limit": 200,
             },
         )
     ]
+
+
+def test_refresh_falls_back_from_iso_window_to_date_only(db_session) -> None:
+    class _FallbackOdds:
+        def __init__(self) -> None:
+            self.events_calls: list[tuple[str, dict[str, Any]]] = []
+            self.odds_calls = 0
+
+        async def events(self, sport, **kwargs):
+            self.events_calls.append((sport, dict(kwargs)))
+            if kwargs.get("date_from") and "T" in str(kwargs.get("date_from")):
+                raise OddsApiError("bad request", status_code=400)
+            return _events()
+
+        async def odds(self, event_id):
+            self.odds_calls += 1
+            return _odds_for(event_id)
+
+    odds = _FallbackOdds()
+
+    result = asyncio.run(refresh_mlb_odds_cache(db_session, odds, _games(), game_date="2026-05-25"))
+
+    assert result.strategy_attempted[:2] == ["full_iso_window", "date_only_window"]
+    assert result.strategy_successful == "date_only_window"
+    assert odds.events_calls[0][1]["date_from"].endswith("Z")
+    assert odds.events_calls[1][1]["date_from"] == "2026-05-25"
 
 
 def test_consecutive_refreshes_within_ttl_reuse_cache(db_session) -> None:
@@ -292,7 +319,7 @@ def test_provider_retries_429_then_raises_rate_limited(monkeypatch) -> None:
             return {}
 
     class _Client:
-        def __init__(self, timeout):
+        def __init__(self, timeout, **kwargs):
             self.timeout = timeout
 
         async def __aenter__(self):

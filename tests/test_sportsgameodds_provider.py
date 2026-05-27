@@ -123,6 +123,20 @@ def test_sgo_normalize_event_odds_includes_totals_and_pitcher_props() -> None:
     assert prop_lines[0].player_name == "Gerrit Cole"
 
 
+def test_sgo_mlb_events_params_validate_and_include_odds_filters() -> None:
+    provider = SportsGameOddsProvider("key", "https://api.sportsgameodds.com/v2")
+
+    params = provider.mlb_events_params(limit=75, cursor="abc123")
+
+    assert params == {
+        "leagueID": "MLB",
+        "oddsAvailable": "true",
+        "includeAltLines": "true",
+        "limit": 75,
+        "cursor": "abc123",
+    }
+
+
 def test_refresh_falls_back_to_sgo_for_missing_props(db_session, monkeypatch) -> None:
     odds_cache.reset_metrics()
 

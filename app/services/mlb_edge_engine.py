@@ -42,7 +42,12 @@ ODDS_MLB_SPORT = odds_cache.ODDS_MLB_SPORT
 ODDS_MLB_LEAGUE = odds_cache.ODDS_MLB_LEAGUE
 
 
-async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> dict[str, Any]:
+async def run_daily_mlb_edges(
+    db: Session,
+    *,
+    game_date: str | None = None,
+    force_stale: bool = False,
+) -> dict[str, Any]:
     from app.services.mlb_performance import arizona_today
 
     settings = get_settings()
@@ -70,7 +75,7 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         db, odds, games, game_date=card_date, force=False,
     )
     match_results, unmatched_events = odds_cache.matches_for_games(
-        db, games, game_date=card_date, fallback_stale=False,
+        db, games, game_date=card_date, fallback_stale=force_stale,
     )
     matches_by_game: dict[int, MatchResult] = {m.game_pk: m for m in match_results}
     diagnostics = _initial_diagnostics(db, games, match_results, card_date=card_date)
@@ -78,6 +83,7 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         games
         and diagnostics["fresh_odds_snapshots_found"] == 0
         and (diagnostics["markets_matched"] > 0 or not diagnostics["events_list_fresh"])
+        and not force_stale
     ):
         reason = "Odds cache stale; refresh required before edge scan."
         logger.warning("%s diagnostics=%s refresh=%s", reason, diagnostics, refresh.as_dict())
@@ -123,10 +129,10 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
             diagnostics["skipped_missing_odds"] += 1
             continue
         state = odds_cache.event_odds_cache_state(db, match.matched_event_id)
-        if not state.get("fresh"):
+        if not state.get("fresh") and not force_stale:
             diagnostics["skipped_stale_odds"] += 1
             continue
-        payload = _resolve_cached_payload(db, match)
+        payload = _resolve_cached_payload(db, match, fallback_stale=force_stale)
         if payload is None:
             diagnostics["skipped_missing_odds"] += 1
             continue
@@ -442,6 +448,8 @@ async def _pitcher_prop_for_game(
 def _resolve_cached_payload(
     db: Session,
     match: MatchResult | None,
+    *,
+    fallback_stale: bool = False,
 ) -> dict[str, Any] | None:
     """Pure cache read — never touches the live API.
 
@@ -456,7 +464,11 @@ def _resolve_cached_payload(
                 match.game_pk, match.reason,
             )
         return None
-    return odds_cache.get_cached_event_odds(db, match.matched_event_id, fallback_stale=False)
+    return odds_cache.get_cached_event_odds(
+        db,
+        match.matched_event_id,
+        fallback_stale=fallback_stale,
+    )
 
 
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:

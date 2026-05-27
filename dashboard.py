@@ -2230,7 +2230,7 @@ def fetch_odds_cache() -> dict[str, Any]:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_odds_providers() -> dict[str, Any]:
-    return safe_get("/mlb/debug/odds-providers", default={})
+    return safe_get("/odds/providers/health", default={})
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -3419,7 +3419,7 @@ with tab_odds:
 
         st.markdown("### Provider diagnostics")
         diag_cols = st.columns(3)
-        diag_cols[0].metric("Last provider", providers_diag.get("last_provider_used") or DASH)
+        diag_cols[0].metric("Active provider", providers_diag.get("last_provider_used") or providers_diag.get("provider") or DASH)
         diag_cols[1].metric("Primary events", primary_diag.get("events_fetched", 0))
         diag_cols[2].metric("Backup events", backup_diag.get("events_fetched", 0))
 
@@ -3427,6 +3427,7 @@ with tab_odds:
             "<div class='sf-card'>"
             + f"<div class='sf-card-row'><span class='k'>Primary:</span>{primary_diag.get('name') or 'Odds-API'}"
             + f" · enabled={bool(primary_diag.get('enabled'))}"
+            + f" · api key={'yes' if primary_diag.get('api_key_present', True) else 'no'}"
             + f" · last success={fmt_dt(primary_diag.get('last_success_at'))}"
             + "</div>"
             + f"<div class='sf-card-row'><span class='k'>Totals found:</span>{primary_diag.get('totals_found', 0)}"
@@ -3435,6 +3436,8 @@ with tab_odds:
             + f"<div class='sf-card-row'><span class='k'>Last error:</span>"
             + f"{primary_diag.get('last_error') or DASH}"
             + f" · at {fmt_dt(primary_diag.get('last_error_at'))}"
+            + f" · cooldown until {fmt_dt(primary_diag.get('cooldown_until'))}"
+            + f" · strategy {primary_diag.get('last_successful_strategy') or DASH}"
             + "</div>"
             + "</div>",
             unsafe_allow_html=True,
@@ -3444,6 +3447,7 @@ with tab_odds:
             "<div class='sf-card'>"
             + f"<div class='sf-card-row'><span class='k'>Backup:</span>{backup_diag.get('name') or 'SportsGameOdds'}"
             + f" · enabled={bool(backup_diag.get('enabled'))}"
+            + f" · api key={'yes' if backup_diag.get('api_key_present', True) else 'no'}"
             + f" · last success={fmt_dt(backup_diag.get('last_success_at'))}"
             + "</div>"
             + f"<div class='sf-card-row'><span class='k'>Totals found:</span>{backup_diag.get('totals_found', 0)}"
@@ -3452,6 +3456,8 @@ with tab_odds:
             + f"<div class='sf-card-row'><span class='k'>Last error:</span>"
             + f"{backup_diag.get('last_error') or DASH}"
             + f" · at {fmt_dt(backup_diag.get('last_error_at'))}"
+            + f" · cooldown until {fmt_dt(backup_diag.get('cooldown_until'))}"
+            + f" · strategy {backup_diag.get('last_successful_strategy') or DASH}"
             + "</div>"
             + "</div>",
             unsafe_allow_html=True,
@@ -3461,6 +3467,14 @@ with tab_odds:
         if recent_errors:
             st.markdown("**Recent provider errors**")
             st.code("\n".join(str(err) for err in recent_errors[-5:]), language="text")
+
+        if backup_diag.get("cooldown_until"):
+            st.warning(f"SportsGameOdds rate-limited until {fmt_dt(backup_diag.get('cooldown_until'))}")
+
+        if odds_cache_status in {"stale", "empty"}:
+            st.warning(
+                "Odds refresh failed or cache is stale. The edge scan will refuse stale odds unless you opt into a force-stale run."
+            )
 
         action_cols2 = st.columns([1, 1, 1, 4])
         with action_cols2[0]:

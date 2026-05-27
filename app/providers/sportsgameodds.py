@@ -4,24 +4,51 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+import os
+from datetime import datetime, timedelta
 from typing import Any
 
 import httpx
 
+from app.config import get_settings
+from app.utils.redaction import redact_headers, redact_url, sanitize_text
+
 logger = logging.getLogger(__name__)
+
+_cooldown_until: datetime | None = None
 
 
 class SportsGameOddsError(RuntimeError):
     """Raised for SportsGameOdds configuration or upstream failures."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        sanitized_url: str | None = None,
+        error_body_preview: str | None = None,
+    ) -> None:
+        super().__init__(sanitize_text(message))
+        self.status_code = status_code
+        self.sanitized_url = sanitized_url
+        self.error_body_preview = error_body_preview
+
 
 class SportsGameOddsRateLimited(SportsGameOddsError):
     """Raised when SportsGameOdds returns HTTP 429."""
 
-    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        cooldown_until: datetime | None = None,
+        sanitized_url: str | None = None,
+    ) -> None:
+        super().__init__(message, status_code=429, sanitized_url=sanitized_url)
         self.retry_after = retry_after
+        self.cooldown_until = cooldown_until
 
 
 class SportsGameOddsProvider:
@@ -42,6 +69,40 @@ class SportsGameOddsProvider:
             raise SportsGameOddsError("SIGNALFORGE_SGO_API_KEY is not configured")
         return {"x-api-key": self._api_key}
 
+    def preview_events_request(
+        self,
+        *,
+        params: dict[str, Any] | None = None,
+        include_auth: bool = True,
+    ) -> dict[str, Any]:
+        request_params = dict(params or {})
+        request_url = httpx.URL(f"{self._base_url}/events", params=request_params)
+        return {
+            "method": "GET",
+            "url": redact_url(str(request_url)),
+            "params": request_params,
+            "headers": redact_headers(self._auth_headers()) if include_auth else {},
+        }
+
+    def mlb_events_params(
+        self,
+        *,
+        limit: int | None = None,
+        cursor: str | None = None,
+        odds_available: bool = True,
+        include_alt_lines: bool = True,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "leagueID": self._validate_mlb_league("MLB"),
+            "oddsAvailable": "true" if odds_available else "false",
+            "includeAltLines": "true" if include_alt_lines else "false",
+        }
+        if limit is not None:
+            params["limit"] = self._validate_page_size(limit)
+        if cursor:
+            params["cursor"] = str(cursor)
+        return params
+
     async def _get(
         self,
         path: str,
@@ -49,18 +110,37 @@ class SportsGameOddsProvider:
         *,
         max_retries: int = 1,
     ) -> Any:
+        _raise_if_in_cooldown(path)
         query = dict(params or {})
         delay = 1.0
         last_retry_after: float | None = None
+        last_url: str | None = None
         for attempt in range(max_retries + 1):
-            async with httpx.AsyncClient(timeout=self._timeout) as client:
+            limits = httpx.Limits(max_connections=2, max_keepalive_connections=1)
+            try:
+                client_factory = httpx.AsyncClient(timeout=self._timeout, limits=limits)
+            except TypeError:
+                client_factory = httpx.AsyncClient(timeout=self._timeout)
+            async with client_factory as client:
                 response = await client.get(
                     f"{self._base_url}{path}",
                     params=query,
                     headers=self._auth_headers(),
                 )
+            last_url = _response_url(response, fallback=f"{self._base_url}{path}")
             if response.status_code != 429:
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    body = _response_text(response)
+                    raise SportsGameOddsError(
+                        (
+                            f"SportsGameOdds HTTP {response.status_code} on {path}; "
+                            f"url={redact_url(last_url)}; headers={redact_headers(self._auth_headers())}; "
+                            f"body={sanitize_text(body, limit=300)}"
+                        ),
+                        status_code=response.status_code,
+                        sanitized_url=redact_url(last_url),
+                        error_body_preview=sanitize_text(body, limit=500),
+                    )
                 return response.json()
             retry_after_raw = response.headers.get("Retry-After")
             try:
@@ -76,30 +156,36 @@ class SportsGameOddsProvider:
             )
             await asyncio.sleep(sleep_for)
             delay *= 2
+        cooldown_until = _set_cooldown(last_retry_after)
         raise SportsGameOddsRateLimited(
             f"SportsGameOdds returned 429 on {path} after {max_retries + 1} attempts",
             retry_after=last_retry_after,
+            cooldown_until=cooldown_until,
+            sanitized_url=redact_url(last_url),
         )
 
     async def fetch_mlb_events_with_odds(self, game_date: str) -> list[dict[str, Any]]:
         """Return MLB events with odds data filtered to the requested date."""
-        payload = await self._get(
-            "/events",
-            {
-                "leagueID": "MLB",
-                "oddsAvailable": "true",
-                "limit": 200,
-            },
-        )
-        if not isinstance(payload, dict):
-            raise SportsGameOddsError("Unexpected SportsGameOdds response")
-        if payload.get("success") is False:
-            raise SportsGameOddsError(str(payload.get("error") or "SGO request failed"))
-        data = payload.get("data") or []
-        if not isinstance(data, list):
-            return []
+        settings = get_settings()
+        page_limit = max(1, min(int(settings.sgo_page_limit or 200), 200))
+        max_pages = max(1, min(int(settings.sgo_max_pages or 3), 5))
+        cursor: str | None = None
+        events: list[dict[str, Any]] = []
+        for _page in range(max_pages):
+            params = self.mlb_events_params(limit=page_limit, cursor=cursor)
+            payload = await self._get("/events", params)
+            if not isinstance(payload, dict):
+                raise SportsGameOddsError("Unexpected SportsGameOdds response")
+            if payload.get("success") is False:
+                raise SportsGameOddsError(str(payload.get("error") or "SGO request failed"))
+            data = payload.get("data") or []
+            if isinstance(data, list):
+                events.extend(event for event in data if isinstance(event, dict))
+            cursor = _next_cursor(payload)
+            if not cursor:
+                break
         return [
-            event for event in data
+            event for event in events
             if _event_date(event) == game_date
         ]
 
@@ -206,6 +292,23 @@ class SportsGameOddsProvider:
             "source": "SportsGameOdds",
         }
 
+    @staticmethod
+    def _validate_mlb_league(league_id: str) -> str:
+        league = str(league_id or "").strip().upper()
+        if league != "MLB":
+            raise SportsGameOddsError("SportsGameOdds MLB requests must use leagueID=MLB")
+        return league
+
+    @staticmethod
+    def _validate_page_size(limit: int) -> int:
+        try:
+            value = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise SportsGameOddsError("limit must be an integer") from exc
+        if value < 1:
+            raise SportsGameOddsError("limit must be >= 1")
+        return min(value, 200)
+
 
 def _event_start_time(event: dict[str, Any]) -> str | None:
     status = event.get("status") or {}
@@ -214,6 +317,80 @@ def _event_start_time(event: dict[str, Any]) -> str | None:
         or event.get("startsAt")
         or event.get("startTime")
     )
+
+
+def cooldown_until() -> datetime | None:
+    return _cooldown_until
+
+
+def reset_cooldown() -> None:
+    global _cooldown_until
+    _cooldown_until = None
+
+
+def _raise_if_in_cooldown(path: str) -> None:
+    until = _cooldown_until
+    if until is None:
+        return
+    now = datetime.utcnow()
+    if until <= now:
+        reset_cooldown()
+        return
+    retry_after = max((until - now).total_seconds(), 0.0)
+    raise SportsGameOddsRateLimited(
+        f"SportsGameOdds cooldown active until {until.isoformat()}",
+        retry_after=retry_after,
+        cooldown_until=until,
+        sanitized_url=path,
+    )
+
+
+def _set_cooldown(retry_after: float | None) -> datetime:
+    global _cooldown_until
+    seconds = retry_after if retry_after and retry_after > 0 else _default_cooldown_seconds()
+    _cooldown_until = datetime.utcnow() + timedelta(seconds=float(seconds))
+    return _cooldown_until
+
+
+def _default_cooldown_seconds() -> int:
+    raw = os.getenv("SPORTS_GAME_ODDS_COOLDOWN_SECONDS")
+    if raw:
+        try:
+            return max(int(raw), 1)
+        except ValueError:
+            pass
+    return max(int(get_settings().sports_game_odds_cooldown_seconds or 300), 1)
+
+
+def _next_cursor(payload: dict[str, Any]) -> str | None:
+    for key in ("nextCursor", "next_cursor", "cursor"):
+        value = payload.get(key)
+        if value:
+            return str(value)
+    meta = payload.get("meta") or payload.get("metadata") or {}
+    if isinstance(meta, dict):
+        for key in ("nextCursor", "next_cursor", "cursor"):
+            value = meta.get(key)
+            if value:
+                return str(value)
+    return None
+
+
+def _response_url(response: Any, *, fallback: str) -> str:
+    url = getattr(response, "url", None)
+    if url:
+        return str(url)
+    request = getattr(response, "request", None)
+    if request is not None and getattr(request, "url", None):
+        return str(request.url)
+    return fallback
+
+
+def _response_text(response: Any) -> str:
+    try:
+        return str(response.text)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _event_date(event: dict[str, Any]) -> str | None:

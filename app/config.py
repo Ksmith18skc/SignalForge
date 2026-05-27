@@ -90,6 +90,9 @@ class Settings(BaseSettings):
     sgo_api_key: str | None = None
     sgo_base_url: str = "https://api.sportsgameodds.com/v2"
     sgo_enabled: bool = False
+    sports_game_odds_cooldown_seconds: int = 300
+    sgo_page_limit: int = 200
+    sgo_max_pages: int = 3
     mlb_stats_enabled: bool = True
     weather_api_key: str | None = None
     weather_api_base_url: str = "https://api.weatherapi.com/v1"

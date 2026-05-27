@@ -36,6 +36,11 @@ from app.services.ingestion_health import get_ingestion_health
 from app.services.odds_cache import get_odds_cache_health
 from app.providers.mlb_stats_api import MlbStatsApiError, MlbStatsApiProvider
 from app.providers.odds_api import OddsApiError, OddsApiProvider
+from app.providers.sportsgameodds import (
+    SportsGameOddsError,
+    SportsGameOddsProvider,
+    SportsGameOddsRateLimited,
+)
 from app.providers.pybaseball_provider import PyBaseballError, PyBaseballProvider
 from app.providers.weather_api import WeatherApiError, WeatherApiProvider
 from app.schemas import (
@@ -63,6 +68,7 @@ from app.services.mlb_edge_engine import (
 )
 from app.services.mlb_market_validation import validation_report
 from app.services.odds_cache import MLB_PITCHER_PROPS_TTL, MLB_TOTALS_TTL
+from app.services.odds_cache import get_odds_provider_health
 from app.services.mlb_performance import (
     arizona_today,
     arizona_window,
@@ -81,6 +87,7 @@ from app.services.pnl_alerts import refresh_pnl_alerts
 from app.services.position_matcher import find_missed_opportunities
 from app.services.signal_attribution import summarize_signal_attribution
 from app.services.wallet_sync import ensure_pnl_demo_data_if_needed, sync_personal_wallets
+from app.utils.redaction import redact_headers, redact_url, sanitize_text
 from app.storage.pnl_store import (
     MyPosition,
     PnlAlert,
@@ -474,14 +481,22 @@ def _odds_provider() -> OddsApiProvider:
 
 def _odds_error(exc: Exception) -> HTTPException:
     if isinstance(exc, OddsApiError):
-        return HTTPException(status_code=400, detail=str(exc))
+        return HTTPException(
+            status_code=getattr(exc, "status_code", None) or 400,
+            detail=sanitize_text(str(exc), limit=500),
+        )
+    if isinstance(exc, SportsGameOddsError):
+        return HTTPException(
+            status_code=getattr(exc, "status_code", None) or 502,
+            detail=sanitize_text(str(exc), limit=500),
+        )
     if hasattr(exc, "response"):
         response = exc.response  # type: ignore[attr-defined]
         return HTTPException(
             status_code=response.status_code,
-            detail=response.text[:500],
+            detail=sanitize_text(response.text, limit=500),
         )
-    return HTTPException(status_code=502, detail=f"{type(exc).__name__}: {exc}")
+    return HTTPException(status_code=502, detail=sanitize_text(f"{type(exc).__name__}: {exc}", limit=500))
 
 
 @router.get("/odds/sports")
@@ -596,6 +611,187 @@ async def odds_movements(
         return await _odds_provider().odds_movements(event_id, bookmaker, market, market_line)
     except Exception as exc:  # noqa: BLE001
         raise _odds_error(exc) from exc
+
+
+def _odds_provider_health_payload(db: Session) -> dict[str, object]:
+    s = get_settings()
+    provider_health = get_odds_provider_health(db)
+    cache_health = get_odds_cache_health()
+
+    primary = provider_health.get("primary") or {}
+    backup = provider_health.get("backup") or {}
+    primary_payload = {
+        "provider": primary.get("provider") or "Odds-API",
+        "enabled": bool(primary.get("enabled", s.has_odds_api_credentials())),
+        "api_key_present": bool(s.odds_api_key),
+        "last_success_at": primary.get("last_success_at"),
+        "last_error": primary.get("last_error"),
+        "cooldown_until": primary.get("cooldown_until"),
+        "status": primary.get("status") or ("disabled" if not s.has_odds_api_credentials() else "unknown"),
+        "last_refresh_event_count": primary.get("last_refresh_event_count", 0),
+        "refresh_errors": primary.get("refresh_errors", 0),
+        "hourly_call_rate": cache_health.hourly_call_rate(),
+        "last_status_code": primary.get("last_status_code"),
+        "last_successful_strategy": primary.get("last_successful_strategy"),
+        "recent_failures": primary.get("recent_failures", 0),
+    }
+    backup_payload = {
+        "provider": backup.get("provider") or "SportsGameOdds",
+        "enabled": bool(backup.get("enabled", s.sgo_enabled)),
+        "api_key_present": bool(s.sgo_api_key),
+        "last_success_at": backup.get("last_success_at"),
+        "last_error": backup.get("last_error"),
+        "cooldown_until": backup.get("cooldown_until"),
+        "status": backup.get("status") or ("disabled" if not s.sgo_enabled else "unknown"),
+        "last_refresh_event_count": backup.get("last_refresh_event_count", 0),
+        "refresh_errors": backup.get("refresh_errors", 0),
+        "hourly_call_rate": cache_health.hourly_call_rate(),
+        "last_status_code": backup.get("last_status_code"),
+        "last_successful_strategy": backup.get("last_successful_strategy"),
+        "recent_failures": backup.get("recent_failures", 0),
+    }
+    return {
+        "provider": provider_health.get("last_provider_used"),
+        "last_provider_used": provider_health.get("last_provider_used"),
+        "status": provider_health.get("status") or "unknown",
+        "last_errors": provider_health.get("last_errors", []),
+        "hourly_call_rate": cache_health.hourly_call_rate(),
+        "primary": primary_payload,
+        "backup": backup_payload,
+        "providers": [primary_payload, backup_payload],
+    }
+
+
+def _self_test_failure_reason(exc: Exception) -> str:
+    status = getattr(exc, "status_code", None)
+    if status == 400:
+        return "bad_request"
+    if status == 401:
+        return "unauthorized"
+    if status == 403:
+        return "forbidden"
+    if status == 429:
+        return "rate_limited"
+    if isinstance(exc, (OddsApiError, SportsGameOddsError, SportsGameOddsRateLimited)):
+        return "upstream_error"
+    return "unexpected_error"
+
+
+def _self_test_suggestion(reason: str) -> str:
+    if reason == "bad_request":
+        return "Verify sport mapping, date window format, and endpoint parameters."
+    if reason == "unauthorized":
+        return "Verify API key placement and credential configuration."
+    if reason == "forbidden":
+        return "Verify plan access and account restrictions."
+    if reason == "rate_limited":
+        return "Respect Retry-After or provider cooldown before retrying."
+    return "Inspect the sanitized response body and provider health state."
+
+
+async def _probe_provider_call(
+    *,
+    provider: str,
+    endpoint: str,
+    sanitized_url: str,
+    call,
+) -> dict[str, object]:
+    started = time.perf_counter()
+    try:
+        await call()
+        status_code = 200
+        ok = True
+        parsed_reason = "ok"
+        error_body_preview = None
+        suggested_fix = None
+    except Exception as exc:  # noqa: BLE001
+        status_code = int(getattr(exc, "status_code", None) or 500)
+        ok = False
+        parsed_reason = _self_test_failure_reason(exc)
+        error_body_preview = sanitize_text(
+            getattr(exc, "error_body_preview", None) or str(exc),
+            limit=500,
+        )
+        suggested_fix = _self_test_suggestion(parsed_reason)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return {
+        "provider": provider,
+        "endpoint": endpoint,
+        "sanitized_url": sanitized_url,
+        "status_code": status_code,
+        "ok": ok,
+        "parsed_reason": parsed_reason,
+        "suggested_fix": suggested_fix,
+        "error_body_preview": error_body_preview,
+        "provider_response_time_ms": elapsed_ms,
+    }
+
+
+@router.get("/odds/providers/health")
+def odds_providers_health(db: Session = Depends(get_db)) -> dict[str, object]:
+    return _odds_provider_health_payload(db)
+
+
+@router.get("/odds/providers/self-test")
+async def odds_providers_self_test(db: Session = Depends(get_db)) -> dict[str, object]:
+    from app.services import odds_cache as odds_cache_module
+
+    s = get_settings()
+    odds = OddsApiProvider(s.odds_api_key, s.odds_api_base_url, s.odds_bookmakers)
+    sgo = SportsGameOddsProvider(s.sgo_api_key, s.sgo_base_url)
+
+    from app.services.mlb_performance import arizona_today
+
+    card_date = arizona_today()
+    start_utc, end_utc = odds_cache_module.odds_api_event_window(card_date)
+
+    results = [
+        await _probe_provider_call(
+            provider="Odds-API",
+            endpoint="/events",
+            sanitized_url=odds.preview_events_request("mlb", limit=1, include_auth=False)["url"],
+            call=lambda: odds.events("mlb", limit=1),
+        ),
+        await _probe_provider_call(
+            provider="Odds-API",
+            endpoint="/events",
+            sanitized_url=odds.preview_events_request("mlb", include_auth=False)["url"],
+            call=lambda: odds.events("mlb"),
+        ),
+        await _probe_provider_call(
+            provider="Odds-API",
+            endpoint="/events",
+            sanitized_url=odds.preview_events_request(
+                "mlb",
+                date_from=start_utc,
+                date_to=end_utc,
+                include_auth=False,
+            )["url"],
+            call=lambda: odds.events("mlb", date_from=start_utc, date_to=end_utc),
+        ),
+        await _probe_provider_call(
+            provider="SportsGameOdds",
+            endpoint="/events",
+            sanitized_url=sgo.preview_events_request(params={"limit": 1}, include_auth=False)["url"],
+            call=lambda: sgo._get("/events", {"limit": 1}),  # noqa: SLF001 - probe only
+        ),
+        await _probe_provider_call(
+            provider="SportsGameOdds",
+            endpoint="/events",
+            sanitized_url=sgo.preview_events_request(
+                params={"oddsAvailable": "true", "limit": 1},
+                include_auth=False,
+            )["url"],
+            call=lambda: sgo._get("/events", {"oddsAvailable": "true", "limit": 1}),  # noqa: SLF001 - probe only
+        ),
+        await _probe_provider_call(
+            provider="SportsGameOdds",
+            endpoint="/events",
+            sanitized_url=sgo.preview_events_request(params=sgo.mlb_events_params(limit=1), include_auth=False)["url"],
+            call=lambda: sgo._get("/events", sgo.mlb_events_params(limit=1)),  # noqa: SLF001 - probe only
+        ),
+    ]
+    return {"game_date": card_date, "results": results}
 
 
 # ---------------------------- MLB StatsAPI ----------------------------------
@@ -1069,10 +1265,11 @@ def mlb_edges_today(
 @router.post("/mlb/edges/run")
 async def mlb_edges_run(
     game_date: str | None = None,
+    force_stale: bool = False,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
     try:
-        return await run_daily_mlb_edges(db, game_date=game_date)
+        return await run_daily_mlb_edges(db, game_date=game_date, force_stale=force_stale)
     except Exception as exc:  # noqa: BLE001
         db.rollback()
         logger.exception("MLB edge run failed")
@@ -1528,11 +1725,9 @@ def mlb_debug_market_validation() -> dict[str, object]:
 
 
 @router.get("/mlb/debug/odds-providers")
-def mlb_debug_odds_providers() -> dict[str, object]:
+def mlb_debug_odds_providers(db: Session = Depends(get_db)) -> dict[str, object]:
     """Primary/backup odds provider status and fallback telemetry."""
-    from app.services import odds_cache
-
-    return odds_cache.get_odds_provider_health()
+    return _odds_provider_health_payload(db)
 
 
 @router.post("/mlb/debug/odds-cache/refresh")

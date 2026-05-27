@@ -774,6 +774,25 @@ class OddsSnapshot(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
+class ProviderHealthState(Base):
+    """Persisted provider status used for cooldowns and operator diagnostics."""
+
+    __tablename__ = "provider_health_state"
+
+    provider: Mapped[str] = mapped_column(String(64), primary_key=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, index=True)
+    recent_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_successful_strategy: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    last_refresh_event_count: Mapped[int] = mapped_column(Integer, default=0)
+    refresh_errors: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, index=True)
+
+
 class MlbDailyCard(Base):
     __tablename__ = "mlb_daily_cards"
 
