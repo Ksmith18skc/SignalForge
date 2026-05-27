@@ -2570,7 +2570,7 @@ with st.sidebar:
 
     st.markdown("**Signal score**")
     score_min, score_max = st.slider(
-        "Score", min_value=0, max_value=100, value=(60, 100), step=5,
+        "Score", min_value=0, max_value=100, value=(0, 100), step=5,
         label_visibility="collapsed",
     )
 
@@ -2592,7 +2592,7 @@ with st.sidebar:
     # Off by default — Pass-action edges should not dominate the terminal.
     # Flip on for full-slate inspection in MLB Terminal and Wallet Flow.
     show_pass_candidates = st.checkbox(
-        "Show pass candidates in terminal", value=False
+        "Show pass candidates in MLB terminal", value=False
     )
     debug_mode = st.checkbox("Show raw JSON in Debug tab", value=True)
 
@@ -2622,8 +2622,6 @@ def apply_filters(positions: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     out = []
     for p in positions:
         score = _as_float(p.get("score")) or 0.0
-        if not show_pass_candidates and score < 65:
-            continue
         if not (score_min <= score <= score_max):
             continue
         if selected_trader != "(all)" and p.get("trader_nickname") != selected_trader:
@@ -2639,6 +2637,7 @@ def apply_filters(positions: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 filtered_positions = apply_filters(positions_all)
+wallet_filters_hide_current = bool(positions_all and not filtered_positions)
 
 
 # =============================================================================
@@ -2724,6 +2723,7 @@ if stale_positions_hidden or stale_alerts_hidden:
 
 if not mlb_edges_all and odds_cache_status in {"stale", "empty"}:
     st.warning("Odds cache stale; refresh required before edge scan.")
+mlb_blocked_by_stale_odds = not mlb_edges_all and odds_cache_status in {"stale", "empty"}
 
 
 # Header metric strip — the 7 numbers an operator wants in one glance.
@@ -2840,7 +2840,11 @@ with tab_command:
         else:
             render_empty_state(
                 "NO ACTIONABLE OPPORTUNITIES",
-                "System is monitoring. Check MLB Terminal for watchlist candidates.",
+                (
+                    "Odds cache stale; refresh odds before running the edge scan."
+                    if mlb_blocked_by_stale_odds
+                    else "System is monitoring. Check MLB Terminal for watchlist candidates."
+                ),
                 actions=[
                     ("Run MLB edge scan", action_run_mlb_edge_scan),
                     ("Refresh odds cache", action_refresh_odds_cache),
@@ -2862,7 +2866,11 @@ with tab_command:
         else:
             render_empty_state(
                 "MARKET SILENT",
-                f"No watchlist candidates in the {SCORE_ACTIONABLE_MIN}-{SCORE_STRONG_MIN - 1} band right now.",
+                (
+                    "Odds cache stale; refresh odds before running the edge scan."
+                    if mlb_blocked_by_stale_odds
+                    else f"No watchlist candidates in the {SCORE_ACTIONABLE_MIN}-{SCORE_STRONG_MIN - 1} band right now."
+                ),
                 actions=[("Refresh odds cache", action_refresh_odds_cache)],
             )
 
@@ -2873,8 +2881,16 @@ with tab_command:
                 render_wallet_card(sig)
         else:
             render_empty_state(
-                "No current-card wallet flow found.",
-                f"No {selected_card_date} wallet flow meets the live-card filters.",
+                (
+                    "Current-card wallet flow hidden by filters."
+                    if wallet_filters_hide_current
+                    else "No current-card wallet flow found."
+                ),
+                (
+                    f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
+                    if wallet_filters_hide_current
+                    else f"No {selected_card_date} wallet flow meets the live-card filters."
+                ),
             )
 
     with right:
@@ -2961,9 +2977,13 @@ with tab_mlb:
                 st.markdown(f"<h3>{title}{stale_suffix}</h3>", unsafe_allow_html=True)
                 if not rows:
                     body = (
+                        "Odds cache stale; refresh odds before running the edge scan."
+                        if mlb_blocked_by_stale_odds
+                        else (
                         f"No saved edges for {requested_date_label}. Run the scan to populate."
                         if is_stale_card
                         else "No qualifying edges in this band for today's slate."
+                        )
                     )
                     render_empty_state("NO QUALIFYING EDGES", body)
                 else:
@@ -2978,7 +2998,14 @@ with tab_mlb:
         )
 
     st.markdown("### Score Distribution")
-    render_score_distribution(mlb_edges_all)
+    if mlb_blocked_by_stale_odds:
+        render_empty_state(
+            "NO SCORE DATA",
+            "Odds cache stale; refresh odds before running the edge scan.",
+            actions=[("Refresh odds cache", action_refresh_odds_cache)],
+        )
+    else:
+        render_score_distribution(mlb_edges_all)
 
     st.markdown("### All Edges")
     if mlb_edges_all:
@@ -3034,8 +3061,16 @@ with tab_mlb:
     else:
         render_empty_state(
             "NO MLB EDGES",
-            "Run the MLB edge scan. If still empty, check the Odds Cache tab.",
-            actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
+            (
+                "Odds cache stale; refresh odds before running the edge scan."
+                if mlb_blocked_by_stale_odds
+                else "Run the MLB edge scan. If still empty, check the Odds Cache tab."
+            ),
+            actions=[
+                ("Refresh odds cache", action_refresh_odds_cache)
+                if mlb_blocked_by_stale_odds
+                else ("Run MLB edge scan", action_run_mlb_edge_scan)
+            ],
         )
 
     st.markdown("### Data Quality")
@@ -3073,8 +3108,16 @@ with tab_wallet:
             render_wallet_card(pos)
     else:
         render_empty_state(
-            "No current-card wallet flow found.",
-            f"No {selected_card_date} positions match your live-card filters.",
+            (
+                "Current-card wallet flow hidden by filters."
+                if wallet_filters_hide_current
+                else "No current-card wallet flow found."
+            ),
+            (
+                f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
+                if wallet_filters_hide_current
+                else f"No {selected_card_date} positions match your live-card filters."
+            ),
         )
 
     st.markdown(f"### All Positions ({len(filtered_positions)})")
@@ -3116,8 +3159,16 @@ with tab_wallet:
         )
     else:
         render_empty_state(
-            "No current-card wallet flow found.",
-            "Run a wallet scan after today's markets are available.",
+            (
+                "Current-card wallet flow hidden by filters."
+                if wallet_filters_hide_current
+                else "No current-card wallet flow found."
+            ),
+            (
+                f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
+                if wallet_filters_hide_current
+                else "Run a wallet scan after today's markets are available."
+            ),
         )
 
 
