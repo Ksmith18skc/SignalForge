@@ -63,9 +63,6 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         )
         or 0
     )
-    db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
-    db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
-
     # Refresh the centralized odds cache ONCE for this slate. This is the only
     # place we hit Odds-API live — every other consumer reads from
     # odds_snapshots. Concurrent callers coalesce via odds_cache's lock.
@@ -73,9 +70,36 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         db, odds, games, game_date=card_date, force=False,
     )
     match_results, unmatched_events = odds_cache.matches_for_games(
-        db, games, game_date=card_date,
+        db, games, game_date=card_date, fallback_stale=False,
     )
     matches_by_game: dict[int, MatchResult] = {m.game_pk: m for m in match_results}
+    diagnostics = _initial_diagnostics(db, games, match_results, card_date=card_date)
+    if (
+        games
+        and diagnostics["fresh_odds_snapshots_found"] == 0
+        and (diagnostics["markets_matched"] > 0 or not diagnostics["events_list_fresh"])
+    ):
+        reason = "Odds cache stale; refresh required before edge scan."
+        logger.warning("%s diagnostics=%s refresh=%s", reason, diagnostics, refresh.as_dict())
+        return {
+            "date": card_date,
+            "generated_for_date": card_date,
+            "status": "blocked",
+            "reason": reason,
+            "games": len(games),
+            "odds_events": refresh.events_fetched,
+            "events_with_totals": 0,
+            "events_with_pitcher_props": 0,
+            "edges": 0,
+            "snapshots_written": 0,
+            "snapshots_preserved_from_prior_dates": preserved_snapshots,
+            "odds_refresh": refresh.as_dict(),
+            "diagnostics": diagnostics,
+            "daily_card": latest_daily_card(db, card_date=card_date),
+        }
+
+    db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
+    db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
     logger.info(
         "MLB scan summary: games=%d odds_events=%d matched=%d unmatched_games=%d "
         "unmatched_events=%d refresh=%s",
@@ -90,11 +114,22 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
     created_edges: list[MlbEdge] = []
     totals_count = 0
     pitcher_k_count = 0
+    skipped_no_threshold = 0
     for game in games:
         _upsert_game(db, game)
         env = await _environment_for_game(db, weather, game)
         match = matches_by_game.get(int(game["game_pk"]))
+        if match is None or not match.matched_event_id:
+            diagnostics["skipped_missing_odds"] += 1
+            continue
+        state = odds_cache.event_odds_cache_state(db, match.matched_event_id)
+        if not state.get("fresh"):
+            diagnostics["skipped_stale_odds"] += 1
+            continue
         payload = _resolve_cached_payload(db, match)
+        if payload is None:
+            diagnostics["skipped_missing_odds"] += 1
+            continue
         totals_analysis = await _odds_for_game(db, game, payload)
         if totals_analysis.get("book_count") and totals_analysis.get("is_valid", True):
             totals_count += 1
@@ -106,6 +141,8 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
             )
         else:
             for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
+                if (edge_payload.get("score") or 0) < 65:
+                    skipped_no_threshold += 1
                 created_edges.append(_persist_edge(db, edge_payload, card_date))
 
         for pitcher in _pitchers(game):
@@ -142,9 +179,14 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
                 statcast_context=statcast,
                 environment=env,
             ):
+                if (edge_payload.get("score") or 0) < 65:
+                    skipped_no_threshold += 1
                 created_edges.append(_persist_edge(db, edge_payload, card_date))
 
     card = _build_daily_card(db, card_date)
+    diagnostics["prop_snapshots_found"] = pitcher_k_count
+    diagnostics["edges_generated"] = len(created_edges)
+    diagnostics["skipped_no_threshold"] = skipped_no_threshold
     db.commit()
     logger.info(
         "MLB edge run: date=%s games=%d odds_events=%d events_with_totals=%d "
@@ -164,6 +206,7 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
         "snapshots_written": len(created_edges),
         "snapshots_preserved_from_prior_dates": preserved_snapshots,
         "odds_refresh": refresh.as_dict(),
+        "diagnostics": diagnostics,
         "daily_card": _card_to_dict(card),
     }
 
@@ -174,6 +217,41 @@ def latest_daily_card(db: Session, *, card_date: str | None = None) -> dict[str,
         query = query.where(MlbDailyCard.card_date == card_date)
     card = db.scalar(query.order_by(desc(MlbDailyCard.card_date)).limit(1))
     return _card_to_dict(card) if card else None
+
+
+def _initial_diagnostics(
+    db: Session,
+    games: list[dict[str, Any]],
+    match_results: list[MatchResult],
+    *,
+    card_date: str,
+) -> dict[str, Any]:
+    matched = [m for m in match_results if m.matched_event_id]
+    events_state = odds_cache.events_list_cache_state(db, game_date=card_date)
+    fresh_odds = 0
+    stale_odds = 0
+    missing_odds = 0
+    for match in matched:
+        state = odds_cache.event_odds_cache_state(db, match.matched_event_id or "")
+        if state["state"] == "fresh":
+            fresh_odds += 1
+        elif state["state"] == "stale":
+            stale_odds += 1
+        else:
+            missing_odds += 1
+    return {
+        "mlb_games_today": len(games),
+        "events_list_fresh": bool(events_state.get("fresh")),
+        "events_list_age_minutes": events_state.get("age_minutes"),
+        "odds_snapshots_found": fresh_odds + stale_odds,
+        "fresh_odds_snapshots_found": fresh_odds,
+        "prop_snapshots_found": 0,
+        "markets_matched": len(matched),
+        "edges_generated": 0,
+        "skipped_missing_odds": missing_odds + max(len(games) - len(matched), 0),
+        "skipped_stale_odds": stale_odds,
+        "skipped_no_threshold": 0,
+    }
 
 
 def edges_for_date(db: Session, *, card_date: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -378,7 +456,7 @@ def _resolve_cached_payload(
                 match.game_pk, match.reason,
             )
         return None
-    return odds_cache.get_cached_event_odds(db, match.matched_event_id)
+    return odds_cache.get_cached_event_odds(db, match.matched_event_id, fallback_stale=False)
 
 
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:

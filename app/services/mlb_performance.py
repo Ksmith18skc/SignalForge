@@ -10,31 +10,20 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.models import MlbEdge, MlbFinalScore, MlbGame
+from app.services.card_date import TZ_ARIZONA
 
 
 # ---------------------------------------------------------------------------
 # Timezone helpers — Arizona/MST is the source-of-truth date for grading.
 # ---------------------------------------------------------------------------
 
-try:  # pragma: no cover - import is trivial
-    from zoneinfo import ZoneInfo
-
-    TZ_ARIZONA = ZoneInfo("America/Phoenix")
-except Exception:  # pragma: no cover - zoneinfo is in stdlib on supported versions
-    TZ_ARIZONA = None  # type: ignore[assignment]
-
-
 def arizona_today() -> str:
     """Today's date in Arizona/MST (ISO YYYY-MM-DD)."""
-    if TZ_ARIZONA is None:
-        return date_cls.today().isoformat()
     return datetime.now(TZ_ARIZONA).date().isoformat()
 
 
 def arizona_yesterday() -> str:
     """Yesterday's date in Arizona/MST."""
-    if TZ_ARIZONA is None:
-        return (date_cls.today() - timedelta(days=1)).isoformat()
     return (datetime.now(TZ_ARIZONA).date() - timedelta(days=1)).isoformat()
 
 

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.config import Settings, get_settings
 from app.models import Alert, Signal, Trade, Trader
+from app.services.card_date import parse_slug_date
 from app.utils.dashboard_format import (
     american_to_implied_probability,
     confidence_label,
@@ -66,7 +67,6 @@ class AlertDecision:
     reason: str
 
 
-_SLUG_DATE_RE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})")
 # A "human" market title contains a space or capital letter — anything else
 # (mlb-mia-tor-2026-05-25-spread-home-1pt5) is treated as the raw slug.
 _SLUG_LIKE_RE = re.compile(r"^[a-z0-9.\-]+$")
@@ -76,15 +76,7 @@ def event_date_from_slug(slug: str | None) -> date | None:
     """Extract the calendar date encoded in slugs like
     `mlb-mia-tor-2026-05-25-spread-home-1pt5`. Returns None when the slug
     has no parseable date — never throws."""
-    if not slug:
-        return None
-    m = _SLUG_DATE_RE.search(slug)
-    if not m:
-        return None
-    try:
-        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-    except ValueError:
-        return None
+    return parse_slug_date(slug)
 
 
 def market_expiration_reason(
@@ -802,6 +794,7 @@ def _skipped_alert(
         status="skipped",
         message=message,
         error=f"{decision.tier}: {reason or decision.reason}",
+        generated_for_date=signal.generated_for_date,
         created_at=datetime.utcnow(),
     )
 
@@ -946,6 +939,7 @@ class AlertDispatcher:
                 status="sent" if ok else "failed",
                 message=message,
                 error=err,
+                generated_for_date=signal.generated_for_date,
                 created_at=datetime.utcnow(),
             )
             db.add(alert)

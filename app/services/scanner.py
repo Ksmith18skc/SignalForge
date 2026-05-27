@@ -12,17 +12,18 @@ import threading
 import time
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.db import SessionLocal
-from app.models import Market, Trader
+from app import db as db_module
+from app.models import Alert, Market, Signal, Trader
 from app.providers.falcon import begin_scan_window, end_scan_window, get_falcon_health
 from app.schemas import ScanResult
 from app.services import ingestion, ingestion_health, signal_engine
 from app.services.alerts import AlertDispatcher
+from app.services.card_date import arizona_today, market_card_date
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 _manual_scan_lock = threading.RLock()
 _manual_scan_status: dict[str, object] = {
     "state": "idle",
+    "generated_for_date": None,
     "started_at": None,
     "finished_at": None,
     "result": None,
@@ -37,9 +39,10 @@ _manual_scan_status: dict[str, object] = {
 }
 
 
-async def run_scan_once() -> ScanResult:
+async def run_scan_once(*, card_date: str | None = None) -> ScanResult:
     """One full scan pass. Returns a structured result for the API."""
     started = time.perf_counter()
+    card_date = card_date or arizona_today()
     settings = get_settings()
     providers = ingestion.build_providers()
     dispatcher = AlertDispatcher()
@@ -47,7 +50,7 @@ async def run_scan_once() -> ScanResult:
     # Reset Falcon per-scan counters so /health reflects this pass.
     begin_scan_window(settings.falcon_base_url)
 
-    db: Session = SessionLocal()
+    db: Session = db_module.SessionLocal()
     try:
         traders = list(db.scalars(select(Trader)))
         # 1. Enrich every watched trader.
@@ -88,7 +91,11 @@ async def run_scan_once() -> ScanResult:
             discovered = []
 
         existing_markets = list(db.scalars(select(Market)))
-        refresh_targets = {market.id: market for market in [*discovered, *existing_markets]}
+        refresh_targets = {
+            market.id: market
+            for market in [*discovered, *existing_markets]
+            if market_card_date(market) == card_date
+        }
         for market in refresh_targets.values():
             try:
                 await ingestion.refresh_market(db, market, providers)
@@ -101,10 +108,17 @@ async def run_scan_once() -> ScanResult:
 
         existing_markets = list(db.scalars(select(Market)))
         scanned_markets = len(existing_markets)
+        markets_for_card_date = sum(
+            1 for market in existing_markets if market_card_date(market) == card_date
+        )
+        stale_markets_skipped = max(scanned_markets - markets_for_card_date, 0)
+        preserved_prior_date_rows = _prior_date_row_count(db, card_date)
 
         # 4. Generate signals.
         try:
-            new_signals = await signal_engine.generate_signals(db, providers)
+            new_signals = await signal_engine.generate_signals(
+                db, providers, card_date=card_date
+            )
         except SQLAlchemyError as exc:
             ingestion_health.record_failure(f"generate_signals: {exc}")
             ingestion_health.safe_rollback(db)
@@ -132,6 +146,14 @@ async def run_scan_once() -> ScanResult:
             logger.exception("scan commit failed, rolled back")
             # Return what we know — the scanner loop must not crash.
             return ScanResult(
+                generated_for_date=card_date,
+                markets_seen=scanned_markets,
+                markets_for_card_date=markets_for_card_date,
+                stale_markets_skipped=stale_markets_skipped,
+                positions_written=0,
+                alerts_written=0,
+                preserved_prior_date_rows=preserved_prior_date_rows,
+                reason="scan commit failed",
                 scanned_markets=scanned_markets,
                 scanned_traders=len(traders),
                 new_signals=0,
@@ -139,7 +161,20 @@ async def run_scan_once() -> ScanResult:
                 duration_seconds=round(time.perf_counter() - started, 3),
             )
 
+        reason = "ok"
+        if markets_for_card_date == 0:
+            reason = "no current-card markets found"
+        elif not new_signals:
+            reason = "no current-card wallet flow found"
         return ScanResult(
+            generated_for_date=card_date,
+            markets_seen=scanned_markets,
+            markets_for_card_date=markets_for_card_date,
+            stale_markets_skipped=stale_markets_skipped,
+            positions_written=len(new_signals),
+            alerts_written=new_alerts,
+            preserved_prior_date_rows=preserved_prior_date_rows,
+            reason=reason,
             scanned_markets=scanned_markets,
             scanned_traders=len(traders),
             new_signals=len(new_signals),
@@ -170,7 +205,23 @@ async def run_scan_once() -> ScanResult:
                 logger.info("Falcon: %d/%d calls succeeded (healthy)", f_ok, f_calls)
 
 
-def trigger_manual_scan_background() -> dict[str, object]:
+def _prior_date_row_count(db: Session, card_date: str) -> int:
+    signal_count = db.scalar(
+        select(func.count())
+        .select_from(Signal)
+        .where(Signal.generated_for_date.is_not(None))
+        .where(Signal.generated_for_date != card_date)
+    ) or 0
+    alert_count = db.scalar(
+        select(func.count())
+        .select_from(Alert)
+        .where(Alert.generated_for_date.is_not(None))
+        .where(Alert.generated_for_date != card_date)
+    ) or 0
+    return int(signal_count) + int(alert_count)
+
+
+def trigger_manual_scan_background(*, card_date: str | None = None) -> dict[str, object]:
     """Start one scan in a daemon thread and return immediately.
 
     Render can time out long HTTP requests while Falcon/market enrichment is
@@ -180,9 +231,11 @@ def trigger_manual_scan_background() -> dict[str, object]:
     with _manual_scan_lock:
         if _manual_scan_status.get("state") == "running":
             return scan_status() | {"accepted": False, "message": "scan already running"}
+        card_date = card_date or arizona_today()
         _manual_scan_status.update(
             {
                 "state": "running",
+                "generated_for_date": card_date,
                 "started_at": datetime.utcnow().isoformat(),
                 "finished_at": None,
                 "result": None,
@@ -191,6 +244,7 @@ def trigger_manual_scan_background() -> dict[str, object]:
         )
         thread = threading.Thread(
             target=_run_manual_scan_thread,
+            args=(card_date,),
             name="signalforge-manual-scan",
             daemon=True,
         )
@@ -203,11 +257,11 @@ def scan_status() -> dict[str, object]:
         return dict(_manual_scan_status)
 
 
-def _run_manual_scan_thread() -> None:
+def _run_manual_scan_thread(card_date: str | None = None) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(run_scan_once())
+        result = loop.run_until_complete(run_scan_once(card_date=card_date))
         payload = result.model_dump() if hasattr(result, "model_dump") else result.dict()
         with _manual_scan_lock:
             _manual_scan_status.update(
@@ -215,6 +269,7 @@ def _run_manual_scan_thread() -> None:
                     "state": "finished",
                     "finished_at": datetime.utcnow().isoformat(),
                     "result": payload,
+                    "generated_for_date": payload.get("generated_for_date"),
                     "error": None,
                 }
             )

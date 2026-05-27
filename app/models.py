@@ -24,6 +24,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
+from app.services.card_date import arizona_today
 
 
 def _utcnow() -> datetime:
@@ -145,6 +146,9 @@ class Signal(Base):
     reason: Mapped[str] = mapped_column(Text, default="")
     source: Mapped[str] = mapped_column(String(32), default="Mock")  # Falcon | PolymarketAnalytics | Polycopy | Mock
     score_breakdown: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=dict)
+    generated_for_date: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, index=True, default=arizona_today
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     market: Mapped[Market] = relationship()
@@ -161,6 +165,9 @@ class Alert(Base):
     status: Mapped[str] = mapped_column(String(16), default="pending")  # pending | sent | failed
     message: Mapped[str] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generated_for_date: Mapped[str | None] = mapped_column(
+        String(10), nullable=True, index=True, default=arizona_today
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
     signal: Mapped[Signal | None] = relationship(back_populates="alerts")

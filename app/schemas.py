@@ -88,6 +88,7 @@ class SignalOut(BaseModel):
     reason: str
     source: SignalSource
     score_breakdown: dict[str, Any] | None
+    generated_for_date: str | None = None
     created_at: datetime
 
     # Enriched fields for the dashboard. Populated by the route, not the ORM.
@@ -115,6 +116,7 @@ class AlertOut(BaseModel):
     status: str
     message: str
     error: str | None
+    generated_for_date: str | None = None
     created_at: datetime
 
 
@@ -142,6 +144,14 @@ class DashboardSummary(BaseModel):
 
 
 class ScanResult(BaseModel):
+    generated_for_date: str | None = None
+    markets_seen: int = 0
+    markets_for_card_date: int = 0
+    stale_markets_skipped: int = 0
+    positions_written: int = 0
+    alerts_written: int = 0
+    preserved_prior_date_rows: int = 0
+    reason: str = "ok"
     scanned_markets: int
     scanned_traders: int
     new_signals: int

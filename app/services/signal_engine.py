@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import Market, MarketSnapshot, Signal, Trade, Trader
 from app.providers.base import BaseProvider, ProviderSource
+from app.services.card_date import market_card_date
 from app.services import scoring
 
 logger = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ class SignalCandidate:
     source: str = ProviderSource.MOCK.value
     score: float = 0.0
     confidence: float = 0.0
+    generated_for_date: str | None = None
     score_breakdown: dict[str, Any] = field(default_factory=dict)
 
     def to_model(self) -> Signal:
@@ -67,6 +69,7 @@ class SignalCandidate:
             reason=self.reason,
             source=self.source,
             score_breakdown=self.score_breakdown,
+            generated_for_date=self.generated_for_date,
             created_at=datetime.utcnow(),
         )
 
@@ -106,6 +109,7 @@ def _signal_key(
     size_usd: float | None,
     source: str,
     reason: str,
+    generated_for_date: str | None,
 ) -> tuple[Any, ...]:
     return (
         market_id,
@@ -117,6 +121,7 @@ def _signal_key(
         round(size_usd or 0.0, 2),
         source,
         reason,
+        generated_for_date,
     )
 
 
@@ -131,6 +136,7 @@ def _candidate_key(candidate: SignalCandidate) -> tuple[Any, ...]:
         candidate.size_usd,
         candidate.source,
         candidate.reason,
+        candidate.generated_for_date,
     )
 
 
@@ -148,6 +154,7 @@ def _existing_signal_keys(db: Session) -> set[tuple[Any, ...]]:
             s.size_usd,
             s.source,
             s.reason,
+            s.generated_for_date,
         )
         for s in signals
     }
@@ -205,15 +212,12 @@ async def _score_candidate(
 async def generate_signals(
     db: Session,
     providers: dict[str, BaseProvider] | None = None,
+    *,
+    card_date: str | None = None,
 ) -> list[Signal]:
     """Run every rule against current DB state. Returns persisted Signal rows."""
     settings = get_settings()
     candidates: list[SignalCandidate] = []
-
-    trades = _recent_trades(db)
-    if not trades:
-        logger.info("signal_engine: no recent trades to evaluate")
-        return []
 
     traders_by_id: dict[int, Trader] = {
         t.id: t for t in db.scalars(select(Trader))
@@ -221,6 +225,19 @@ async def generate_signals(
     markets_by_id: dict[int, Market] = {
         m.id: m for m in db.scalars(select(Market))
     }
+    trades = _recent_trades(db)
+    if card_date:
+        trades = [
+            trade for trade in trades
+            if market_card_date(markets_by_id.get(trade.market_id)) == card_date
+        ]
+    if not trades:
+        logger.info(
+            "signal_engine: no recent trades to evaluate%s",
+            f" for card_date={card_date}" if card_date else "",
+        )
+        return []
+
     total_watched = len(traders_by_id)
 
     # --- Rule 1+2: trusted_wallet_entry / multi_wallet_consensus -------------
@@ -254,6 +271,7 @@ async def generate_signals(
                 f"(${most_recent.size_usd:,.0f})"
             ),
             source=most_recent.source or ProviderSource.MOCK.value,
+            generated_for_date=card_date,
         )
         await _score_candidate(
             db, cand, trader, market, same_side_wallets, total_watched
@@ -276,6 +294,7 @@ async def generate_signals(
                     f"(total ${sum(t.size_usd for t in grouped):,.0f})"
                 ),
                 source=most_recent.source or ProviderSource.MOCK.value,
+                generated_for_date=card_date,
             )
             await _score_candidate(
                 db, consensus, trader, market, same_side_wallets, total_watched
@@ -306,6 +325,7 @@ async def generate_signals(
                 f"(threshold ${_LARGE_POSITION_USD:,.0f})"
             ),
             source=trade.source or ProviderSource.MOCK.value,
+            generated_for_date=card_date,
         )
         await _score_candidate(db, cand, trader, market, 1, total_watched)
         if cand.score >= settings.signal_score_threshold:
@@ -341,6 +361,7 @@ async def generate_signals(
                 f"after their {trade.side} entry on '{market.title}'"
             ),
             source=trade.source or ProviderSource.MOCK.value,
+            generated_for_date=card_date,
         )
         await _score_candidate(db, cand, trader, market, 1, total_watched)
         if cand.score >= settings.signal_score_threshold:

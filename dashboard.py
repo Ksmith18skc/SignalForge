@@ -790,6 +790,7 @@ def safe_get(path: str, *, default: Any, params: dict[str, Any] | None = None) -
 
 DASH = "—"
 TZ_MST = ZoneInfo("America/Phoenix")
+CARD_DATE = datetime.now(TZ_MST).date().isoformat()
 
 
 def _resolve_perf_window(choice: str) -> tuple[int | None, str | None]:
@@ -1947,7 +1948,7 @@ def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callab
 def action_run_wallet_scan() -> None:
     with st.spinner("Starting wallet scan..."):
         try:
-            result = api_post("/run-scan", timeout=SCAN_TIMEOUT)
+            result = api_post("/run-scan", timeout=SCAN_TIMEOUT, params={"date": selected_card_date})
         except ApiError as exc:
             render_api_error(exc, prefix="Wallet scan failed")
             return
@@ -1961,9 +1962,11 @@ def action_run_wallet_scan() -> None:
     if state == "finished" and result.get("result"):
         result = result.get("result") or {}
     st.toast(
-        f"Wallet scan: {result.get('new_signals', 0)} signals, "
-        f"{result.get('new_alerts', 0)} alerts, "
-        f"{result.get('duration_seconds', 0):.2f}s"
+        f"Wallet scan {result.get('generated_for_date') or selected_card_date}: "
+        f"{result.get('markets_for_card_date', 0)}/{result.get('markets_seen', 0)} markets, "
+        f"skipped stale={result.get('stale_markets_skipped', 0)}, "
+        f"positions={result.get('positions_written', result.get('new_signals', 0))}, "
+        f"alerts={result.get('alerts_written', result.get('new_alerts', 0))}"
     )
     st.cache_data.clear()
     st.rerun()
@@ -1972,10 +1975,15 @@ def action_run_wallet_scan() -> None:
 def action_run_mlb_edge_scan() -> None:
     with st.spinner("Running MLB edge engine (may take a moment)..."):
         try:
-            result = api_post("/mlb/edges/run", timeout=MLB_RUN_TIMEOUT)
+            result = api_post("/mlb/edges/run", timeout=MLB_RUN_TIMEOUT, params={"game_date": selected_card_date})
         except ApiError as exc:
             render_api_error(exc, prefix="MLB edge scan failed")
             return
+    if str(result.get("status") or "").lower() == "blocked":
+        st.warning(result.get("reason") or "Odds cache stale; refresh required before edge scan.")
+        st.cache_data.clear()
+        st.rerun()
+        return
     generated_for = result.get("generated_for_date") or result.get("date") or "?"
     written = int(result.get("snapshots_written") or result.get("edges") or 0)
     preserved = int(result.get("snapshots_preserved_from_prior_dates") or 0)
@@ -1991,7 +1999,11 @@ def action_run_mlb_edge_scan() -> None:
 def action_refresh_odds_cache() -> None:
     with st.spinner("Refreshing odds cache..."):
         try:
-            result = api_post("/mlb/debug/odds-cache/refresh", timeout=MLB_RUN_TIMEOUT)
+            result = api_post(
+                "/mlb/debug/odds-cache/refresh",
+                timeout=MLB_RUN_TIMEOUT,
+                params={"game_date": selected_card_date},
+            )
         except ApiError as exc:
             render_api_error(exc, prefix="Odds cache refresh failed")
             return
@@ -2159,8 +2171,8 @@ def fetch_scan_status() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def fetch_summary() -> dict[str, Any]:
-    return safe_get("/dashboard-summary", default={})
+def fetch_summary(card_date: str = CARD_DATE) -> dict[str, Any]:
+    return safe_get("/dashboard-summary", default={}, params={"date": card_date})
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -2169,23 +2181,41 @@ def fetch_traders() -> list[dict[str, Any]]:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def fetch_signals(limit: int = 500) -> list[dict[str, Any]]:
-    return safe_get("/signals", default=[], params={"limit": limit})
+def fetch_signals(limit: int = 500, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
+    return safe_get(
+        "/signals",
+        default=[],
+        params={
+            "limit": limit,
+            "date": card_date,
+            "active_only": True,
+            "exclude_resolved": True,
+        },
+    )
 
 
 @st.cache_data(ttl=10, show_spinner=False)
-def fetch_alerts(limit: int = 200) -> list[dict[str, Any]]:
-    return safe_get("/alerts", default=[], params={"limit": limit})
+def fetch_alerts(limit: int = 200, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
+    return safe_get("/alerts", default=[], params={"limit": limit, "date": card_date})
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_historical_alerts(limit: int = 200) -> list[dict[str, Any]]:
+    return safe_get("/alerts", default=[], params={"limit": limit, "history": True})
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_mlb_edges(limit: int = 100) -> list[dict[str, Any]]:
-    return safe_get("/mlb/edges/today", default=[], params={"limit": limit})
+def fetch_mlb_edges(limit: int = 100, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
+    return safe_get(
+        "/mlb/edges/today",
+        default=[],
+        params={"limit": limit, "game_date": card_date},
+    )
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_mlb_daily_card() -> dict[str, Any] | None:
-    return safe_get("/mlb/daily-card", default=None)
+def fetch_mlb_daily_card(card_date: str = CARD_DATE) -> dict[str, Any] | None:
+    return safe_get("/mlb/daily-card", default=None, params={"game_date": card_date})
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -2204,8 +2234,13 @@ def fetch_odds_providers() -> dict[str, Any]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_odds_event_match() -> dict[str, Any]:
-    return safe_get("/mlb/debug/odds/event-match", default={})
+def fetch_odds_event_match(card_date: str = CARD_DATE) -> dict[str, Any]:
+    return safe_get("/mlb/debug/odds/event-match", default={}, params={"game_date": card_date})
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_dashboard_debug(card_date: str = CARD_DATE) -> dict[str, Any]:
+    return safe_get("/dashboard/debug", default={}, params={"date": card_date})
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -2476,15 +2511,17 @@ elif backend_state == "offline":
 # Pre-fetch everything once per render
 # =============================================================================
 
-summary = fetch_summary() or {}
+selected_card_date = CARD_DATE
+summary = fetch_summary(selected_card_date) or {}
 ready = fetch_ready() or {}
 scan_status_payload = fetch_scan_status() or {}
 traders = fetch_traders()
-signals_all = fetch_signals(limit=500)
+signals_all = fetch_signals(limit=500, card_date=selected_card_date)
 positions_all = aggregate_signals_to_positions(signals_all)
-alerts_all = fetch_alerts(limit=200)
-mlb_edges_all = fetch_mlb_edges(limit=100)
-mlb_daily_card = fetch_mlb_daily_card()
+alerts_all = fetch_alerts(limit=200, card_date=selected_card_date)
+historical_alerts = fetch_historical_alerts(limit=200)
+mlb_edges_all = fetch_mlb_edges(limit=100, card_date=selected_card_date)
+mlb_daily_card = fetch_mlb_daily_card(selected_card_date)
 mlb_sources = fetch_mlb_sources()
 _perf_choice = st.session_state.get("perf_window_choice", "Last 7 days")
 _perf_window_days, _perf_window_date = _resolve_perf_window(_perf_choice)
@@ -2492,9 +2529,10 @@ mlb_performance = fetch_mlb_performance(days=_perf_window_days, date=_perf_windo
 pnl_payload = fetch_pnl_tracker()
 odds_cache_payload = fetch_odds_cache()
 odds_providers_payload = fetch_odds_providers()
-event_match_payload = fetch_odds_event_match()
+event_match_payload = fetch_odds_event_match(selected_card_date)
 pitcher_props_payload = fetch_pitcher_props()
 market_validation_payload = fetch_market_validation()
+dashboard_debug_payload = fetch_dashboard_debug(selected_card_date)
 
 providers_block = ready.get("providers", {}) or {}
 falcon_info = providers_block.get("falcon", {}) or {}
@@ -2642,6 +2680,7 @@ st.markdown(
       <div>
         <span class='pulse-dot'></span>{backend_badge}{mkt_badge}{odds_cache_badge}
         <div class='sf-meta' style='margin-top:6px;'>MST: {local_label}</div>
+                <div class='sf-meta'>Card date: {selected_card_date}</div>
                 <div class='sf-meta'>Last refresh: {last_refresh_age}</div>
                 <div class='sf-meta'>Backend health: {health_label}</div>
       </div>
@@ -2673,6 +2712,18 @@ if scan_status_payload.get("state") == "running":
     )
 elif scan_status_payload.get("state") == "failed":
     st.warning(f"Last wallet scan failed: {scan_status_payload.get('error') or 'unknown error'}")
+
+stale_positions_hidden = int(dashboard_debug_payload.get("stale_wallet_positions_hidden") or 0)
+stale_alerts_hidden = int(dashboard_debug_payload.get("stale_alerts_hidden") or 0)
+if stale_positions_hidden or stale_alerts_hidden:
+    st.info(
+        "Historical / stale, not today's card: "
+        f"{stale_positions_hidden} wallet position signal(s) and "
+        f"{stale_alerts_hidden} alert(s) are hidden from the live {selected_card_date} card."
+    )
+
+if not mlb_edges_all and odds_cache_status in {"stale", "empty"}:
+    st.warning("Odds cache stale; refresh required before edge scan.")
 
 
 # Header metric strip — the 7 numbers an operator wants in one glance.
@@ -2822,8 +2873,8 @@ with tab_command:
                 render_wallet_card(sig)
         else:
             render_empty_state(
-                "No high-conviction wallet flow.",
-                "Lower the score filter in the sidebar, or wait for the next scan pass.",
+                "No current-card wallet flow found.",
+                f"No {selected_card_date} wallet flow meets the live-card filters.",
             )
 
     with right:
@@ -2864,8 +2915,8 @@ with tab_command:
                 )
         else:
             render_empty_state(
-                "No alerts dispatched yet.",
-                "Alerts post automatically when a signal exceeds the discord threshold.",
+                "No current-card alerts.",
+                f"No alerts have been dispatched for {selected_card_date}.",
             )
 
 
@@ -3022,8 +3073,8 @@ with tab_wallet:
             render_wallet_card(pos)
     else:
         render_empty_state(
-            "No positions match your filters.",
-            "Lower the score range or clear trader/league filters in the sidebar.",
+            "No current-card wallet flow found.",
+            f"No {selected_card_date} positions match your live-card filters.",
         )
 
     st.markdown(f"### All Positions ({len(filtered_positions)})")
@@ -3065,8 +3116,8 @@ with tab_wallet:
         )
     else:
         render_empty_state(
-            "No positions in the current filter set.",
-            "The scanner emits one signal per pass; check back after the next scan.",
+            "No current-card wallet flow found.",
+            "Run a wallet scan after today's markets are available.",
         )
 
 
@@ -3536,8 +3587,8 @@ with tab_watchlist:
         )
     else:
         render_empty_state(
-            "No active wallet positions.",
-            "Run a wallet scan to populate tracked wallet positions.",
+            "No current-card wallet flow found.",
+            f"No active wallet positions were found for {selected_card_date}.",
             actions=[("Run wallet scan", action_run_wallet_scan)],
         )
 
@@ -3620,15 +3671,15 @@ with tab_alerts:
     skipped = [a for a in alerts_all if a.get("status") == "skipped"]
     failed = [a for a in alerts_all if a.get("status") == "failed"]
     ac1, ac2, ac3, ac4 = st.columns(4)
-    ac1.metric("Alerts total", len(alerts_all))
+    ac1.metric("Today alerts", len(alerts_all))
     ac2.metric("Sent", len(sent))
     ac3.metric("Skipped", len(skipped))
     ac4.metric("Failed", len(failed))
 
     if not alerts_all:
         render_empty_state(
-            "No alerts dispatched yet.",
-            "Alerts post when a signal exceeds the configured Discord threshold.",
+            "No current-card alerts.",
+            f"No alerts have been dispatched for {selected_card_date}.",
         )
     else:
         rows = []
@@ -3648,6 +3699,32 @@ with tab_alerts:
             df_a, use_container_width=True, hide_index=True,
             height=min(640, 60 + 32 * len(df_a)),
         )
+
+    historical_only = [
+        a for a in historical_alerts
+        if (a.get("generated_for_date") or "") != selected_card_date
+    ]
+    with st.expander("Historical alerts", expanded=False):
+        if not historical_only:
+            st.caption("No historical alerts found.")
+        else:
+            rows = []
+            for a in historical_only:
+                rows.append({
+                    "generated_for_date": a.get("generated_for_date") or DASH,
+                    "created_at": fmt_dt(a.get("created_at")),
+                    "channel": a.get("channel"),
+                    "status": a.get("status"),
+                    "signal_id": a.get("signal_id"),
+                    "message": (a.get("message") or "")[:240],
+                })
+            st.warning("Historical / stale, not today's card")
+            st.dataframe(
+                pd.DataFrame(rows).fillna(DASH),
+                use_container_width=True,
+                hide_index=True,
+                height=min(420, 60 + 32 * len(rows)),
+            )
 
 
 # =============================================================================
@@ -3921,6 +3998,31 @@ with tab_health:
                 with st.expander(f"{path}  ·  {err.status_code or 'transport'}", expanded=False):
                     render_api_error(err, prefix=f"Failed fetching {path}")
 
+    st.markdown("### Card-Date Debug")
+    debug_rows = [
+        ("Arizona today", dashboard_debug_payload.get("arizona_today")),
+        ("Selected card date", dashboard_debug_payload.get("selected_card_date")),
+        ("Latest wallet scan generated_for_date", dashboard_debug_payload.get("latest_wallet_scan_generated_for_date")),
+        ("Latest MLB edge generated_for_date", dashboard_debug_payload.get("latest_mlb_edge_generated_for_date")),
+        ("Latest alert generated_for_date", dashboard_debug_payload.get("latest_alert_generated_for_date")),
+        ("Today wallet positions", dashboard_debug_payload.get("today_wallet_positions")),
+        ("Stale wallet positions hidden", dashboard_debug_payload.get("stale_wallet_positions_hidden")),
+        ("Today alerts", dashboard_debug_payload.get("today_alerts")),
+        ("Stale alerts hidden", dashboard_debug_payload.get("stale_alerts_hidden")),
+        (
+            "Odds cache age",
+            f"{dashboard_debug_payload.get('odds_cache_age_minutes')} min"
+            if dashboard_debug_payload.get("odds_cache_age_minutes") is not None
+            else DASH,
+        ),
+    ]
+    st.dataframe(
+        pd.DataFrame(debug_rows, columns=["field", "value"]).fillna(DASH),
+        use_container_width=True,
+        hide_index=True,
+        height=390,
+    )
+
     if debug_mode:
         st.markdown("### Raw payloads")
         with st.expander("/health", expanded=False):
@@ -3937,5 +4039,7 @@ with tab_health:
             st.json(market_validation_payload)
         with st.expander("/dashboard-summary", expanded=False):
             st.json(summary)
+        with st.expander("/dashboard/debug", expanded=False):
+            st.json(dashboard_debug_payload)
     else:
         st.caption("Raw JSON hidden. Enable 'Show raw JSON' in the sidebar to expose payloads.")

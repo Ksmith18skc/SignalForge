@@ -302,6 +302,47 @@ def get_cached_event_odds(
     return None
 
 
+def events_list_cache_state(db: Session, *, game_date: str) -> dict[str, Any]:
+    snap = _load_snapshot(
+        db,
+        sport=ODDS_MLB_SPORT,
+        event_id=_events_list_key(game_date),
+        market_type=MARKET_TYPE_EVENTS_LIST,
+    )
+    return _cache_state_dict(snap)
+
+
+def event_odds_cache_state(db: Session, event_id: str) -> dict[str, Any]:
+    snap = _load_snapshot(
+        db,
+        sport=ODDS_MLB_SPORT,
+        event_id=event_id,
+        market_type=MARKET_TYPE_EVENT_ODDS,
+    )
+    return _cache_state_dict(snap)
+
+
+def _cache_state_dict(snap: OddsSnapshot | None) -> dict[str, Any]:
+    now = datetime.utcnow()
+    if snap is None:
+        return {
+            "state": "missing",
+            "fresh": False,
+            "age_minutes": None,
+            "fetched_at": None,
+            "expires_at": None,
+        }
+    age_minutes = int((now - snap.fetched_at).total_seconds() / 60)
+    fresh = snap.expires_at > now
+    return {
+        "state": "fresh" if fresh else "stale",
+        "fresh": fresh,
+        "age_minutes": age_minutes,
+        "fetched_at": snap.fetched_at.isoformat() if snap.fetched_at else None,
+        "expires_at": snap.expires_at.isoformat() if snap.expires_at else None,
+    }
+
+
 def get_cached_mlb_totals(
     db: Session,
     *,

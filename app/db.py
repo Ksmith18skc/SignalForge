@@ -119,6 +119,8 @@ def init_db() -> None:
     if _is_sqlite:
         _add_sqlite_column_if_missing("trades", "outcome", "VARCHAR(64)")
         _add_sqlite_column_if_missing("signals", "outcome", "VARCHAR(64)")
+        _add_sqlite_column_if_missing("signals", "generated_for_date", "VARCHAR(10)")
+        _add_sqlite_column_if_missing("alerts", "generated_for_date", "VARCHAR(10)")
         _add_sqlite_column_if_missing("mlb_edges", "opening_line", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "current_line", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "recommended_line", "FLOAT")
@@ -134,6 +136,7 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
         _ensure_mlb_edge_validation_columns()
     if _is_postgres:
+        _ensure_signal_date_columns()
         _ensure_mlb_edge_validation_columns()
         _ensure_postgres_trades_external_id_is_text()
 
@@ -185,6 +188,30 @@ def _ensure_mlb_edge_validation_columns() -> None:
         except SQLAlchemyError as exc:
             logger.exception("mlb_edges validation-column migration failed: %s", exc)
             raise
+
+
+def _ensure_signal_date_columns() -> None:
+    """Backfill generated_for_date columns on existing deployments."""
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    dialect = engine.dialect.name
+    if dialect == "sqlite":
+        if "signals" in tables:
+            _add_sqlite_column_if_missing("signals", "generated_for_date", "VARCHAR(10)")
+        if "alerts" in tables:
+            _add_sqlite_column_if_missing("alerts", "generated_for_date", "VARCHAR(10)")
+        return
+    if dialect.startswith("postgres"):
+        statements = []
+        if "signals" in tables:
+            statements.append("ALTER TABLE signals ADD COLUMN IF NOT EXISTS generated_for_date VARCHAR(10)")
+        if "alerts" in tables:
+            statements.append("ALTER TABLE alerts ADD COLUMN IF NOT EXISTS generated_for_date VARCHAR(10)")
+        if not statements:
+            return
+        with engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
 
 
 def _ensure_postgres_trades_external_id_is_text() -> None:
