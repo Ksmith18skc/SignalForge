@@ -121,6 +121,31 @@ class Settings(BaseSettings):
     high_conviction_score: float = 80.0
     possible_entry_score: float = 85.0
 
+    # --- personal P&L tracker ---
+    # Your Polymarket wallet (public on-chain address; no key required — we
+    # only read positions/trades from the public data API).
+    my_polymarket_wallet: str | None = None
+    # Comma-separated to support multiple wallets / sub-accounts.
+    my_polymarket_wallets: str = ""
+
+    # Your Kalshi account. The v2 API uses RSA-PSS signed headers; supply the
+    # API key id plus a PEM-encoded RSA private key (file path *or* literal
+    # PEM string). Auth is skipped if either is missing.
+    kalshi_user_api_key_id: str | None = None
+    kalshi_user_private_key_path: str | None = None
+    kalshi_user_private_key_pem: str | None = None
+
+    # If True, wallet sync uses local mocks so the tracker is exercisable
+    # without API keys. Forced on automatically when no creds are present.
+    pnl_use_mock_wallet: bool = False
+
+    # Floors for the smart-alert engine.
+    pnl_alert_overexposure_pct: float = 0.20       # 20% of portfolio on one game
+    pnl_alert_overexposure_sport_pct: float = 0.60 # 60% of portfolio on one sport
+    pnl_alert_negative_edge_threshold: float = -0.02  # |fair - market| in cents
+    pnl_alert_strong_clv_points: float = 0.04      # 4 cents of CLV
+    pnl_alert_bad_entry_points: float = 0.04       # 4 cents worse than callout
+
     # --- nested ---
     scoring: ScoringWeights = Field(default_factory=ScoringWeights)
     risk: RiskLimits = Field(default_factory=RiskLimits)
@@ -139,6 +164,24 @@ class Settings(BaseSettings):
 
     def has_weather_api_credentials(self) -> bool:
         return bool(self.weather_api_key)
+
+    def has_polymarket_wallet_addresses(self) -> bool:
+        return bool(self.my_polymarket_wallet) or bool(self.my_polymarket_wallets.strip())
+
+    def has_kalshi_user_credentials(self) -> bool:
+        return bool(self.kalshi_user_api_key_id) and bool(
+            self.kalshi_user_private_key_path or self.kalshi_user_private_key_pem
+        )
+
+    def polymarket_wallet_list(self) -> list[str]:
+        addresses: list[str] = []
+        if self.my_polymarket_wallet:
+            addresses.append(self.my_polymarket_wallet.strip())
+        for chunk in self.my_polymarket_wallets.split(","):
+            chunk = chunk.strip()
+            if chunk and chunk not in addresses:
+                addresses.append(chunk)
+        return addresses
 
 
 @lru_cache(maxsize=1)

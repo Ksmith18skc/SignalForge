@@ -65,6 +65,7 @@ def init_db() -> None:
     """Create all tables. Safe to call repeatedly."""
     # Import models so they register on Base.metadata before create_all.
     from app import models  # noqa: F401
+    from app import storage  # noqa: F401  — registers personal P&L tables.
 
     Base.metadata.create_all(bind=engine)
     if _is_sqlite:

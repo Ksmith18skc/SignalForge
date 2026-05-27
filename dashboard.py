@@ -22,6 +22,7 @@ import httpx
 import pandas as pd
 import streamlit as st
 
+from app.components.pnl_dashboard import render_pnl_summary_cards, render_pnl_tracker
 from app.utils.dashboard_format import (
     SCORE_ACTIONABLE_MIN,
     SCORE_BUCKETS,
@@ -1930,6 +1931,24 @@ def action_grade_mlb_results() -> None:
     st.rerun()
 
 
+def action_sync_pnl_wallets() -> None:
+    with st.spinner("Syncing personal wallet P&L cache..."):
+        try:
+            result = api_post("/pnl/sync", timeout=SCAN_TIMEOUT)
+        except ApiError as exc:
+            render_api_error(exc, prefix="P&L wallet sync failed")
+            return
+    st.cache_data.clear()
+    warnings = result.get("warnings") or []
+    st.success(
+        f"P&L sync: {result.get('new_trades', 0)} new fills, "
+        f"{result.get('positions_rebuilt', 0)} positions rebuilt ({result.get('mode')})."
+    )
+    for warning in warnings[:3]:
+        st.warning(warning)
+    st.rerun()
+
+
 # =============================================================================
 # Cached fetchers
 # =============================================================================
@@ -2014,6 +2033,11 @@ def fetch_mlb_performance() -> dict[str, Any]:
         "clv": safe_get("/mlb/performance/clv", default={}),
     }
     return out
+
+
+@st.cache_data(ttl=10, show_spinner=False)
+def fetch_pnl_tracker() -> dict[str, Any]:
+    return safe_get("/pnl/tracker", default={"summary": {}, "open_positions": [], "closed_positions": []})
 
 
 # =============================================================================
@@ -2236,6 +2260,7 @@ mlb_edges_all = fetch_mlb_edges(limit=100)
 mlb_daily_card = fetch_mlb_daily_card()
 mlb_sources = fetch_mlb_sources()
 mlb_performance = fetch_mlb_performance()
+pnl_payload = fetch_pnl_tracker()
 odds_cache_payload = fetch_odds_cache()
 odds_providers_payload = fetch_odds_providers()
 event_match_payload = fetch_odds_event_match()
@@ -2433,6 +2458,8 @@ m7.metric(
     delta_color="normal" if falcon_info.get("healthy") else "inverse",
 )
 
+render_pnl_summary_cards(pnl_payload, fmt_money=fmt_money, fmt_num=fmt_num)
+
 
 # =============================================================================
 # Tab navigation
@@ -2442,6 +2469,7 @@ m7.metric(
     tab_command,
     tab_mlb,
     tab_wallet,
+    tab_pnl,
     tab_perf,
     tab_odds,
     tab_watchlist,
@@ -2451,6 +2479,7 @@ m7.metric(
     "Command Center",
     "MLB Terminal",
     "Wallet Flow",
+    "P&L Tracker",
     "Performance / CLV",
     "Odds Cache",
     "Watchlist",
@@ -2775,6 +2804,20 @@ with tab_wallet:
             "No positions in the current filter set.",
             "The scanner emits one signal per pass; check back after the next scan.",
         )
+
+
+# =============================================================================
+# P&L Tracker
+# =============================================================================
+
+with tab_pnl:
+    render_pnl_tracker(
+        pnl_payload,
+        sync_action=action_sync_pnl_wallets,
+        fmt_money=fmt_money,
+        fmt_num=fmt_num,
+        fmt_pct=fmt_pct,
+    )
 
 
 # =============================================================================

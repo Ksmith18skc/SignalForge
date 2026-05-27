@@ -67,6 +67,20 @@ from app.services.mlb_performance import (
     top_factors_by_performance,
     update_closing_line_fields,
 )
+from app.services import pnl_tracker
+from app.services.pnl_alerts import refresh_pnl_alerts
+from app.services.position_matcher import find_missed_opportunities
+from app.services.signal_attribution import summarize_signal_attribution
+from app.services.wallet_sync import ensure_pnl_demo_data_if_needed, sync_personal_wallets
+from app.storage.pnl_store import (
+    MyPosition,
+    PnlAlert,
+    RecommendationSnapshot,
+    SignalAttribution,
+    WalletSnapshot,
+    list_positions,
+    list_wallets,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1872,6 +1886,82 @@ async def falcon_test(
 # ---------------------------- dashboard -------------------------------------
 
 
+@router.post("/pnl/sync")
+def pnl_sync(db: Session = Depends(get_db)) -> dict[str, object]:
+    try:
+        result = sync_personal_wallets(db)
+        db.commit()
+        return result
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.exception("Personal P&L sync failed")
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.get("/pnl/tracker")
+def pnl_tracker_payload(db: Session = Depends(get_db)) -> dict[str, object]:
+    demo_result = ensure_pnl_demo_data_if_needed(db)
+    if demo_result is not None:
+        db.commit()
+
+    wallets = list_wallets(db, active_only=False)
+    positions = list_positions(db, status=None)
+    snapshots = list(db.scalars(select(WalletSnapshot).order_by(WalletSnapshot.captured_at.desc())))
+    prev_total = pnl_tracker.previous_total_value(snapshots)
+    cash_by_wallet = {
+        s.wallet_id: s.cash_balance_usd
+        for s in snapshots
+        if s.cash_balance_usd is not None
+    }
+    # Keep only the freshest cash snapshot per wallet.
+    freshest_cash: dict[int, float] = {}
+    for snap in snapshots:
+        if snap.cash_balance_usd is not None and snap.wallet_id not in freshest_cash:
+            freshest_cash[snap.wallet_id] = snap.cash_balance_usd
+    summary = pnl_tracker.compute_portfolio_summary(
+        pnl_tracker.PnlInputs(
+            positions=positions,
+            cash_by_wallet=freshest_cash or cash_by_wallet,
+            previous_total_value_usd=prev_total,
+        )
+    )
+    attribution = summarize_signal_attribution(db)
+    alerts = refresh_pnl_alerts(db)
+    db.commit()
+
+    open_positions = [p for p in positions if p.status == "open" and p.shares > 0]
+    closed_positions = [p for p in positions if p.status == "closed" or p.shares <= 0]
+    attrs = list(db.scalars(select(SignalAttribution)))
+    attrs_by_trade: dict[int, SignalAttribution] = {
+        a.my_trade_id: a for a in attrs if a.my_trade_id is not None
+    }
+    missed = find_missed_opportunities(db)
+    warnings = [
+        w.last_sync_error for w in wallets if w.last_sync_error
+    ]
+    if summary.is_estimated:
+        warnings.append("Some P&L values are estimated because cash or current marks are missing/stale.")
+    if demo_result:
+        warnings.extend(demo_result.get("warnings") or [])
+
+    return {
+        "summary": _portfolio_summary_dict(summary),
+        "wallets": [_wallet_dict(w) for w in wallets],
+        "open_positions": [_position_dict(p, attrs_by_trade) for p in open_positions],
+        "closed_positions": [_position_dict(p, attrs_by_trade) for p in closed_positions],
+        "missed_edges": [_recommendation_dict(r) for r in missed],
+        "alerts": [_pnl_alert_dict(a) for a in alerts],
+        "exposure": {
+            "sport": [_exposure_dict(s) for s in pnl_tracker.exposure_breakdown(open_positions, dimension="sport", portfolio_value=summary.total_value_usd)],
+            "market": [_exposure_dict(s) for s in pnl_tracker.exposure_breakdown(open_positions, dimension="market", portfolio_value=summary.total_value_usd)],
+            "source": [_exposure_dict(s) for s in pnl_tracker.exposure_breakdown(open_positions, dimension="platform", portfolio_value=summary.total_value_usd)],
+        },
+        "attribution": attribution.__dict__,
+        "warnings": sorted(set(warnings)),
+        "mode": (demo_result or {}).get("mode") or ("cached_live" if wallets else "empty"),
+    }
+
+
 @router.get("/dashboard-summary", response_model=DashboardSummary)
 def dashboard_summary(db: Session = Depends(get_db)) -> DashboardSummary:
     active_signals_raw = list(
@@ -1932,3 +2022,122 @@ def dashboard_summary(db: Session = Depends(get_db)) -> DashboardSummary:
         simulated_pnl_usd=simulated_pnl,
         watchlist_health=health,
     )
+
+
+def _portfolio_summary_dict(summary: pnl_tracker.PortfolioSummary) -> dict[str, object]:
+    return summary.__dict__
+
+
+def _wallet_dict(wallet) -> dict[str, object]:  # noqa: ANN001
+    return {
+        "id": wallet.id,
+        "platform": wallet.platform,
+        "address": wallet.address,
+        "label": wallet.label,
+        "is_active": wallet.is_active,
+        "last_synced_at": wallet.last_synced_at.isoformat() if wallet.last_synced_at else None,
+        "last_sync_error": wallet.last_sync_error,
+    }
+
+
+def _position_dict(
+    pos: MyPosition,
+    attrs_by_trade: dict[int, SignalAttribution],
+) -> dict[str, object]:
+    attrs = [
+        a for a in attrs_by_trade.values()
+        if a.my_position_id == pos.id
+    ]
+    trailed = bool(attrs)
+    clv_points = None
+    clv_percent = None
+    if pos.avg_entry_price and pos.current_price is not None:
+        clv_points, clv_percent = pnl_tracker.compute_clv(pos.avg_entry_price, pos.current_price)
+    badges = ["LIVE" if pos.status == "open" else "CLOSED"]
+    if trailed:
+        badges.append("TRAILED")
+    if pos.current_edge is not None and pos.current_edge < 0:
+        badges.append("NEGATIVE EDGE")
+    if clv_points is not None and clv_points > 0:
+        badges.append("POSITIVE CLV")
+    elif clv_points is not None and clv_points < 0:
+        badges.append("BAD ENTRY")
+    if pos.is_stale_price:
+        badges.append("ESTIMATED")
+    return {
+        "id": pos.id,
+        "wallet_id": pos.wallet_id,
+        "platform": pos.platform,
+        "market_slug": pos.market_slug,
+        "market_title": pos.market_title,
+        "outcome": pos.outcome,
+        "side": pos.side,
+        "avg_entry_price": pos.avg_entry_price,
+        "current_price": pos.current_price,
+        "fair_probability": pos.fair_probability,
+        "edge_at_entry": pos.edge_at_entry,
+        "current_edge": pos.current_edge,
+        "clv_points": clv_points,
+        "clv_percent": clv_percent,
+        "shares": pos.shares,
+        "cost_basis_usd": pos.cost_basis_usd,
+        "current_value_usd": pos.current_value_usd,
+        "unrealized_pnl_usd": pos.unrealized_pnl_usd,
+        "realized_pnl_usd": pos.realized_pnl_usd,
+        "total_pnl_usd": round((pos.realized_pnl_usd or 0.0) + (pos.unrealized_pnl_usd or 0.0), 2),
+        "confidence_tier": pos.confidence_tier,
+        "signal_status": pos.signal_status,
+        "sport": pos.sport,
+        "event_date": pos.event_date,
+        "status": pos.status,
+        "is_stale_price": pos.is_stale_price,
+        "opened_at": pos.opened_at.isoformat() if pos.opened_at else None,
+        "closed_at": pos.closed_at.isoformat() if pos.closed_at else None,
+        "trailed_signalforge": trailed,
+        "badges": badges,
+    }
+
+
+def _recommendation_dict(rec: RecommendationSnapshot) -> dict[str, object]:
+    return {
+        "id": rec.id,
+        "source": rec.source,
+        "market_slug": rec.market_slug,
+        "market_title": rec.market_title,
+        "side": rec.side,
+        "outcome": rec.outcome,
+        "sport": rec.sport,
+        "event_date": rec.event_date,
+        "fair_probability": rec.fair_probability,
+        "market_price": rec.market_price,
+        "implied_edge": rec.implied_edge,
+        "score": rec.score,
+        "confidence_tier": rec.confidence_tier,
+        "threshold_status": rec.threshold_status,
+        "captured_at": rec.captured_at.isoformat() if rec.captured_at else None,
+        "badges": ["MISSED", "STILL ACTIONABLE" if rec.threshold_status == "actionable" else "NO LONGER ACTIONABLE"],
+    }
+
+
+def _pnl_alert_dict(alert: PnlAlert) -> dict[str, object]:
+    return {
+        "id": alert.id,
+        "alert_type": alert.alert_type,
+        "severity": alert.severity,
+        "title": alert.title,
+        "body": alert.body,
+        "market_slug": alert.market_slug,
+        "status": alert.status,
+        "acknowledged": alert.acknowledged,
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
+    }
+
+
+def _exposure_dict(slc: pnl_tracker.ExposureSlice) -> dict[str, object]:
+    return {
+        "key": slc.key,
+        "label": slc.label,
+        "notional_usd": slc.notional_usd,
+        "portfolio_pct": slc.portfolio_pct,
+        "position_count": slc.position_count,
+    }

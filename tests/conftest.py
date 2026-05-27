@@ -24,6 +24,7 @@ def db_session() -> Generator[Session, None, None]:
     )
     # Ensure all models register on metadata before create_all.
     from app import models  # noqa: F401
+    from app import storage  # noqa: F401
 
     Base.metadata.create_all(engine)
 
