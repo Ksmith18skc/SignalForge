@@ -22,8 +22,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
+    logger.info("Startup stage: settings loaded")
+    logger.info("Startup stage: initializing database metadata")
     init_db()
+    logger.info("Startup stage: database metadata ready")
     if settings.auto_seed_watchlist:
+        logger.info("Startup stage: seeding watchlist")
         db = SessionLocal()
         try:
             created, updated = seed_watchlist(db)
@@ -39,6 +43,7 @@ async def lifespan(app: FastAPI):
             raise
         finally:
             db.close()
+        logger.info("Startup stage: watchlist seed finished")
     logger.info(
         "%s starting in %s mode (auto_trading=%s, default_copy_mode=%s)",
         settings.app_name,
@@ -53,7 +58,9 @@ async def lifespan(app: FastAPI):
         )
 
     scanner = get_background_scanner()
+    logger.info("Startup stage: starting background scanner")
     scanner.start()
+    logger.info("Startup stage: application ready")
     try:
         yield
     finally:

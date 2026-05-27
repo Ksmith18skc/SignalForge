@@ -205,7 +205,7 @@ SIGNALFORGE_MAX_LIVE_STATCAST_ROWS=500
 The web service should only read cached Statcast summaries:
 
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port $PORT --workers 1
+uvicorn app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 Run Statcast pulls outside the web process with a Render background worker,

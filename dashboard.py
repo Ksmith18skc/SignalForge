@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from itertools import count
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -53,9 +54,18 @@ from app.utils.dashboard_format import (
 )
 
 API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip("/")
-DEFAULT_TIMEOUT = 10.0
-SCAN_TIMEOUT = 60.0
+DEFAULT_TIMEOUT = 45.0
+HEALTH_TIMEOUT = 60.0
+SCAN_TIMEOUT = 90.0
 MLB_RUN_TIMEOUT = 180.0
+RETRY_PATH_PREFIXES = (
+    "/health",
+    "/api/status",
+    "/ready",
+    "/run-scan",
+    "/mlb/debug/odds-cache",
+    "/mlb/edges/run",
+)
 _EMPTY_STATE_COUNTER = count()
 
 
@@ -614,6 +624,11 @@ class ApiError(Exception):
         self.status_code = status_code
         self.body = body
 
+    @property
+    def is_timeout(self) -> bool:
+        text = str(self).lower()
+        return "timeout" in text or "timed out" in text or "readtimeout" in text
+
     def short_body(self, limit: int = 800) -> str:
         if not self.body:
             return ""
@@ -640,47 +655,84 @@ def _client() -> httpx.Client:
     return httpx.Client(base_url=API_BASE, timeout=DEFAULT_TIMEOUT)
 
 
+def _should_retry(path: str) -> bool:
+    return any(path.startswith(prefix) for prefix in RETRY_PATH_PREFIXES)
+
+
+def _request_json(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json: Any = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    retries: int | None = None,
+) -> Any:
+    url = f"{API_BASE}{path}"
+    retry_count = retries if retries is not None else (2 if _should_retry(path) else 0)
+    attempt = 0
+    last_error: ApiError | None = None
+    while attempt <= retry_count:
+        try:
+            with _client() as c:
+                if method == "GET":
+                    r = c.get(path, params=params, timeout=timeout)
+                else:
+                    r = c.post(path, json=json, timeout=timeout)
+        except httpx.HTTPError as exc:
+            last_error = ApiError(f"{type(exc).__name__}: {exc}", method=method, url=url)
+            if attempt >= retry_count:
+                raise last_error from exc
+            time.sleep(min(2 ** attempt, 8))
+            attempt += 1
+            continue
+        if r.is_success:
+            try:
+                return r.json()
+            except ValueError as exc:
+                raise ApiError(
+                    f"Non-JSON response: {exc}", method=method, url=url,
+                    status_code=r.status_code, body=r.text,
+                ) from exc
+        error = ApiError(
+            f"HTTP {r.status_code}", method=method, url=url,
+            status_code=r.status_code, body=r.text,
+        )
+        if r.status_code in {502, 503, 504} and attempt < retry_count:
+            last_error = error
+            time.sleep(min(2 ** attempt, 8))
+            attempt += 1
+            continue
+        raise error
+    if last_error:
+        raise last_error
+    raise ApiError("request failed", method=method, url=url)
+
+
 def api_get(path: str, params: dict[str, Any] | None = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
     """GET an endpoint and parse JSON, raising ApiError on any failure."""
-    url = f"{API_BASE}{path}"
-    try:
-        with _client() as c:
-            r = c.get(path, params=params, timeout=timeout)
-    except httpx.HTTPError as exc:
-        raise ApiError(f"{type(exc).__name__}: {exc}", method="GET", url=url) from exc
-    if r.is_success:
-        try:
-            return r.json()
-        except ValueError as exc:
-            raise ApiError(
-                f"Non-JSON response: {exc}", method="GET", url=url,
-                status_code=r.status_code, body=r.text,
-            ) from exc
-    raise ApiError(
-        f"HTTP {r.status_code}", method="GET", url=url,
-        status_code=r.status_code, body=r.text,
-    )
+    return _request_json("GET", path, params=params, timeout=timeout)
 
 
 def api_post(path: str, json: Any = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
-    url = f"{API_BASE}{path}"
-    try:
-        with _client() as c:
-            r = c.post(path, json=json, timeout=timeout)
-    except httpx.HTTPError as exc:
-        raise ApiError(f"{type(exc).__name__}: {exc}", method="POST", url=url) from exc
-    if r.is_success:
+    return _request_json("POST", path, json=json, timeout=timeout)
+
+
+def api_get_once(path: str, *, timeout: float = 8.0) -> Any:
+    return _request_json("GET", path, timeout=timeout, retries=0)
+
+
+def backend_fallback_probe() -> bool:
+    """If /health timed out, check whether Render is at least serving HTTP."""
+    for path in ("/api/status", "/", "/docs"):
         try:
-            return r.json()
-        except ValueError as exc:
-            raise ApiError(
-                f"Non-JSON response: {exc}", method="POST", url=url,
-                status_code=r.status_code, body=r.text,
-            ) from exc
-    raise ApiError(
-        f"HTTP {r.status_code}", method="POST", url=url,
-        status_code=r.status_code, body=r.text,
-    )
+            with httpx.Client(base_url=API_BASE, timeout=8.0) as c:
+                r = c.get(path)
+            if r.status_code < 500:
+                return True
+        except httpx.HTTPError:
+            continue
+    return False
 
 
 def render_api_error(err: ApiError, *, prefix: str = "Request failed") -> None:
@@ -1892,13 +1944,13 @@ def action_refresh_odds_cache() -> None:
 
 def action_test_backend() -> None:
     try:
-        payload = api_get("/health")
+        payload = api_get("/health", timeout=HEALTH_TIMEOUT)
     except ApiError as exc:
         render_api_error(exc, prefix="Backend test failed")
         return
     st.success(
         f"Backend OK · env={payload.get('environment')} · "
-        f"db={payload.get('database', {}).get('backend', '?')}"
+        f"timestamp={payload.get('timestamp', '?')}"
     )
 
 
@@ -1957,10 +2009,26 @@ def action_sync_pnl_wallets() -> None:
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_health() -> dict[str, Any] | None:
     try:
-        return api_get("/health")
+        payload = api_get("/health", timeout=HEALTH_TIMEOUT)
+        payload["_frontend_state"] = "healthy"
+        return payload
     except ApiError as exc:
         st.session_state.setdefault("_fetch_errors", {})["/health"] = exc
+        if exc.is_timeout:
+            fallback_ok = backend_fallback_probe()
+            return {
+                "ok": False,
+                "status": "waking" if fallback_ok else "cold_start_timeout",
+                "_frontend_state": "waking",
+                "_fallback_probe_ok": fallback_ok,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
         return None
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_ready() -> dict[str, Any]:
+    return safe_get("/ready", default={})
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -2222,6 +2290,34 @@ def position_watchlist_notes(position: dict[str, Any]) -> str:
 st.session_state.setdefault("_fetch_errors", {})
 health = fetch_health()
 
+if health and health.get("_frontend_state") == "waking":
+    attempts = int(st.session_state.get("_backend_wake_attempts", 0))
+    st.session_state["_backend_wake_attempts"] = attempts + 1
+    st.markdown(
+        f"""
+        <div class='sf-header'>
+          <div class='sf-brand'>
+            <span class='sf-brand-mark'>â—†</span>
+            <span class='sf-brand-name'>SIGNALFORGE</span>
+            <span class='sf-brand-tagline'>Prediction Market + MLB Edge Terminal</span>
+          </div>
+          <div>{badge("WAKING BACKEND", "purple")}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.info(
+        f"Backend URL: **{API_BASE}**\n\n"
+        "The `/health` request timed out during the first backend probe. "
+        "This usually means Render is cold-starting; retrying automatically."
+    )
+    if attempts < 4:
+        time.sleep(min(3 + attempts * 2, 10))
+        st.cache_data.clear()
+        st.rerun()
+    st.warning("Backend is still waking or degraded. Refresh in a moment if this does not advance.")
+    st.stop()
+
 if health is None:
     st.markdown(
         f"""
@@ -2252,6 +2348,7 @@ if health is None:
 # =============================================================================
 
 summary = fetch_summary() or {}
+ready = fetch_ready() or {}
 traders = fetch_traders()
 signals_all = fetch_signals(limit=500)
 positions_all = aggregate_signals_to_positions(signals_all)
@@ -2267,7 +2364,7 @@ event_match_payload = fetch_odds_event_match()
 pitcher_props_payload = fetch_pitcher_props()
 market_validation_payload = fetch_market_validation()
 
-providers_block = health.get("providers", {}) or {}
+providers_block = ready.get("providers", {}) or {}
 falcon_info = providers_block.get("falcon", {}) or {}
 if isinstance(falcon_info, bool):
     falcon_info = {"configured": falcon_info, "healthy": False, "calls": 0, "successes": 0}

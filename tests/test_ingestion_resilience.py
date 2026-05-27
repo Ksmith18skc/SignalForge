@@ -249,15 +249,15 @@ def test_session_is_reusable_after_savepoint_failure(
     assert get_ingestion_health().ingestion_failures == 1
 
 
-def test_health_endpoint_exposes_ingestion_counters() -> None:
-    from app.api.routes import health
+def test_ready_endpoint_exposes_ingestion_counters() -> None:
+    from app.api.routes import ready
 
     ingestion_health_module.record_failure("simulated truncation")
     ingestion_health_module.record_rollback()
     ingestion_health_module.record_trade_inserted(3)
     ingestion_health_module.record_trade_skipped_oversized()
 
-    payload = health()
+    payload = ready()
     assert "ingestion" in payload
     block = payload["ingestion"]
     assert block["ingestion_failures"] >= 1
@@ -267,6 +267,17 @@ def test_health_endpoint_exposes_ingestion_counters() -> None:
     assert block["last_rollback_at"] is not None
     assert block["trades_inserted"] >= 3
     assert block["trades_skipped_oversized"] >= 1
+
+
+def test_health_endpoint_is_lightweight_liveness_probe() -> None:
+    from app.api.routes import health
+
+    payload = health()
+    assert payload["ok"] is True
+    assert payload["status"] == "healthy"
+    assert "timestamp" in payload
+    assert "providers" not in payload
+    assert "ingestion" not in payload
 
 
 def test_trade_external_id_column_is_text() -> None:

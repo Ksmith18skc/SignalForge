@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from datetime import date, datetime, timedelta
 import logging
 from urllib.parse import unquote, urlparse
@@ -96,6 +97,35 @@ _LIVE_PYBASEBALL_DISABLED_MESSAGE = (
 
 @router.get("/health")
 def health() -> dict[str, object]:
+    started = time.perf_counter()
+    payload = {
+        "ok": True,
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    logger.info("/health responded in %.2fms", elapsed_ms)
+    return payload
+
+
+@router.get("/")
+def root() -> dict[str, object]:
+    return health()
+
+
+@router.get("/api/status")
+def api_status() -> dict[str, object]:
+    return health()
+
+
+@router.get("/ready")
+def ready() -> dict[str, object]:
+    """Dependency/cache readiness probe.
+
+    Keep `/health` as a cheap process liveness endpoint. This route carries the
+    heavier diagnostic payload that the dashboard and operators can inspect
+    after the process is already awake.
+    """
     s = get_settings()
     falcon_health = get_falcon_health()
     ingest = get_ingestion_health()
