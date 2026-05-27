@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from collections.abc import Generator
 
 from sqlalchemy import create_engine, event, inspect, text
@@ -12,6 +13,13 @@ from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+# Lazy-init guards. ensure_db_initialized() may be called from the bootstrap
+# thread (during startup) and from request handlers (as a safety net if the
+# bootstrap thread hasn't finished yet). The lock keeps create_all from racing.
+_db_init_lock = threading.Lock()
+_db_init_done = False
+_db_init_error: Exception | None = None
 
 _settings = get_settings()
 
@@ -53,12 +61,52 @@ class Base(DeclarativeBase):
 
 
 def get_db() -> Generator[Session, None, None]:
-    """FastAPI dependency that yields a scoped DB session."""
+    """FastAPI dependency that yields a scoped DB session.
+
+    Calls ensure_db_initialized() so any request that arrives before the
+    background bootstrap finishes still sees an initialized schema.
+    """
+    ensure_db_initialized()
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+def db_init_status() -> dict[str, object]:
+    """Snapshot used by /ready to report whether the DB is ready yet."""
+    return {
+        "ready": _db_init_done,
+        "error": str(_db_init_error) if _db_init_error else None,
+    }
+
+
+def ensure_db_initialized() -> None:
+    """Run init_db() once, lazily and idempotently.
+
+    Safe to call from many threads. After the first successful call this is a
+    cheap flag check. If init_db() failed previously the cached error is
+    re-raised so the caller can return a clean 5xx instead of running queries
+    against a half-built schema.
+    """
+    global _db_init_done, _db_init_error
+    if _db_init_done:
+        return
+    if _db_init_error is not None:
+        raise _db_init_error
+    with _db_init_lock:
+        if _db_init_done:
+            return
+        if _db_init_error is not None:
+            raise _db_init_error
+        try:
+            init_db()
+            _db_init_done = True
+        except Exception as exc:
+            _db_init_error = exc
+            logger.exception("ensure_db_initialized: init_db failed")
+            raise
 
 
 def init_db() -> None:

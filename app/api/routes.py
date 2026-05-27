@@ -101,15 +101,16 @@ _LIVE_PYBASEBALL_DISABLED_MESSAGE = (
 
 @router.get("/health")
 def health() -> dict[str, object]:
-    started = time.perf_counter()
-    payload = {
+    """Pure liveness probe — must return instantly, never touch DB or providers.
+
+    Render uses this for its port scan. Anything that can block (DB DDL, provider
+    metrics, cache refreshes) belongs on /ready instead.
+    """
+    return {
         "ok": True,
         "status": "healthy",
         "timestamp": datetime.utcnow().isoformat(),
     }
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    logger.info("/health responded in %.2fms", elapsed_ms)
-    return payload
 
 
 @router.get("/")
@@ -134,11 +135,24 @@ def ready() -> dict[str, object]:
     falcon_health = get_falcon_health()
     ingest = get_ingestion_health()
     odds_cache_health = get_odds_cache_health()
+    # Importing here keeps /health independent of the bootstrap module so a
+    # broken import in main.py can't take down the liveness probe.
+    try:
+        from app.db import db_init_status
+        from app.main import get_bootstrap_state
+
+        db_status = db_init_status()
+        bootstrap = get_bootstrap_state()
+    except Exception as exc:  # noqa: BLE001
+        db_status = {"ready": False, "error": f"db_init_status import failed: {exc}"}
+        bootstrap = {"error": f"bootstrap state import failed: {exc}"}
     # "Configured" means a key is set. "Healthy" means calls are actually
     # succeeding — these can disagree (wrong base URL, expired key, etc.).
     return {
-        "status": "ok",
+        "status": "ok" if db_status.get("ready") else "warming",
         "app": s.app_name,
+        "bootstrap": bootstrap,
+        "db_initialized": db_status,
         "environment": s.environment,
         "default_copy_mode": s.default_copy_mode,
         "auto_trading_enabled": s.enable_auto_trading,

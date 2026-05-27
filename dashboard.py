@@ -54,10 +54,18 @@ from app.utils.dashboard_format import (
 )
 
 API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip("/")
-DEFAULT_TIMEOUT = 45.0
-HEALTH_TIMEOUT = 60.0
+# Keep normal reads tight (10s) so a stalled backend can't hang the dashboard.
+# /health gets its own longer budget *only* on the first wake-up attempt so
+# Render's cold start (~30-45s) doesn't masquerade as "backend offline".
+DEFAULT_TIMEOUT = 10.0
+HEALTH_TIMEOUT = 45.0
+HEALTH_WARM_TIMEOUT = 8.0
 SCAN_TIMEOUT = 90.0
 MLB_RUN_TIMEOUT = 180.0
+# When set (via env or sidebar toggle) the dashboard renders shell + empty data
+# without ever calling the backend. Useful for design work and for unblocking
+# the UI when Render is degraded.
+OFFLINE_MODE = os.environ.get("SIGNALFORGE_OFFLINE_MODE", "").lower() in {"1", "true", "yes"}
 RETRY_PATH_PREFIXES = (
     "/health",
     "/api/status",
@@ -752,9 +760,15 @@ def render_api_error(err: ApiError, *, prefix: str = "Request failed") -> None:
 def safe_get(path: str, *, default: Any, params: dict[str, Any] | None = None) -> Any:
     """GET that swallows errors and returns a default — for dashboard renders
     that must keep going even if one panel's endpoint is down. The error gets
-    stashed in session_state so the Health tab can surface it."""
+    stashed in session_state so the Health tab can surface it.
+
+    In OFFLINE_MODE we skip the network entirely so the dashboard renders
+    cards/tabs against the supplied defaults instead of waiting on timeouts.
+    """
+    if OFFLINE_MODE:
+        return default
     try:
-        return api_get(path, params=params)
+        return api_get(path, params=params, timeout=DEFAULT_TIMEOUT)
     except ApiError as exc:
         errors = st.session_state.setdefault("_fetch_errors", {})
         errors[path] = exc
@@ -2017,9 +2031,15 @@ def action_sync_pnl_wallets() -> None:
 
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_health() -> dict[str, Any] | None:
+    # First attempt of the session gets the cold-start budget (~45s) because
+    # Render needs that long to wake the worker. Subsequent calls use the
+    # tight warm timeout so a half-dead backend can't stall the dashboard.
+    warmed = bool(st.session_state.get("_backend_warmed"))
+    timeout = HEALTH_WARM_TIMEOUT if warmed else HEALTH_TIMEOUT
     try:
-        payload = api_get("/health", timeout=HEALTH_TIMEOUT)
+        payload = api_get("/health", timeout=timeout)
         payload["_frontend_state"] = "healthy"
+        st.session_state["_backend_warmed"] = True
         return payload
     except ApiError as exc:
         st.session_state.setdefault("_fetch_errors", {})["/health"] = exc
@@ -2302,59 +2322,53 @@ def position_watchlist_notes(position: dict[str, Any]) -> str:
 # =============================================================================
 
 st.session_state.setdefault("_fetch_errors", {})
-health = fetch_health()
 
-if health and health.get("_frontend_state") == "waking":
-    attempts = int(st.session_state.get("_backend_wake_attempts", 0))
-    st.session_state["_backend_wake_attempts"] = attempts + 1
-    st.markdown(
-        f"""
-        <div class='sf-header'>
-          <div class='sf-brand'>
-            <span class='sf-brand-mark'>â—†</span>
-            <span class='sf-brand-name'>SIGNALFORGE</span>
-            <span class='sf-brand-tagline'>Prediction Market + MLB Edge Terminal</span>
-          </div>
-          <div>{badge("WAKING BACKEND", "purple")}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.info(
-        f"Backend URL: **{API_BASE}**\n\n"
-        "The `/health` request timed out during the first backend probe. "
-        "This usually means Render is cold-starting; retrying automatically."
-    )
-    if attempts < 4:
-        time.sleep(min(3 + attempts * 2, 10))
-        st.cache_data.clear()
-        st.rerun()
-    st.warning("Backend is still waking or degraded. Refresh in a moment if this does not advance.")
-    st.stop()
+# Degraded-mode contract: the dashboard NEVER hard-stops on a backend miss.
+# fetch_health() may return None (offline), {"_frontend_state": "waking"} (cold
+# start), or a healthy payload. Each pre-fetch below uses safe_get() which
+# already absorbs ApiError and returns the supplied default — so missing
+# endpoints render as empty cards, not a blank page.
+if OFFLINE_MODE:
+    health = {
+        "ok": False,
+        "status": "offline_mode",
+        "_frontend_state": "offline",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+else:
+    health = fetch_health()
 
-if health is None:
-    st.markdown(
-        f"""
-        <div class='sf-header'>
-          <div class='sf-brand'>
-            <span class='sf-brand-mark'>◆</span>
-            <span class='sf-brand-name'>SIGNALFORGE</span>
-            <span class='sf-brand-tagline'>Prediction Market + MLB Edge Terminal</span>
-          </div>
-          <div>{badge("BACKEND OFFLINE", "red")}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+backend_state: str
+if OFFLINE_MODE:
+    backend_state = "offline"
+elif health is None:
+    backend_state = "offline"
+elif health.get("_frontend_state") == "waking":
+    backend_state = "waking"
+else:
+    backend_state = "healthy"
+
+if backend_state == "waking":
+    st.warning(
+        f"Backend at **{API_BASE}** is waking up (Render cold start can take ~30-60s). "
+        "Rendering the dashboard shell with empty data — refresh in a moment for live values."
     )
+elif backend_state == "offline":
     err = st.session_state["_fetch_errors"].get("/health")
-    if isinstance(err, ApiError):
-        render_api_error(err, prefix="Cannot reach SignalForge backend")
-    st.info(
-        f"Backend URL: **{API_BASE}**\n\n"
-        "Start it locally with:\n```bash\nuvicorn app.main:app --reload\n```\n"
-        "Or set `SIGNALFORGE_API_URL` to your deployed instance."
-    )
-    st.stop()
+    if OFFLINE_MODE:
+        st.info(
+            "OFFLINE MODE — SignalForge backend calls are disabled. "
+            "Dashboard shell renders with empty/mock data only."
+        )
+    else:
+        st.error(
+            f"Backend at **{API_BASE}** is unreachable. Showing dashboard shell with "
+            "empty data. Start the backend locally with `uvicorn app.main:app --reload` "
+            "or check Render logs."
+        )
+        if isinstance(err, ApiError):
+            with st.expander("Show backend error"):
+                render_api_error(err, prefix="Cannot reach SignalForge backend")
 
 
 # =============================================================================
