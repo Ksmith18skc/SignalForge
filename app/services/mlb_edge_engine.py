@@ -6,7 +6,7 @@ import logging
 from datetime import date, datetime
 from typing import Any
 
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -50,6 +50,17 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
     odds = OddsApiProvider(settings.odds_api_key, settings.odds_api_base_url, settings.odds_bookmakers)
 
     games = await _load_games(mlb, card_date)
+    # Snapshots for OTHER dates are never touched — only this card_date's
+    # rows are recomputed. We surface both counts so the UI can show the
+    # user "X snapshots written for today, Y preserved from prior dates."
+    preserved_snapshots = int(
+        db.scalar(
+            select(func.count())
+            .select_from(MlbEdge)
+            .where(MlbEdge.generated_for_date != card_date)
+        )
+        or 0
+    )
     db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
     db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
 
@@ -142,11 +153,14 @@ async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> d
     )
     return {
         "date": card_date,
+        "generated_for_date": card_date,
         "games": len(games),
         "odds_events": refresh.events_fetched,
         "events_with_totals": totals_count,
         "events_with_pitcher_props": pitcher_k_count,
         "edges": len(created_edges),
+        "snapshots_written": len(created_edges),
+        "snapshots_preserved_from_prior_dates": preserved_snapshots,
         "odds_refresh": refresh.as_dict(),
         "daily_card": _card_to_dict(card),
     }

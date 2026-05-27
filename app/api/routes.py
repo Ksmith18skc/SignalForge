@@ -64,10 +64,13 @@ from app.services.mlb_edge_engine import (
 from app.services.mlb_market_validation import validation_report
 from app.services.odds_cache import MLB_PITCHER_PROPS_TTL, MLB_TOTALS_TTL
 from app.services.mlb_performance import (
+    arizona_today,
+    arizona_window,
     clv_report,
     grade_edge,
     performance_by_market,
     performance_by_score_band,
+    performance_diagnostics,
     performance_summary,
     top_factors_by_performance,
     update_closing_line_fields,
@@ -1441,21 +1444,48 @@ async def mlb_debug_odds_cache_refresh(
 
 
 @router.post("/mlb/debug/closing-lines/run")
-async def mlb_debug_run_closing_lines(window_minutes: int = 30) -> dict[str, object]:
-    """Run the closing-line updater script once."""
-    from scripts.update_mlb_closing_lines import main_async
+async def mlb_debug_run_closing_lines(
+    window_minutes: int = 30,
+    date: str | None = None,
+) -> dict[str, object]:
+    """Run the closing-line updater once. Returns structured counts.
 
-    exit_code = await main_async(["--window-minutes", str(window_minutes)])
-    return {"status": "ok" if exit_code == 0 else "error", "exit_code": exit_code}
+    Accepts ?date=YYYY-MM-DD (Arizona). When omitted, no date filter is
+    applied so any ungraded edge near start time is eligible.
+    """
+    from scripts.update_mlb_closing_lines import run_async as closing_lines_run
+
+    result = await closing_lines_run(window_minutes=window_minutes, date=date)
+    result["status"] = "ok" if result.get("ok") else "error"
+    return result
 
 
 @router.post("/mlb/debug/grade-results/run")
-async def mlb_debug_run_grade_results() -> dict[str, object]:
-    """Run the MLB grading script once."""
-    from scripts.grade_mlb_results import main_async
+async def mlb_debug_run_grade_results(date: str | None = None) -> dict[str, object]:
+    """Run the MLB grading script once. Returns structured counts.
 
-    exit_code = await main_async([])
-    return {"status": "ok" if exit_code == 0 else "error", "exit_code": exit_code}
+    When ``date`` is provided, persists final scores into the
+    ``mlb_final_scores`` table before grading so subsequent runs (or a
+    redeploy with a cold live cache) can grade from the persisted rows.
+    """
+    from scripts.grade_mlb_results import run_async as grade_results_run
+
+    result = await grade_results_run(date=date)
+    result["status"] = "ok" if result.get("ok") else "error"
+    return result
+
+
+@router.post("/mlb/debug/final-scores/ingest")
+async def mlb_debug_ingest_final_scores(
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Ingest persisted final scores for a date (Arizona). Idempotent upsert."""
+    from app.services.mlb_final_scores import ingest_final_scores_for_date
+
+    target = date or arizona_today()
+    mlb = MlbStatsApiProvider()
+    return await ingest_final_scores_for_date(db, mlb, date=target)
 
 
 @router.post("/mlb/edges/{edge_id}/grade")
@@ -1514,26 +1544,78 @@ def mlb_update_closing_lines(
     return {"updated": updated, "missing_edge_ids": missing}
 
 
+def _perf_window(days: int | None, date: str | None) -> tuple[str | None, str | None]:
+    """Resolve (start, end) Arizona dates from ?days= and ?date= params.
+
+    - ``date`` (single day) wins when provided.
+    - ``days`` (rolling window ending today AZ) is used otherwise.
+    - When neither is provided, returns (None, None) for all-time.
+    """
+    if date:
+        return date, date
+    if days and days > 0:
+        return arizona_window(days)
+    return None, None
+
+
 @router.get("/mlb/performance/summary")
-def mlb_performance_summary(db: Session = Depends(get_db)) -> dict[str, object]:
-    data = performance_summary(db)
-    data["top_factors_by_performance"] = top_factors_by_performance(db)[:10]
+def mlb_performance_summary(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    start_date, end_date = _perf_window(days, date)
+    data = performance_summary(db, start_date=start_date, end_date=end_date)
+    data["top_factors_by_performance"] = top_factors_by_performance(
+        db, start_date=start_date, end_date=end_date,
+    )[:10]
+    data["diagnostics"] = performance_diagnostics(
+        db, start_date=start_date, end_date=end_date,
+    )
+    data["arizona_today"] = arizona_today()
+    data["window"] = {"start_date": start_date, "end_date": end_date, "days": days}
     return data
 
 
 @router.get("/mlb/performance/by-market")
-def mlb_performance_by_market(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return performance_by_market(db)
+def mlb_performance_by_market(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    return performance_by_market(db, start_date=start_date, end_date=end_date)
 
 
 @router.get("/mlb/performance/by-score-band")
-def mlb_performance_by_score_band(db: Session = Depends(get_db)) -> list[dict[str, object]]:
-    return performance_by_score_band(db)
+def mlb_performance_by_score_band(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    return performance_by_score_band(db, start_date=start_date, end_date=end_date)
 
 
 @router.get("/mlb/performance/clv")
-def mlb_performance_clv(db: Session = Depends(get_db)) -> dict[str, object]:
-    return clv_report(db)
+def mlb_performance_clv(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    start_date, end_date = _perf_window(days, date)
+    return clv_report(db, start_date=start_date, end_date=end_date)
+
+
+@router.get("/mlb/performance/diagnostics")
+def mlb_performance_diagnostics(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Visibility counts so the dashboard can explain *why* the tab is empty."""
+    start_date, end_date = _perf_window(days, date)
+    return performance_diagnostics(db, start_date=start_date, end_date=end_date)
 
 
 def _optional_float(value: object) -> float | None:

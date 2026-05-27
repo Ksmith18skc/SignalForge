@@ -382,6 +382,28 @@ class MlbEdgeFactor(Base):
     note: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class MlbFinalScore(Base):
+    """Persisted final-score table.
+
+    Grading reads from here first so a redeploy that drops the live API cache
+    (or transient StatsAPI outages) cannot silently strand ungraded edges.
+    One row per ``game_pk``; ``generated_for_date`` is the Arizona card date
+    so the row aligns with the matching ``MlbEdge.generated_for_date``.
+    """
+
+    __tablename__ = "mlb_final_scores"
+
+    game_pk: Mapped[int] = mapped_column(Integer, primary_key=True)
+    generated_for_date: Mapped[str] = mapped_column(String(10), index=True)
+    home_team: Mapped[str] = mapped_column(String(128))
+    away_team: Mapped[str] = mapped_column(String(128))
+    home_score: Mapped[int] = mapped_column(Integer)
+    away_score: Mapped[int] = mapped_column(Integer)
+    total_runs: Mapped[int] = mapped_column(Integer)
+    status: Mapped[str] = mapped_column(String(64), default="Final")
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, index=True)
+
+
 class OddsSnapshot(Base):
     """Single source of truth for raw Odds-API payloads.
 

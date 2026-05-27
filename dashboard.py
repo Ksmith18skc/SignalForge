@@ -690,7 +690,7 @@ def _request_json(
                 if method == "GET":
                     r = c.get(path, params=params, timeout=timeout)
                 else:
-                    r = c.post(path, json=json, timeout=timeout)
+                    r = c.post(path, params=params, json=json, timeout=timeout)
         except httpx.HTTPError as exc:
             last_error = ApiError(f"{type(exc).__name__}: {exc}", method=method, url=url)
             if attempt >= retry_count:
@@ -726,8 +726,13 @@ def api_get(path: str, params: dict[str, Any] | None = None, timeout: float = DE
     return _request_json("GET", path, params=params, timeout=timeout)
 
 
-def api_post(path: str, json: Any = None, timeout: float = DEFAULT_TIMEOUT) -> Any:
-    return _request_json("POST", path, json=json, timeout=timeout)
+def api_post(
+    path: str,
+    json: Any = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    return _request_json("POST", path, params=params, json=json, timeout=timeout)
 
 
 def api_get_once(path: str, *, timeout: float = 8.0) -> Any:
@@ -785,6 +790,26 @@ def safe_get(path: str, *, default: Any, params: dict[str, Any] | None = None) -
 
 DASH = "—"
 TZ_MST = ZoneInfo("America/Phoenix")
+
+
+def _resolve_perf_window(choice: str) -> tuple[int | None, str | None]:
+    """Map a selectbox label to (days, single_date) for the performance API.
+
+    Dates are Arizona/MST so the rollover lines up with the backend default
+    (``app.services.mlb_performance.arizona_today``).
+    """
+    today_az = datetime.now(TZ_MST).date()
+    if choice == "Today":
+        return None, today_az.isoformat()
+    if choice == "Yesterday":
+        return None, (today_az - timedelta(days=1)).isoformat()
+    if choice == "Last 7 days":
+        return 7, None
+    if choice == "Last 30 days":
+        return 30, None
+    if choice == "All time":
+        return None, None
+    return 7, None
 
 
 def fmt_num(value: Any, *, fmt: str = "{:.2f}", default: str = DASH) -> str:
@@ -1951,9 +1976,13 @@ def action_run_mlb_edge_scan() -> None:
         except ApiError as exc:
             render_api_error(exc, prefix="MLB edge scan failed")
             return
+    generated_for = result.get("generated_for_date") or result.get("date") or "?"
+    written = int(result.get("snapshots_written") or result.get("edges") or 0)
+    preserved = int(result.get("snapshots_preserved_from_prior_dates") or 0)
     st.success(
-        f"MLB scan: {result.get('edges', 0)} edges across {result.get('games', 0)} games "
-        f"(odds events: {result.get('odds_events', 0)})."
+        f"MLB scan for {generated_for}: {written} snapshot(s) written across "
+        f"{result.get('games', 0)} game(s) (odds events: {result.get('odds_events', 0)}). "
+        f"{preserved} snapshot(s) preserved from prior dates."
     )
     st.cache_data.clear()
     st.rerun()
@@ -1987,31 +2016,85 @@ def action_test_backend() -> None:
     )
 
 
-def action_update_mlb_closing_lines() -> None:
+def action_update_mlb_closing_lines(date: str | None = None) -> None:
+    params: dict[str, Any] = {}
+    if date:
+        params["date"] = date
     with st.spinner("Updating MLB closing lines..."):
         try:
             result = api_post(
                 "/mlb/debug/closing-lines/run",
                 timeout=MLB_RUN_TIMEOUT,
+                params=params or None,
             )
         except ApiError as exc:
             render_api_error(exc, prefix="Closing-line update failed")
             return
-    status = result.get("status") or "ok"
-    st.success(f"Closing-line update finished ({status}).")
+    updated = int(result.get("closing_lines_updated") or 0)
+    candidates = int(result.get("candidates") or 0)
+    skipped = int(result.get("skipped") or 0)
+    failed = int(result.get("failed") or 0)
+    reason = result.get("reason")
+    date_suffix = f" for {date}" if date else ""
+    if updated:
+        st.success(
+            f"Closing lines updated{date_suffix}: {updated} of {candidates} candidate edge(s). "
+            f"Skipped {skipped}, failed {failed}."
+        )
+    elif reason:
+        st.warning(f"Closing-line update finished{date_suffix} — no rows updated. {reason}")
+    else:
+        st.info(
+            f"Closing-line update finished{date_suffix}: 0 updated, {candidates} candidate(s), "
+            f"{skipped} skipped, {failed} failed."
+        )
     st.cache_data.clear()
     st.rerun()
 
 
-def action_grade_mlb_results() -> None:
+def action_grade_mlb_results(date: str | None = None) -> None:
+    params: dict[str, Any] = {}
+    if date:
+        params["date"] = date
     with st.spinner("Grading MLB results..."):
         try:
-            result = api_post("/mlb/debug/grade-results/run", timeout=MLB_RUN_TIMEOUT)
+            result = api_post(
+                "/mlb/debug/grade-results/run",
+                timeout=MLB_RUN_TIMEOUT,
+                params=params or None,
+            )
         except ApiError as exc:
             render_api_error(exc, prefix="MLB grading failed")
             return
-    status = result.get("status") or "ok"
-    st.success(f"MLB grading finished ({status}).")
+    graded = int(result.get("graded") or 0)
+    candidates = int(result.get("candidates") or 0)
+    finals = int(result.get("finals_found") or 0)
+    persisted = int(result.get("graded_from_persisted") or 0)
+    live = int(result.get("graded_from_live") or 0)
+    skipped_not_final = int(result.get("skipped_not_final") or 0)
+    failed = int(result.get("failed") or 0)
+    ingestion = result.get("ingestion") or {}
+    upserted = int(ingestion.get("upserted") or 0)
+    reason = result.get("reason")
+    date_suffix = f" for {date}" if date else ""
+    if graded:
+        st.success(
+            f"Graded {graded} edge(s){date_suffix} across {finals} final game(s) "
+            f"(persisted: {persisted}, live: {live}). Ingested {upserted} new "
+            f"final-score row(s). Candidates: {candidates}, not-yet-final: "
+            f"{skipped_not_final}, failed: {failed}."
+        )
+    elif reason:
+        st.warning(
+            f"MLB grading finished{date_suffix} — no edges graded. {reason} "
+            f"(Ingested {upserted} final-score row(s).)"
+        )
+    else:
+        st.info(
+            f"MLB grading finished{date_suffix}: candidates={candidates}, "
+            f"finals={finals}, not_final={skipped_not_final}, failed={failed}, "
+            f"ingested={upserted}."
+        )
     st.cache_data.clear()
     st.rerun()
 
@@ -2137,12 +2220,20 @@ def fetch_pitcher_props(limit: int = 100) -> dict[str, Any]:
 
 
 @st.cache_data(ttl=30, show_spinner=False)
-def fetch_mlb_performance() -> dict[str, Any]:
+def fetch_mlb_performance(
+    days: int | None = None,
+    date: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    if days is not None:
+        params["days"] = days
+    if date:
+        params["date"] = date
     out: dict[str, Any] = {
-        "summary": safe_get("/mlb/performance/summary", default={}),
-        "by_market": safe_get("/mlb/performance/by-market", default=[]),
-        "by_score_band": safe_get("/mlb/performance/by-score-band", default=[]),
-        "clv": safe_get("/mlb/performance/clv", default={}),
+        "summary": safe_get("/mlb/performance/summary", default={}, params=params or None),
+        "by_market": safe_get("/mlb/performance/by-market", default=[], params=params or None),
+        "by_score_band": safe_get("/mlb/performance/by-score-band", default=[], params=params or None),
+        "clv": safe_get("/mlb/performance/clv", default={}, params=params or None),
     }
     return out
 
@@ -2395,7 +2486,9 @@ alerts_all = fetch_alerts(limit=200)
 mlb_edges_all = fetch_mlb_edges(limit=100)
 mlb_daily_card = fetch_mlb_daily_card()
 mlb_sources = fetch_mlb_sources()
-mlb_performance = fetch_mlb_performance()
+_perf_choice = st.session_state.get("perf_window_choice", "Last 7 days")
+_perf_window_days, _perf_window_date = _resolve_perf_window(_perf_choice)
+mlb_performance = fetch_mlb_performance(days=_perf_window_days, date=_perf_window_date)
 pnl_payload = fetch_pnl_tracker()
 odds_cache_payload = fetch_odds_cache()
 odds_providers_payload = fetch_odds_providers()
@@ -2972,39 +3065,125 @@ with tab_pnl:
 
 with tab_perf:
     st.markdown("### Performance Window")
+    window_options = ["Last 7 days", "Today", "Yesterday", "Last 30 days", "All time"]
     window = st.selectbox(
         "Date range",
-        ["Last 7 days", "Today", "Yesterday", "Last 30 days", "All time", "Custom"],
-        index=0,
+        window_options,
+        index=window_options.index(_perf_choice) if _perf_choice in window_options else 0,
+        key="perf_window_choice",
     )
-    if window == "Custom":
-        st.caption("Custom date filtering is not yet wired; showing all available data.")
-    else:
-        st.caption("Backend does not yet expose date filters; showing all available data.")
+    perf_days, perf_date = _resolve_perf_window(window)
+    diagnostics = perf_summary.get("diagnostics") or {}
+    backend_window = perf_summary.get("window") or {}
+    backend_start = backend_window.get("start_date") or diagnostics.get("start_date")
+    backend_end = backend_window.get("end_date") or diagnostics.get("end_date")
+    arizona_today_iso = perf_summary.get("arizona_today") or datetime.now(TZ_MST).date().isoformat()
+    range_label = (
+        f"{backend_start} → {backend_end}" if backend_start and backend_end else "all available data"
+    )
+    st.caption(f"Arizona today: **{arizona_today_iso}** · backend window: **{range_label}**")
 
     perf_actions = st.columns([1, 1, 6])
+    action_date = perf_date  # only pass to backend when a single day is selected
     with perf_actions[0]:
         if st.button("Update closing lines", use_container_width=True):
-            action_update_mlb_closing_lines()
+            action_update_mlb_closing_lines(date=action_date)
     with perf_actions[1]:
         if st.button("Grade MLB results", use_container_width=True):
-            action_grade_mlb_results()
+            action_grade_mlb_results(date=action_date)
 
-    st.markdown("### Today's Score Distribution")
+    # --- Debug visibility panel so the user can tell WHY the tab is empty ----
+    with st.expander("Performance debug panel", expanded=not (perf_summary.get("graded_edges") or 0)):
+        dbg_row1 = st.columns(4)
+        dbg_row1[0].metric("Selected date", perf_date or backend_start or arizona_today_iso)
+        dbg_row1[1].metric("Candidate edge snapshots", diagnostics.get("snapshot_count", 0))
+        dbg_row1[2].metric("Closing lines", diagnostics.get("closing_line_count", 0))
+        dbg_row1[3].metric("Graded edges", diagnostics.get("graded_edge_count", 0))
+        dbg_row2 = st.columns(4)
+        dbg_row2[0].metric(
+            "Persisted final scores", diagnostics.get("persisted_final_score_count", 0),
+        )
+        dbg_row2[1].metric("Live finals found", diagnostics.get("live_final_count", 0))
+        dbg_row2[2].metric(
+            "Backend window",
+            f"{backend_start or 'all'} → {backend_end or 'all'}",
+        )
+        dbg_row2[3].metric(
+            "Last graded at", diagnostics.get("last_graded_at") or "—",
+        )
+        st.caption(
+            f"Selected: **{window}** · Arizona today: **{arizona_today_iso}** · "
+            f"backend dates: **{backend_start or 'all'} → {backend_end or 'all'}**"
+        )
+        if diagnostics.get("reason"):
+            st.info(diagnostics["reason"])
+        if perf_date:
+            if st.button(
+                "Ingest persisted final scores for selected date",
+                use_container_width=False,
+                key="ingest_final_scores_btn",
+            ):
+                with st.spinner(f"Ingesting final scores for {perf_date}..."):
+                    try:
+                        ingest_result = api_post(
+                            "/mlb/debug/final-scores/ingest",
+                            params={"date": perf_date},
+                            timeout=MLB_RUN_TIMEOUT,
+                        )
+                    except ApiError as exc:
+                        render_api_error(exc, prefix="Final-score ingestion failed")
+                        ingest_result = None
+                if ingest_result is not None:
+                    if ingest_result.get("error"):
+                        st.warning(
+                            f"Final-score ingestion error for {perf_date}: "
+                            f"{ingest_result['error']}"
+                        )
+                    else:
+                        st.success(
+                            f"Final scores for {perf_date}: "
+                            f"games_seen={ingest_result.get('games_seen', 0)}, "
+                            f"finals_found={ingest_result.get('finals_found', 0)}, "
+                            f"upserted={ingest_result.get('upserted', 0)}."
+                        )
+                    st.cache_data.clear()
+                    st.rerun()
+
+    st.markdown(f"### Score Distribution · {range_label}")
     render_score_distribution(mlb_edges_all)
     render_why_no_high_conviction(mlb_edges_all)
 
-    graded = perf_summary.get("graded_edges") or 0
-    if not graded:
+    snapshot_count = int(diagnostics.get("snapshot_count") or 0)
+    final_score_count = int(diagnostics.get("final_score_count") or 0)
+    graded = int(perf_summary.get("graded_edges") or 0)
+    if snapshot_count == 0:
+        target = perf_date or backend_start or arizona_today_iso
         render_empty_state(
-            "WAITING FOR GRADED RESULTS",
-            "No graded edges yet. Update closing lines, then grade MLB results.",
+            "NO SAVED EDGE SNAPSHOTS",
+            f"No saved edge snapshots for {target}. Run an MLB edge scan during game "
+            "day to enable grading tomorrow.",
             actions=[
-                ("Update closing lines", action_update_mlb_closing_lines),
-                ("Grade MLB results", action_grade_mlb_results),
+                ("Update closing lines", lambda: action_update_mlb_closing_lines(date=action_date)),
+                ("Grade MLB results", lambda: action_grade_mlb_results(date=action_date)),
             ],
         )
-    else:
+    elif graded == 0:
+        body = (
+            diagnostics.get("reason")
+            or (
+                f"{snapshot_count} edge snapshot(s) found but {final_score_count} final score(s) "
+                "are ingested. Click 'Grade MLB results' once games are final."
+            )
+        )
+        render_empty_state(
+            "WAITING FOR GRADED RESULTS",
+            body,
+            actions=[
+                ("Update closing lines", lambda: action_update_mlb_closing_lines(date=action_date)),
+                ("Grade MLB results", lambda: action_grade_mlb_results(date=action_date)),
+            ],
+        )
+    if graded:
         pc1, pc2, pc3, pc4, pc5, pc6, pc7 = st.columns(7)
         pc1.metric("Graded edges", graded)
         pc2.metric("Win rate", fmt_pct(perf_summary.get("win_rate")))

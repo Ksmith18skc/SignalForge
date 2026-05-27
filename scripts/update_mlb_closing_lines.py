@@ -24,28 +24,52 @@ from app.services.mlb_performance import update_closing_line_fields
 logger = logging.getLogger(__name__)
 
 
-async def main_async(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Update MLB edge closing lines")
-    parser.add_argument("--window-minutes", type=int, default=30)
-    parser.add_argument("--log-level", default="INFO")
-    args = parser.parse_args(argv)
-    logging.basicConfig(level=args.log_level)
+async def run_async(
+    *,
+    window_minutes: int = 30,
+    date: str | None = None,
+    db: Session | None = None,
+    odds: Any | None = None,
+) -> dict[str, Any]:
+    """Refresh closing lines for ungraded edges and return a structured result.
 
-    init_db()
-    settings = get_settings()
-    odds = OddsApiProvider(settings.odds_api_key, settings.odds_api_base_url, settings.odds_bookmakers)
-    db = SessionLocal()
+    When ``date`` is provided, only edges whose linked game is on that date are
+    considered. Returns counts plus a `reason` when zero rows are updated so
+    the dashboard can show something more useful than a generic "OK".
+    """
+    if db is None:
+        init_db()
+        db = SessionLocal()
+        owns_db = True
+    else:
+        owns_db = False
+    if odds is None:
+        settings = get_settings()
+        odds = OddsApiProvider(
+            settings.odds_api_key, settings.odds_api_base_url, settings.odds_bookmakers,
+        )
+
     counts = {"updated": 0, "skipped": 0, "failed": 0}
+    candidates: list[tuple[MlbEdge, MlbGame]] = []
+    games_refreshed = 0
+    reason: str | None = None
     try:
-        candidates = _candidate_edges(db, args.window_minutes)
+        candidates = _candidate_edges(db, window_minutes, date=date)
+        if not candidates:
+            reason = (
+                f"No ungraded edge snapshots near start time for {date}."
+                if date else
+                "No ungraded edge snapshots near start time. Run an MLB edge scan "
+                "before game day to enable closing-line capture."
+            )
+            logger.info("MLB closing lines: %s", reason)
+            return _result(counts, candidates, games_refreshed, date, reason)
 
-        # Refresh the centralized odds cache once per game_date — never per
-        # edge. With ~10 edges/game and ~15 games/day this turns ~150 live
-        # calls into 1 events call + 15 odds calls.
         for game_date, games in _games_by_date(candidates).items():
             await odds_cache.refresh_mlb_odds_cache(
                 db, odds, games, game_date=game_date, force=True,
             )
+            games_refreshed += len(games)
 
         for edge, game in candidates:
             try:
@@ -55,31 +79,83 @@ async def main_async(argv: list[str] | None = None) -> int:
                 if closing_line is None and closing_price is None:
                     counts["skipped"] += 1
                     continue
-                update_closing_line_fields(edge, closing_line=closing_line, closing_price=closing_price)
+                update_closing_line_fields(
+                    edge, closing_line=closing_line, closing_price=closing_price,
+                )
                 counts["updated"] += 1
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Failed closing-line update for edge=%s: %s", edge.id, exc)
                 counts["failed"] += 1
         db.commit()
-        logger.info("MLB closing lines: updated=%d skipped=%d failed=%d", counts["updated"], counts["skipped"], counts["failed"])
-        return 0 if counts["failed"] == 0 else 1
-    finally:
-        db.close()
-
-
-def _candidate_edges(db: Session, window_minutes: int) -> list[tuple[MlbEdge, MlbGame]]:
-    cutoff = datetime.utcnow() + timedelta(minutes=window_minutes)
-    return list(
-        db.execute(
-            select(MlbEdge, MlbGame)
-            .join(MlbGame, MlbGame.game_pk == MlbEdge.game_pk)
-            .where(
-                MlbEdge.win_loss_push.is_(None),
-                MlbGame.start_time.is_not(None),
-                MlbGame.start_time <= cutoff,
+        logger.info(
+            "MLB closing lines: candidates=%d games_refreshed=%d updated=%d skipped=%d "
+            "failed=%d date=%s",
+            len(candidates), games_refreshed, counts["updated"], counts["skipped"],
+            counts["failed"], date,
+        )
+        if counts["updated"] == 0 and reason is None:
+            reason = (
+                f"Found {len(candidates)} candidate edge(s) but no closing lines were "
+                "available from upstream odds. Try again after odds-api refresh."
             )
-        ).all()
+        return _result(counts, candidates, games_refreshed, date, reason)
+    finally:
+        if owns_db:
+            db.close()
+
+
+def _result(
+    counts: dict[str, int],
+    candidates: list[tuple[MlbEdge, MlbGame]],
+    games_refreshed: int,
+    date: str | None,
+    reason: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "ok": counts["failed"] == 0,
+        "date": date,
+        "candidates": len(candidates),
+        "games_refreshed": games_refreshed,
+        "closing_lines_updated": counts["updated"],
+        "skipped": counts["skipped"],
+        "failed": counts["failed"],
+    }
+    if reason:
+        payload["reason"] = reason
+    return payload
+
+
+async def main_async(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Update MLB edge closing lines")
+    parser.add_argument("--window-minutes", type=int, default=30)
+    parser.add_argument("--date", default=None, help="YYYY-MM-DD game date filter")
+    parser.add_argument("--log-level", default="INFO")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=args.log_level)
+
+    result = await run_async(window_minutes=args.window_minutes, date=args.date)
+    return 0 if result.get("ok") else 1
+
+
+def _candidate_edges(
+    db: Session,
+    window_minutes: int,
+    *,
+    date: str | None = None,
+) -> list[tuple[MlbEdge, MlbGame]]:
+    cutoff = datetime.utcnow() + timedelta(minutes=window_minutes)
+    query = (
+        select(MlbEdge, MlbGame)
+        .join(MlbGame, MlbGame.game_pk == MlbEdge.game_pk)
+        .where(
+            MlbEdge.win_loss_push.is_(None),
+            MlbGame.start_time.is_not(None),
+            MlbGame.start_time <= cutoff,
+        )
     )
+    if date:
+        query = query.where(MlbGame.game_date == date)
+    return list(db.execute(query).all())
 
 
 def _analysis_for_edge(edge: MlbEdge, payload: dict[str, Any] | None) -> dict[str, Any]:
