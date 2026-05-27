@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     mlb_discord_min_score: float = 80.0
     mlb_edge_default_game_date: str | None = None
 
+    # --- wallet-flow enrichment (join tracked-wallet positions to edges) ---
+    # Sportsbook totals are decimal (10.1); Polymarket markets are half-points
+    # (total-10pt5 -> 10.5). This tolerance bridges the two when joining.
+    wallet_flow_total_line_tolerance: float = 0.5
+    wallet_flow_spread_line_tolerance: float = 0.5
+    # Bounded score nudges so wallet flow influences but never dominates.
+    wallet_flow_elite_score_bonus: float = 4.0
+    wallet_flow_opposing_penalty: float = 5.0
+    wallet_flow_crowded_penalty: float = 2.0
+    wallet_flow_max_adjustment: float = 6.0
+
     # --- alert channels ---
     discord_webhook_url: str | None = None
     discord_bot_token: str | None = None

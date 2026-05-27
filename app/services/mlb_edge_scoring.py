@@ -100,6 +100,7 @@ def edge_to_dict(edge: Any) -> dict[str, Any]:
         "warnings": edge.warnings or [],
         "data_sources_used": edge.data_sources_used or [],
         "factors": edge.factors or {},
+        "wallet_context": edge.wallet_context or None,
         "generated_for_date": edge.generated_for_date,
         "opening_line": edge.opening_line,
         "current_line": edge.current_line,

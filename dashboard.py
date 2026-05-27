@@ -24,6 +24,7 @@ import pandas as pd
 import streamlit as st
 
 from app.components.pnl_dashboard import render_pnl_summary_cards, render_pnl_tracker
+from app.services import wallet_market_resolver as wmr
 from app.utils.dashboard_format import (
     SCORE_ACTIONABLE_MIN,
     SCORE_BUCKETS,
@@ -410,6 +411,11 @@ button[data-baseweb="tab"][aria-selected="true"] {
 
 /* --- Misc --- */
 .sf-meta { color: var(--muted); font-size: 0.78rem; }
+.sf-link { color: var(--cyan); text-decoration: none; }
+.sf-link:hover { text-decoration: underline; }
+.sf-wallet-row { font-size: 0.82rem; margin: 2px 0; }
+.sf-wallet-debug { margin-top: 6px; }
+.sf-wallet-debug summary { cursor: pointer; }
 .sf-divider {
   height: 1px;
   background: var(--border);
@@ -1538,6 +1544,163 @@ def _live_dot(edge: dict[str, Any]) -> str:
     return "<span class='pulse-dot'></span>"
 
 
+_ALERT_SLUG_RE = re.compile(r"\b(mlb-[a-z0-9\-]+)", re.IGNORECASE)
+
+
+def _edge_matchup_index(edges: list[dict[str, Any]]) -> dict[frozenset[str], str]:
+    """Map each today-card edge's team pair -> a short matchup label, so a
+    Falcon alert for the same game can point back at its edge card."""
+    index: dict[frozenset[str], str] = {}
+    for edge in edges or []:
+        away = wmr.fullname_to_abbr(edge.get("away_team"))
+        home = wmr.fullname_to_abbr(edge.get("home_team"))
+        if not away or not home:
+            continue
+        pair = frozenset({away, home})
+        index.setdefault(pair, f"{team_short(edge.get('away_team'))} @ {team_short(edge.get('home_team'))}")
+    return index
+
+
+def _alert_edge_reference(message: str | None, edge_matchups: dict[frozenset[str], str]) -> str:
+    """Return a small '→ see edge card' note when the alert's market slug
+    resolves to a game that has an edge on today's card; else empty string."""
+    if not message or not edge_matchups:
+        return ""
+    match = _ALERT_SLUG_RE.search(message)
+    if not match:
+        return ""
+    parsed = wmr.parse_market_slug(match.group(1).lower())
+    if parsed is None:
+        return ""
+    label = edge_matchups.get(parsed.team_pair())
+    if not label:
+        return ""
+    return f"<div class='sf-card-row sf-meta'>→ see edge card: {label}</div>"
+
+
+_WALLET_TAG_KIND = {
+    "WALLET CONFIRMED": "green",
+    "ELITE AGREEMENT": "gold",
+    "ELITE DISAGREEMENT": "red",
+    "CROWDED SIDE": "purple",
+    "NO WALLET DATA": "muted",
+}
+
+
+def _wallet_row(w: dict[str, Any]) -> str:
+    name = w.get("trader_name") or "wallet"
+    profile = w.get("profile_url")
+    name_html = (
+        f'<a class="sf-link" href="{profile}" target="_blank" rel="noopener">{name}</a>'
+        if profile
+        else name
+    )
+    tier = str(w.get("tier") or "").lower()
+    tier_kind = {"elite": "gold", "trusted": "green"}.get(tier, "muted")
+    size = fmt_money(w.get("size_usd"))
+    entry = w.get("avg_entry")
+    entry_str = f" @ {entry:.2f}" if isinstance(entry, (int, float)) else ""
+    market = w.get("market_url")
+    mkt_html = (
+        f' · <a class="sf-link" href="{market}" target="_blank" rel="noopener">market</a>'
+        if market
+        else ""
+    )
+    return (
+        f"<div class='sf-wallet-row'>{name_html} {_pill(tier or 'neutral', tier_kind)} "
+        f"<span class='sf-meta'>{size}{entry_str}{mkt_html}</span></div>"
+    )
+
+
+def render_wallet_flow_section(edge: dict[str, Any]) -> str:
+    """`Wallet Flow Confirmation` — tracked-wallet consensus + contributors."""
+    ctx = edge.get("wallet_context") or None
+    if not ctx:
+        return ""
+
+    tags = ctx.get("tags") or []
+    tag_html = " ".join(_pill(t, _WALLET_TAG_KIND.get(t, "muted")) for t in tags)
+
+    tracked = int(ctx.get("tracked_wallet_count") or 0)
+    if tracked == 0:
+        # NO WALLET DATA: show the tag + the reason so the card is honest.
+        reason = ((ctx.get("debug") or {}).get("no_match_reason")) or "no tracked-wallet activity"
+        return (
+            "<div class='sf-section'>"
+            "<div class='sf-section-title'>Wallet Flow Confirmation</div>"
+            f"<div style='margin-bottom:4px;'>{tag_html}</div>"
+            f"<div class='sf-meta'>{reason}</div>"
+            f"{_render_wallet_debug(ctx)}"
+            "</div>"
+        )
+
+    consensus = ctx.get("consensus_pct")
+    consensus_str = f"{consensus:.0f}%" if isinstance(consensus, (int, float)) else DASH
+    aligned_exp = fmt_money(ctx.get("aligned_exposure_usd"))
+    opposing_exp = fmt_money(ctx.get("opposing_exposure_usd"))
+
+    summary = (
+        "<div class='sf-price-grid'>"
+        f"<div class='sf-price-cell'><div class='lbl'>Consensus</div><div class='val'>{consensus_str}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>Aligned</div><div class='val'>{aligned_exp}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>Opposing</div><div class='val'>{opposing_exp}</div></div>"
+        f"<div class='sf-price-cell'><div class='lbl'>Wallets</div><div class='val'>{tracked}</div></div>"
+        "</div>"
+    )
+
+    aligned = (ctx.get("aligned_wallets") or [])[:3]
+    opposing = (ctx.get("opposing_wallets") or [])[:3]
+    aligned_html = ""
+    if aligned:
+        aligned_html = (
+            "<div class='sf-meta' style='margin-top:6px;'>Aligned wallets</div>"
+            + "".join(_wallet_row(w) for w in aligned)
+        )
+    opposing_html = ""
+    if opposing:
+        opposing_html = (
+            "<div class='sf-meta' style='margin-top:6px;'>Opposing wallets</div>"
+            + "".join(_wallet_row(w) for w in opposing)
+        )
+
+    return (
+        "<div class='sf-section'>"
+        "<div class='sf-section-title'>Wallet Flow Confirmation</div>"
+        f"<div style='margin-bottom:4px;'>{tag_html}</div>"
+        f"{summary}{aligned_html}{opposing_html}"
+        f"{_render_wallet_debug(ctx)}"
+        "</div>"
+    )
+
+
+def _render_wallet_debug(ctx: dict[str, Any]) -> str:
+    """Expandable join explainability — uses a native <details> block so it
+    stays inside the card HTML rather than a separate Streamlit widget."""
+    debug = ctx.get("debug") or {}
+    if not debug:
+        return ""
+    key = debug.get("normalized_key") or {}
+    matched = debug.get("matched_slugs") or []
+    rows = [
+        ("Normalized key", f"{key.get('league')} {key.get('away_abbr')}@{key.get('home_abbr')} "
+                           f"{key.get('market_type')} {key.get('line')} {key.get('outcome')}"),
+        ("Sportsbook event", debug.get("sportsbook_event_id") or DASH),
+        ("Line tolerance", debug.get("line_tolerance")),
+        ("Candidate markets", debug.get("candidate_markets_considered")),
+        ("Matched market(s)", ", ".join(matched) if matched else DASH),
+    ]
+    if debug.get("no_match_reason"):
+        rows.append(("No-match reason", debug.get("no_match_reason")))
+    body = "".join(
+        f"<div class='sf-meta'><b>{label}:</b> {value}</div>" for label, value in rows
+    )
+    return (
+        "<details class='sf-wallet-debug'>"
+        "<summary class='sf-meta'>Wallet join debug</summary>"
+        f"{body}</details>"
+    )
+
+
 def render_edge_card(edge: dict[str, Any]) -> None:
     """Premium edge card. Single source of truth for the visual hierarchy
     used across Command Center, MLB Terminal, Daily Card."""
@@ -1626,6 +1789,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     form_section = _render_recent_form(edge)
     movement_section = _render_movement_clv(edge)
     trust_section = render_trust_tags(edge, odds_source=odds_source, fallback=fallback)
+    wallet_section = render_wallet_flow_section(edge)
     time_block = render_time_context(edge)
 
     reasons_html = ""
@@ -1669,6 +1833,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
       {form_section}
       {factor_section}
       {movement_section}
+      {wallet_section}
       {('<div class="sf-section"><div class="sf-section-title">Why we like it</div>' + reasons_html + '</div>') if reasons_html else ''}
       <div class="sf-section">{trust_section}</div>
       {links_html}
@@ -2919,13 +3084,16 @@ with tab_command:
         st.markdown("### Recent Alerts")
         recent_sent = [a for a in alerts_all if a.get("status") == "sent"][:5]
         if recent_sent:
+            edge_matchups = _edge_matchup_index(mlb_edges_all)
             for a in recent_sent:
                 channel = a.get("channel") or "?"
                 ch_badge = badge(channel, "purple" if channel == "discord" else "cyan")
+                edge_link = _alert_edge_reference(a.get("message"), edge_matchups)
                 st.markdown(
                     "<div class='sf-card'>"
                     + f"<div class='sf-card-row'>{ch_badge}<span class='sf-meta'> · {fmt_dt_mst(a.get('created_at'))}</span></div>"
                     + f"<div class='sf-card-row'>{(a.get('message') or '')[:160]}</div>"
+                    + edge_link
                     + "</div>",
                     unsafe_allow_html=True,
                 )

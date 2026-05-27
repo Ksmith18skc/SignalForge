@@ -361,6 +361,9 @@ class MlbEdge(Base):
     warnings: Mapped[list[str] | None] = mapped_column(JSON, default=list)
     data_sources_used: Mapped[list[str] | None] = mapped_column(JSON, default=list)
     factors: Mapped[dict[str, float] | None] = mapped_column(JSON, default=dict)
+    # Tracked-wallet consensus + contributors joined to this edge at scan time.
+    # Nullable: pitcher-K edges and totals with no wallet market stay None.
+    wallet_context: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     generated_for_date: Mapped[str] = mapped_column(String(10), index=True)
     opening_line: Mapped[float | None] = mapped_column(Float, nullable=True)
     current_line: Mapped[float | None] = mapped_column(Float, nullable=True)

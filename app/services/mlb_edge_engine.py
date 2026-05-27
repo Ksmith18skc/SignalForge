@@ -25,7 +25,7 @@ from app.providers.odds_api import OddsApiProvider
 from app.providers.weather_api import WeatherApiProvider
 from app.services import odds_cache
 from app.services.mlb_edge import statcast_context
-from app.services.mlb_edge_scoring import edge_to_dict
+from app.services.mlb_edge_scoring import classify_edge, edge_to_dict
 from app.services.mlb_environment import score_environment
 from app.services.mlb_odds_analysis import analyze_game_totals
 from app.services.mlb_odds_matching import MatchResult
@@ -147,6 +147,7 @@ async def run_daily_mlb_edges(
             )
         else:
             for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
+                _apply_wallet_flow(db, edge_payload, game, card_date)
                 if (edge_payload.get("score") or 0) < 65:
                     skipped_no_threshold += 1
                 created_edges.append(_persist_edge(db, edge_payload, card_date))
@@ -471,6 +472,42 @@ def _resolve_cached_payload(
     )
 
 
+def _apply_wallet_flow(
+    db: Session,
+    payload: dict[str, Any],
+    game: dict[str, Any],
+    card_date: str,
+) -> None:
+    """Join tracked-wallet activity to a game-level edge, attach the
+    ``wallet_context`` payload, and fold its bounded ``confidence_adjustment``
+    into the score (re-deriving action/confidence so they stay consistent)."""
+    from app.services.wallet_flow import build_wallet_context
+
+    try:
+        context = build_wallet_context(
+            db,
+            edge=payload,
+            home_team=game.get("home_team"),
+            away_team=game.get("away_team"),
+            card_date=card_date,
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment is best-effort
+        logger.warning("wallet-flow enrichment failed for game_pk=%s: %s", game.get("game_pk"), exc)
+        return
+
+    payload["wallet_context"] = context
+    adjustment = float(context.get("confidence_adjustment") or 0.0)
+    if not adjustment:
+        return
+
+    base_score = float(payload.get("score") or 0.0)
+    new_score = round(max(0.0, min(95.0, base_score + adjustment)), 2)
+    payload["score"] = new_score
+    cls = classify_edge(new_score, payload.get("warnings") or [])
+    payload["confidence"] = cls["confidence"]
+    payload["action"] = cls["action"]
+
+
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:
     edge = MlbEdge(
         game_pk=payload["game_pk"],
@@ -489,6 +526,7 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
         warnings=payload.get("warnings") or [],
         data_sources_used=payload.get("data_sources_used") or [],
         factors=payload.get("factors") or {},
+        wallet_context=payload.get("wallet_context") or None,
         generated_for_date=card_date,
         opening_line=payload.get("line"),
         current_line=payload.get("line"),
