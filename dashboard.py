@@ -1896,12 +1896,21 @@ def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callab
 
 
 def action_run_wallet_scan() -> None:
-    with st.spinner("Running wallet scan..."):
+    with st.spinner("Starting wallet scan..."):
         try:
             result = api_post("/run-scan", timeout=SCAN_TIMEOUT)
         except ApiError as exc:
             render_api_error(exc, prefix="Wallet scan failed")
             return
+    state = result.get("state")
+    if state == "running":
+        st.success("Wallet scan started in the background. Refreshing status...")
+        time.sleep(2)
+        st.cache_data.clear()
+        st.rerun()
+        return
+    if state == "finished" and result.get("result"):
+        result = result.get("result") or {}
     st.toast(
         f"Wallet scan: {result.get('new_signals', 0)} signals, "
         f"{result.get('new_alerts', 0)} alerts, "
@@ -2029,6 +2038,11 @@ def fetch_health() -> dict[str, Any] | None:
 @st.cache_data(ttl=20, show_spinner=False)
 def fetch_ready() -> dict[str, Any]:
     return safe_get("/ready", default={})
+
+
+@st.cache_data(ttl=5, show_spinner=False)
+def fetch_scan_status() -> dict[str, Any]:
+    return safe_get("/run-scan/status", default={"state": "unknown"})
 
 
 @st.cache_data(ttl=10, show_spinner=False)
@@ -2349,6 +2363,7 @@ if health is None:
 
 summary = fetch_summary() or {}
 ready = fetch_ready() or {}
+scan_status_payload = fetch_scan_status() or {}
 traders = fetch_traders()
 signals_all = fetch_signals(limit=500)
 positions_all = aggregate_signals_to_positions(signals_all)
@@ -2520,7 +2535,9 @@ st.markdown(
 
 action_cols = st.columns([1, 1, 1, 1, 6])
 with action_cols[0]:
-    if st.button("Run wallet scan", use_container_width=True, type="primary"):
+    scan_running = scan_status_payload.get("state") == "running"
+    scan_label = "Wallet scan running" if scan_running else "Run wallet scan"
+    if st.button(scan_label, use_container_width=True, type="primary", disabled=scan_running):
         action_run_wallet_scan()
 with action_cols[1]:
     if st.button("Run MLB edge scan", use_container_width=True, type="primary"):
@@ -2531,6 +2548,14 @@ with action_cols[2]:
 with action_cols[3]:
     if st.button("Test backend", use_container_width=True):
         action_test_backend()
+
+if scan_status_payload.get("state") == "running":
+    st.info(
+        f"Wallet scan running in backend worker. Started: "
+        f"{scan_status_payload.get('started_at') or DASH}"
+    )
+elif scan_status_payload.get("state") == "failed":
+    st.warning(f"Last wallet scan failed: {scan_status_payload.get('error') or 'unknown error'}")
 
 
 # Header metric strip — the 7 numbers an operator wants in one glance.

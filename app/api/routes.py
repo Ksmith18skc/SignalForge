@@ -48,7 +48,11 @@ from app.schemas import (
     TraderOut,
     WatchlistHealth,
 )
-from app.services.scanner import run_scan_once
+from app.services.scanner import (
+    run_scan_once,
+    scan_status,
+    trigger_manual_scan_background,
+)
 from app.services.alerts import DISCORD_TIERS, evaluate_alert_decision
 from app.services.mlb_edge_engine import (
     discord_ready_summary,
@@ -1862,8 +1866,18 @@ def bot_search_market(
 # ---------------------------- run-scan --------------------------------------
 
 
-@router.post("/run-scan", response_model=ScanResult)
-async def trigger_scan() -> ScanResult:
+@router.post("/run-scan")
+async def trigger_scan() -> dict[str, object]:
+    return trigger_manual_scan_background()
+
+
+@router.get("/run-scan/status")
+def trigger_scan_status() -> dict[str, object]:
+    return scan_status()
+
+
+@router.post("/run-scan/blocking", response_model=ScanResult)
+async def trigger_scan_blocking() -> ScanResult:
     return await run_scan_once()
 
 

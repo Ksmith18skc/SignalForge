@@ -27,6 +27,16 @@ from app.services.alerts import AlertDispatcher
 logger = logging.getLogger(__name__)
 
 
+_manual_scan_lock = threading.RLock()
+_manual_scan_status: dict[str, object] = {
+    "state": "idle",
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+    "error": None,
+}
+
+
 async def run_scan_once() -> ScanResult:
     """One full scan pass. Returns a structured result for the API."""
     started = time.perf_counter()
@@ -158,6 +168,76 @@ async def run_scan_once() -> ScanResult:
                 )
             else:
                 logger.info("Falcon: %d/%d calls succeeded (healthy)", f_ok, f_calls)
+
+
+def trigger_manual_scan_background() -> dict[str, object]:
+    """Start one scan in a daemon thread and return immediately.
+
+    Render can time out long HTTP requests while Falcon/market enrichment is
+    still working. This keeps `/run-scan` as an operator trigger without
+    holding the request open for the full scan duration.
+    """
+    with _manual_scan_lock:
+        if _manual_scan_status.get("state") == "running":
+            return scan_status() | {"accepted": False, "message": "scan already running"}
+        _manual_scan_status.update(
+            {
+                "state": "running",
+                "started_at": datetime.utcnow().isoformat(),
+                "finished_at": None,
+                "result": None,
+                "error": None,
+            }
+        )
+        thread = threading.Thread(
+            target=_run_manual_scan_thread,
+            name="signalforge-manual-scan",
+            daemon=True,
+        )
+        thread.start()
+        return scan_status() | {"accepted": True, "message": "scan started"}
+
+
+def scan_status() -> dict[str, object]:
+    with _manual_scan_lock:
+        return dict(_manual_scan_status)
+
+
+def _run_manual_scan_thread() -> None:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        result = loop.run_until_complete(run_scan_once())
+        payload = result.model_dump() if hasattr(result, "model_dump") else result.dict()
+        with _manual_scan_lock:
+            _manual_scan_status.update(
+                {
+                    "state": "finished",
+                    "finished_at": datetime.utcnow().isoformat(),
+                    "result": payload,
+                    "error": None,
+                }
+            )
+        logger.info(
+            "Manual scan finished: signals=%s alerts=%s markets=%s duration=%ss",
+            payload.get("new_signals"),
+            payload.get("new_alerts"),
+            payload.get("scanned_markets"),
+            payload.get("duration_seconds"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Manual scan failed: %s", exc)
+        with _manual_scan_lock:
+            _manual_scan_status.update(
+                {
+                    "state": "failed",
+                    "finished_at": datetime.utcnow().isoformat(),
+                    "result": None,
+                    "error": str(exc),
+                }
+            )
+    finally:
+        loop.close()
 
 
 # --------------------------------------------------------------------------
