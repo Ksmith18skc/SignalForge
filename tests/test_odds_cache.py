@@ -91,6 +91,9 @@ class _StubOdds:
         self.events_calls = 0
         self.events_args: list[tuple[Any, dict[str, Any]]] = []
         self.odds_calls = 0
+        self.plan_validation_calls = 0
+        self.bookmaker_plan_warning = None
+        self.validated_bookmakers = ["DraftKings", "FanDuel"]
 
     async def events(self, sport, **kwargs):
         self.events_calls += 1
@@ -104,6 +107,11 @@ class _StubOdds:
         if self.odds_raises is not None:
             raise self.odds_raises
         return self.odds_payload_factory(event_id)
+
+    async def validate_bookmaker_plan(self):
+        self.plan_validation_calls += 1
+        self.bookmaker_plan_warning = "Odds-API plan limited to DraftKings/FanDuel."
+        return list(self.validated_bookmakers)
 
 
 # --------------------------------------------------------------------------
@@ -148,6 +156,15 @@ def test_refresh_requests_current_odds_api_mlb_params(db_session) -> None:
             },
         )
     ]
+
+
+def test_refresh_validates_odds_api_plan_before_odds_fetches(db_session) -> None:
+    odds = _StubOdds()
+
+    result = asyncio.run(refresh_mlb_odds_cache(db_session, odds, _games(), game_date="2026-05-25"))
+
+    assert odds.plan_validation_calls == 1
+    assert result.bookmaker_plan_warning == "Odds-API plan limited to DraftKings/FanDuel."
 
 
 def test_refresh_falls_back_from_iso_window_to_date_only(db_session) -> None:

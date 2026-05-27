@@ -541,6 +541,7 @@ class RefreshResult:
     strategy_successful: str | None = None
     parsed_error_reason: str | None = None
     provider_cooldowns: dict[str, str | None] = field(default_factory=dict)
+    bookmaker_plan_warning: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -559,6 +560,7 @@ class RefreshResult:
             "strategy_successful": self.strategy_successful,
             "parsed_error_reason": self.parsed_error_reason,
             "provider_cooldowns": dict(self.provider_cooldowns),
+            "bookmaker_plan_warning": self.bookmaker_plan_warning,
         }
 
 
@@ -957,6 +959,18 @@ async def refresh_mlb_odds_cache(
             result.events_cached = 1
             result.refreshed = True
         result.events_fetched = len(events)
+
+        if events_source == ODDS_API_PROVIDER and hasattr(odds, "validate_bookmaker_plan"):
+            validated_bookmakers = await odds.validate_bookmaker_plan()
+            if odds.bookmaker_plan_warning:
+                result.bookmaker_plan_warning = odds.bookmaker_plan_warning
+                _record_provider_health(
+                    db,
+                    ODDS_API_PROVIDER,
+                    enabled=True,
+                    success=True,
+                    strategy=f"plan_limited:{','.join(validated_bookmakers)}",
+                )
 
         # ---- 2. per-event odds ----
         match_results, _unmatched_events = match_all_games(games, events)

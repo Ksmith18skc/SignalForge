@@ -3468,6 +3468,9 @@ with tab_odds:
             st.markdown("**Recent provider errors**")
             st.code("\n".join(str(err) for err in recent_errors[-5:]), language="text")
 
+        if primary_diag.get("plan_limit_warning"):
+            st.warning(str(primary_diag.get("plan_limit_warning")))
+
         if backup_diag.get("cooldown_until"):
             st.warning(f"SportsGameOdds rate-limited until {fmt_dt(backup_diag.get('cooldown_until'))}")
 

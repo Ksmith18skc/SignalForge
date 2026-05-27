@@ -634,6 +634,7 @@ def _odds_provider_health_payload(db: Session) -> dict[str, object]:
         "last_status_code": primary.get("last_status_code"),
         "last_successful_strategy": primary.get("last_successful_strategy"),
         "recent_failures": primary.get("recent_failures", 0),
+        "plan_limit_warning": _odds_plan_limit_warning(primary),
     }
     backup_payload = {
         "provider": backup.get("provider") or "SportsGameOdds",
@@ -687,6 +688,19 @@ def _self_test_suggestion(reason: str) -> str:
     if reason == "rate_limited":
         return "Respect Retry-After or provider cooldown before retrying."
     return "Inspect the sanitized response body and provider health state."
+
+
+def _odds_plan_limit_warning(state: dict[str, object]) -> str | None:
+    strategy = str(state.get("last_successful_strategy") or "")
+    if strategy.startswith("plan_limited:"):
+        allowed = strategy.split(":", 1)[1].strip()
+        if allowed:
+            pretty = "/".join(part.strip() for part in allowed.split(",") if part.strip())
+            return f"Odds-API plan limited to {pretty}."
+    last_error = str(state.get("last_error") or "")
+    if "allowed bookmaker" in last_error.lower() or "plan limited" in last_error.lower():
+        return "Odds-API plan limited to DraftKings/FanDuel."
+    return None
 
 
 async def _probe_provider_call(

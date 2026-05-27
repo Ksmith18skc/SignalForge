@@ -18,7 +18,7 @@ def test_odds_provider_health_endpoint_reports_persisted_state(db_session) -> No
                 recent_failures=1,
                 last_status_code=400,
                 last_error="bad request",
-                last_successful_strategy="date_only_window",
+                last_successful_strategy="plan_limited:DraftKings,FanDuel",
                 last_refresh_event_count=0,
                 refresh_errors=1,
             ),
@@ -44,6 +44,7 @@ def test_odds_provider_health_endpoint_reports_persisted_state(db_session) -> No
     assert payload["providers"]
     assert payload["primary"]["provider"] == "Odds-API"
     assert payload["primary"]["refresh_errors"] == 1
+    assert payload["primary"]["plan_limit_warning"] == "Odds-API plan limited to DraftKings/FanDuel."
     assert payload["backup"]["provider"] == "SportsGameOdds"
     assert payload["backup"]["last_refresh_event_count"] == 8
 

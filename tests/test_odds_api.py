@@ -3,6 +3,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
+from app.config import Settings
 from app.providers.odds_api import OddsApiError, OddsApiProvider, best_prices, normalize_odds_lines
 
 
@@ -68,6 +69,11 @@ def test_odds_provider_requires_key_for_auth_endpoints():
 
     with pytest.raises(OddsApiError):
         provider._auth_params({"sport": "basketball"})
+
+
+def test_odds_bookmakers_env_alias(monkeypatch):
+    monkeypatch.setenv("ODDS_API_BOOKMAKERS", "DraftKings,FanDuel")
+    assert Settings().odds_bookmakers == "DraftKings,FanDuel"
 
 
 def test_odds_provider_preview_normalizes_mlb_to_baseball():
@@ -175,4 +181,63 @@ async def test_odds_provider_events_omits_empty_league(monkeypatch):
                 "apiKey": "key",
             },
         )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_odds_provider_retries_forbidden_bookmaker_request_with_allowed_books(monkeypatch):
+    calls = []
+
+    class _Response403:
+        status_code = 403
+        headers: dict[str, str] = {}
+
+        def __init__(self):
+            self.text = "Allowed: DraftKings, FanDuel"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"error": "Allowed: DraftKings, FanDuel"}
+
+    class _Response200:
+        status_code = 200
+        headers: dict[str, str] = {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return _sample_odds_payload()
+
+    class _Client:
+        def __init__(self, timeout, **kwargs):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, params=None):
+            calls.append((url, params))
+            return _Response403() if len(calls) == 1 else _Response200()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    provider = OddsApiProvider("key", "https://api.odds-api.io/v3", "DraftKings,FanDuel,BetMGM,Caesars")
+
+    payload = await provider.odds(123)
+
+    assert payload["id"] == 123
+    assert calls == [
+        (
+            "https://api.odds-api.io/v3/odds",
+            {"eventId": 123, "bookmakers": "DraftKings,FanDuel,BetMGM,Caesars", "apiKey": "key"},
+        ),
+        (
+            "https://api.odds-api.io/v3/odds",
+            {"eventId": 123, "bookmakers": "DraftKings,FanDuel", "apiKey": "key"},
+        ),
     ]

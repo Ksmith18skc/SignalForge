@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
+import re
 
 import httpx
 
@@ -54,6 +56,28 @@ class OddsApiRateLimited(OddsApiError):
         self.retry_after = retry_after
 
 
+class OddsApiForbiddenBookmakers(OddsApiError):
+    """Raised when Odds-API rejects a bookmaker set but tells us which books are allowed."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        allowed_bookmakers: list[str],
+        requested_bookmakers: list[str] | None = None,
+        sanitized_url: str | None = None,
+        error_body_preview: str | None = None,
+    ) -> None:
+        super().__init__(
+            message,
+            status_code=403,
+            sanitized_url=sanitized_url,
+            error_body_preview=error_body_preview,
+        )
+        self.allowed_bookmakers = allowed_bookmakers
+        self.requested_bookmakers = requested_bookmakers or []
+
+
 class OddsApiProvider:
     """Small async client for https://api.odds-api.io/v3."""
 
@@ -67,11 +91,55 @@ class OddsApiProvider:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
-        self._bookmakers = _split_csv(bookmakers)
+        self._configured_bookmakers = _split_csv(bookmakers)
+        self._active_bookmakers = list(self._configured_bookmakers)
+        self._bookmaker_plan_warning: str | None = None
+        self._validated_bookmakers: list[str] | None = None
 
     @property
     def default_bookmakers(self) -> list[str]:
-        return self._bookmakers
+        return list(self._configured_bookmakers)
+
+    @property
+    def bookmaker_plan_warning(self) -> str | None:
+        return self._bookmaker_plan_warning
+
+    @property
+    def validated_bookmakers(self) -> list[str] | None:
+        if self._validated_bookmakers is None:
+            return None
+        return list(self._validated_bookmakers)
+
+    async def validate_bookmaker_plan(self) -> list[str]:
+        """Validate the current account's allowed books before fetching odds.
+
+        If Odds-API exposes a narrower plan than our configured bookmaker set,
+        we cache the allowed subset and surface a plan warning for the UI.
+        """
+        if self._validated_bookmakers is not None:
+            return list(self._validated_bookmakers)
+        try:
+            payload = await self.selected_bookmakers()
+        except OddsApiForbiddenBookmakers as exc:
+            allowed = _normalize_bookmakers(exc.allowed_bookmakers)
+            if allowed:
+                self._apply_bookmaker_plan(allowed)
+                return list(self._active_bookmakers)
+            return list(self._active_bookmakers)
+        except OddsApiError as exc:
+            if getattr(exc, "status_code", None) == 403:
+                allowed = _extract_allowed_bookmakers(exc.error_body_preview)
+                if allowed:
+                    self._apply_bookmaker_plan(allowed)
+                    return list(self._active_bookmakers)
+            return list(self._active_bookmakers)
+
+        allowed = _extract_allowed_bookmakers(payload)
+        if allowed:
+            self._apply_bookmaker_plan(allowed)
+        else:
+            self._validated_bookmakers = list(self._active_bookmakers)
+        return list(self._active_bookmakers)
 
     def preview_events_request(
         self,
@@ -145,6 +213,25 @@ class OddsApiProvider:
             if response.status_code != 429:
                 if response.status_code >= 400:
                     body = _response_text(response)
+                    parsed_body: Any = body
+                    try:
+                        parsed_body = response.json()
+                    except Exception:  # noqa: BLE001
+                        parsed_body = body
+                    if response.status_code == 403:
+                        allowed = _extract_allowed_bookmakers(parsed_body)
+                        requested = _split_csv(query.get("bookmakers") if isinstance(query, dict) else None)
+                        if allowed and requested:
+                            raise OddsApiForbiddenBookmakers(
+                                (
+                                    "Odds-API plan limited to "
+                                    f"{', '.join(allowed)} for this bookmaker request"
+                                ),
+                                allowed_bookmakers=allowed,
+                                requested_bookmakers=requested,
+                                sanitized_url=redact_url(last_url),
+                                error_body_preview=sanitize_text(body, limit=500),
+                            )
                     raise OddsApiError(
                         (
                             f"Odds-API HTTP {response.status_code} on {path}; "
@@ -224,10 +311,23 @@ class OddsApiProvider:
         return await self._get(f"/events/{event_id}")
 
     async def odds(self, event_id: str | int, bookmakers: str | list[str] | None = None) -> dict[str, Any]:
-        books = _bookmaker_param(bookmakers or self._bookmakers)
+        books = _bookmaker_param(bookmakers or self._active_bookmakers)
         if not books:
             raise OddsApiError("At least one bookmaker is required for odds lookup")
-        return await self._get("/odds", {"eventId": event_id, "bookmakers": books})
+        params = {"eventId": event_id, "bookmakers": books}
+        try:
+            return await self._get("/odds", params)
+        except OddsApiForbiddenBookmakers as exc:
+            allowed = _bookmaker_param(exc.allowed_bookmakers)
+            if not allowed or allowed == books:
+                raise
+            logger.warning(
+                "Odds-API plan limited bookmaker set from %s to %s",
+                books,
+                allowed,
+            )
+            self._apply_bookmaker_plan(exc.allowed_bookmakers)
+            return await self._get("/odds", {"eventId": event_id, "bookmakers": allowed})
 
     async def odds_multi(
         self,
@@ -235,10 +335,23 @@ class OddsApiProvider:
         bookmakers: str | list[str] | None = None,
     ) -> list[dict[str, Any]]:
         ids = event_ids if isinstance(event_ids, str) else ",".join(str(e) for e in event_ids[:10])
-        books = _bookmaker_param(bookmakers or self._bookmakers)
+        books = _bookmaker_param(bookmakers or self._active_bookmakers)
         if not books:
             raise OddsApiError("At least one bookmaker is required for odds lookup")
-        return await self._get("/odds/multi", {"eventIds": ids, "bookmakers": books})
+        params = {"eventIds": ids, "bookmakers": books}
+        try:
+            return await self._get("/odds/multi", params)
+        except OddsApiForbiddenBookmakers as exc:
+            allowed = _bookmaker_param(exc.allowed_bookmakers)
+            if not allowed or allowed == books:
+                raise
+            logger.warning(
+                "Odds-API plan limited bookmaker set from %s to %s",
+                books,
+                allowed,
+            )
+            self._apply_bookmaker_plan(exc.allowed_bookmakers)
+            return await self._get("/odds/multi", {"eventIds": ids, "bookmakers": allowed})
 
     async def odds_movements(
         self,
@@ -320,6 +433,17 @@ class OddsApiProvider:
             return self._auth_params(params)
         return params
 
+    def _apply_bookmaker_plan(self, bookmakers: list[str]) -> None:
+        normalized = _normalize_bookmakers(bookmakers)
+        if not normalized:
+            return
+        self._validated_bookmakers = list(normalized)
+        self._active_bookmakers = list(normalized)
+        if normalized != self._configured_bookmakers:
+            self._bookmaker_plan_warning = f"Odds-API plan limited to {'/'.join(normalized)}."
+        else:
+            self._bookmaker_plan_warning = None
+
 
 def _normalize_sport(sport: str) -> str:
     value = str(sport or "").strip().lower()
@@ -377,6 +501,48 @@ def _split_csv(value: str | list[str] | None) -> list[str]:
 
 def _bookmaker_param(value: str | list[str] | None) -> str:
     return ",".join(_split_csv(value))
+
+
+def _normalize_bookmakers(value: str | list[str] | None) -> list[str]:
+    items = []
+    for bookmaker in _split_csv(value):
+        if bookmaker not in items:
+            items.append(bookmaker)
+    return items
+
+
+def _extract_allowed_bookmakers(value: Any) -> list[str]:
+    collected: list[str] = []
+
+    def _walk(item: Any) -> None:
+        if isinstance(item, dict):
+            for key, nested in item.items():
+                key_text = str(key).lower()
+                if key_text in {"allowed", "allowedbookmakers", "bookmakers", "selectedbookmakers", "data", "result", "items", "value"}:
+                    _walk(nested)
+                elif key_text in {"error", "message", "detail", "reason", "name", "bookmaker", "bookmakername"} and isinstance(nested, str):
+                    _walk(nested)
+        elif isinstance(item, (list, tuple, set)):
+            for nested in item:
+                _walk(nested)
+        elif isinstance(item, str):
+            text = item.strip()
+            if not text:
+                return
+            if text[:1] in {"{", "["}:
+                try:
+                    _walk(json.loads(text))
+                    return
+                except Exception:  # noqa: BLE001
+                    pass
+            text = re.sub(r"(?i)^allowed\s*[:=]\s*", "", text)
+            for chunk in re.split(r"[,/|&]", text):
+                candidate = chunk.strip(" ;:\t\n\r")
+                if candidate and candidate not in collected:
+                    collected.append(candidate)
+
+    _walk(value)
+    return collected
 
 
 def _clean_params(params: dict[str, Any]) -> dict[str, Any]:

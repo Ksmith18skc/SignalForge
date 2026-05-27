@@ -9,7 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 CopyMode = Literal["disabled", "alert_only", "paper", "live"]
@@ -85,7 +85,10 @@ class Settings(BaseSettings):
     kalshi_base_url: str = "https://trading-api.kalshi.com/trade-api/v2"
     odds_api_key: str | None = None
     odds_api_base_url: str = "https://api.odds-api.io/v3"
-    odds_bookmakers: str = "DraftKings,FanDuel,BetMGM,Caesars"
+    odds_bookmakers: str = Field(
+        default="DraftKings,FanDuel",
+        validation_alias=AliasChoices("ODDS_API_BOOKMAKERS", "SIGNALFORGE_ODDS_BOOKMAKERS"),
+    )
     odds_default_sports: str = "basketball,baseball,american-football,ice-hockey"
     sgo_api_key: str | None = None
     sgo_base_url: str = "https://api.sportsgameodds.com/v2"
