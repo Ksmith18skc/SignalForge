@@ -43,8 +43,10 @@ ODDS_MLB_LEAGUE = "MLB"
 
 
 async def run_daily_mlb_edges(db: Session, *, game_date: str | None = None) -> dict[str, Any]:
+    from app.services.mlb_performance import arizona_today
+
     settings = get_settings()
-    card_date = game_date or settings.mlb_edge_default_game_date or date.today().isoformat()
+    card_date = game_date or settings.mlb_edge_default_game_date or arizona_today()
     mlb = MlbStatsApiProvider()
     weather = WeatherApiProvider(settings.weather_api_key, settings.weather_api_base_url)
     odds = OddsApiProvider(settings.odds_api_key, settings.odds_api_base_url, settings.odds_bookmakers)
@@ -175,7 +177,9 @@ def latest_daily_card(db: Session, *, card_date: str | None = None) -> dict[str,
 
 
 def edges_for_date(db: Session, *, card_date: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-    target = card_date or date.today().isoformat()
+    from app.services.mlb_performance import arizona_today
+
+    target = card_date or arizona_today()
     edges = list(
         db.scalars(
             select(MlbEdge)

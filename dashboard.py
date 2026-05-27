@@ -2875,7 +2875,28 @@ with tab_command:
 
 with tab_mlb:
     # Daily card hero — three columns of edge cards.
+    arizona_today_iso = datetime.now(TZ_MST).date().isoformat()
+    is_stale_card = bool(mlb_daily_card and mlb_daily_card.get("is_stale"))
+    card_date_label = (mlb_daily_card or {}).get("card_date") or "—"
+    requested_date_label = (mlb_daily_card or {}).get("requested_date") or arizona_today_iso
+
     st.markdown("### Daily Card")
+    if is_stale_card:
+        st.warning(
+            f"⚠️ No MLB edge scan has been run for **{requested_date_label}** "
+            f"(Arizona today). Showing the most recent card from **{card_date_label}**. "
+            "Click *Run MLB edge scan* to refresh today's edges, high conviction plays, "
+            "and near misses."
+        )
+        action_cols = st.columns([1, 5])
+        with action_cols[0]:
+            if st.button("Run MLB edge scan", use_container_width=True, key="mlb_run_scan_stale"):
+                action_run_mlb_edge_scan()
+    elif mlb_daily_card:
+        st.caption(
+            f"Showing card for **{card_date_label}** · Arizona today: **{arizona_today_iso}**"
+        )
+
     if mlb_daily_card:
         hero_cols = st.columns(3, gap="medium")
         sections = [
@@ -2885,19 +2906,23 @@ with tab_mlb:
         ]
         for col, (title, rows) in zip(hero_cols, sections):
             with col:
-                st.markdown(f"<h3>{title}</h3>", unsafe_allow_html=True)
+                stale_suffix = " (stale)" if is_stale_card else ""
+                st.markdown(f"<h3>{title}{stale_suffix}</h3>", unsafe_allow_html=True)
                 if not rows:
-                    render_empty_state(
-                        "NO QUALIFYING EDGES",
-                        "No qualifying edges in this band for today's slate.",
+                    body = (
+                        f"No saved edges for {requested_date_label}. Run the scan to populate."
+                        if is_stale_card
+                        else "No qualifying edges in this band for today's slate."
                     )
+                    render_empty_state("NO QUALIFYING EDGES", body)
                 else:
                     for row in rows[:3]:
                         render_edge_card(row)
     else:
         render_empty_state(
             "DAILY CARD MISSING",
-            "Run the MLB edge scan to materialize the daily card.",
+            f"No MLB daily card has ever been generated. Run the MLB edge scan to "
+            f"materialize {arizona_today_iso}'s card.",
             actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
         )
 

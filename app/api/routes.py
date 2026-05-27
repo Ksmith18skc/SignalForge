@@ -963,7 +963,10 @@ def mlb_edges_today(
     limit: int = 100,
     db: Session = Depends(get_db),
 ) -> list[dict[str, object]]:
-    target = game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
+    # "Today" is the Arizona/MST card date so the dashboard agrees with the
+    # scheduler / grader even when the server clock is UTC and the local day
+    # has rolled but Arizona's hasn't (or vice versa).
+    target = game_date or get_settings().mlb_edge_default_game_date or arizona_today()
     edges = list(
         db.scalars(
             select(MlbEdge)
@@ -1008,14 +1011,35 @@ def mlb_daily_card(
     game_date: str | None = None,
     db: Session = Depends(get_db),
 ) -> dict[str, object]:
-    target = game_date or get_settings().mlb_edge_default_game_date
-    card = latest_daily_card(db, card_date=target)
-    if card is None:
+    """Daily card lookup with explicit staleness reporting.
+
+    When ``game_date`` is omitted we look for today's Arizona card. If it
+    exists, return it with ``is_stale=False``. If not, fall back to the most
+    recent card available and mark it ``is_stale=True`` so the dashboard can
+    show the user that they're looking at yesterday's data and offer to run
+    a fresh scan.
+    """
+    requested = game_date or _mlb_card_date(None)  # arizona today
+    card = latest_daily_card(db, card_date=requested)
+    if card is not None:
+        card["requested_date"] = requested
+        card["is_stale"] = False
+        return card
+
+    # Today's card doesn't exist — return the latest available with staleness.
+    fallback = latest_daily_card(db)
+    if fallback is None:
         raise HTTPException(
             status_code=404,
             detail="No MLB daily card found. Run POST /mlb/edges/run first.",
         )
-    return card
+    fallback["requested_date"] = requested
+    fallback["is_stale"] = True
+    fallback["stale_reason"] = (
+        f"No scan has been run for {requested}. Showing the most recent card "
+        f"({fallback.get('card_date')}). Click 'Run MLB edge scan' to refresh."
+    )
+    return fallback
 
 
 @router.get("/mlb/games/{game_pk}/edge-summary")
@@ -1111,7 +1135,7 @@ def mlb_debug_pitcher_props(
 
 
 def _mlb_card_date(game_date: str | None) -> str:
-    return game_date or get_settings().mlb_edge_default_game_date or date.today().isoformat()
+    return game_date or get_settings().mlb_edge_default_game_date or arizona_today()
 
 
 def _parse_dt(value: Any) -> datetime | None:
