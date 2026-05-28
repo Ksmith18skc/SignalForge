@@ -3549,13 +3549,168 @@ with action_cols[3]:
 # the dashboard used to throw up during background work.
 render_active_job_panel()
 
-if scan_status_payload.get("state") == "running":
-    st.info(
-        f"Wallet scan running in backend worker. Started: "
-        f"{scan_status_payload.get('started_at') or DASH}"
+def _render_wallet_scan_status(payload: dict[str, Any]) -> None:
+    """Operator-facing wallet-scan visibility panel.
+
+    Single source of truth for "what is the wallet scan actually doing
+    right now?" — shows the phase, live counters, per-wallet diagnostics
+    table, watchdog deadline, and end-of-run summary. Backed by
+    ``/run-scan/status`` (reaped on every read so a wedged scan can never
+    sit on "running" forever).
+    """
+    state = str(payload.get("state") or "idle").lower()
+    if state == "idle":
+        return
+    started_at = payload.get("started_at")
+    timeout_at = payload.get("timeout_at")
+    summary = payload.get("summary")
+    progress = payload.get("progress") or {}
+    per_wallet = progress.get("per_wallet") or []
+    phase = progress.get("phase") or DASH
+
+    # Top banner — colored by state, names the phase + deadline. Never
+    # shows just "running" — always says what stage and when it expires.
+    if state == "running":
+        st.info(
+            f"**Wallet scan running** · phase: `{phase}` · started "
+            f"{fmt_relative(started_at)} · watchdog timeout at "
+            f"{fmt_dt_mst(timeout_at) or DASH}. "
+            "Counters below update live; if nothing is moving, click "
+            "**Reset scan state** or wait for the watchdog to mark it stale."
+        )
+    elif state == "timeout":
+        st.error(
+            f"**Wallet scan timed out** · {payload.get('error') or 'no detail'} "
+            f"· phase at timeout: `{phase}`"
+        )
+    elif state == "failed":
+        st.warning(
+            f"**Wallet scan failed**: {payload.get('error') or 'unknown error'}"
+        )
+    elif state == "finished":
+        st.success(f"**Wallet scan finished.** {summary or ''}".strip())
+
+    # Live counters — wallets / markets / positions / rejections / errors.
+    cols = st.columns(6)
+    cols[0].metric(
+        "Wallets scanned",
+        f"{progress.get('wallets_scanned', 0)} / {progress.get('wallets_loaded', 0)}",
     )
-elif scan_status_payload.get("state") == "failed":
-    st.warning(f"Last wallet scan failed: {scan_status_payload.get('error') or 'unknown error'}")
+    cols[1].metric("Raw positions", progress.get("raw_positions_found", 0))
+    cols[2].metric("Active after filters", progress.get("active_positions", 0))
+    cols[3].metric("Markets checked", progress.get("markets_checked", 0))
+    cols[4].metric("API errors", progress.get("api_errors", 0))
+    cols[5].metric("Rate-limit hits", progress.get("rate_limited", 0))
+
+    rej_cols = st.columns(3)
+    rej_cols[0].metric(
+        "Rejected stale", progress.get("positions_rejected_stale", 0)
+    )
+    rej_cols[1].metric(
+        "Rejected date mismatch",
+        progress.get("positions_rejected_date_mismatch", 0),
+    )
+    rej_cols[2].metric(
+        "Rejected market-key mismatch",
+        progress.get("positions_rejected_market_key_mismatch", 0),
+    )
+
+    # Per-wallet debug table — wallet, address, request status, raw / active
+    # counts, last seen market, error. The table the user explicitly asked
+    # for so "0 Active" is always explainable per-wallet.
+    if per_wallet:
+        st.markdown("**Per-wallet diagnostics**")
+        df_rows: list[dict[str, Any]] = []
+        for row in per_wallet:
+            df_rows.append(
+                {
+                    "nickname": row.get("nickname") or DASH,
+                    "address": shorten_wallet(row.get("address")) or DASH,
+                    "status": row.get("status") or DASH,
+                    "raw_positions": int(row.get("raw_positions") or 0),
+                    "active_positions": int(row.get("active_positions") or 0),
+                    "last_market": row.get("last_market") or DASH,
+                    "error": (row.get("error") or "")[:160] or DASH,
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(df_rows).fillna(DASH),
+            use_container_width=True, hide_index=True,
+            height=min(360, 60 + 30 * len(df_rows)),
+        )
+
+    if summary and state != "finished":
+        st.caption(summary)
+
+
+_render_wallet_scan_status(scan_status_payload)
+
+# Operator controls: dry-run diagnostics + manual reset. Sit just under
+# the visibility panel so the operator never has to hunt for them when a
+# scan looks wedged.
+scan_ctl_cols = st.columns([1, 1, 6])
+with scan_ctl_cols[0]:
+    if st.button(
+        "Run scan diagnostics",
+        key="cc_btn_scan_diagnostics",
+        use_container_width=True,
+        help=(
+            "Dry-run probe — confirms tracked-wallet count, primary "
+            "provider reachability, and a sample of raw positions. "
+            "Does NOT trigger a full scan."
+        ),
+    ):
+        _job_log("button_click", name="run_scan_diagnostics")
+        with st.status("Running scan diagnostics…", expanded=True, state="running") as diag_box:
+            try:
+                diag = api_get("/run-scan/diagnostics", params={"sample": 5}, timeout=30.0)
+                diag_box.update(label="Scan diagnostics complete", state="complete")
+            except ApiError as exc:
+                diag = None
+                diag_box.update(label="Scan diagnostics failed", state="error")
+                render_api_error(exc, prefix="Scan diagnostics failed")
+        if diag is not None:
+            dcols = st.columns(3)
+            dcols[0].metric("Tracked wallets", diag.get("tracked_wallets", 0))
+            dcols[1].metric(
+                "Provider reachable",
+                "yes" if diag.get("provider_reachable") else "no",
+            )
+            dcols[2].metric("Sample positions", diag.get("sample_count", 0))
+            if diag.get("provider_error"):
+                st.warning(f"Provider error: {diag['provider_error']}")
+            sample = diag.get("sample_positions") or []
+            if sample:
+                st.markdown("**Sample raw positions (first wallet)**")
+                st.dataframe(
+                    pd.DataFrame(sample).fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                    height=min(240, 60 + 30 * len(sample)),
+                )
+            else:
+                st.caption("No sample positions returned for the first wallet.")
+with scan_ctl_cols[1]:
+    reset_disabled = scan_status_payload.get("state") not in {"running", "timeout", "failed"}
+    if st.button(
+        "Reset scan state",
+        key="cc_btn_reset_scan_state",
+        use_container_width=True,
+        disabled=reset_disabled,
+        help=(
+            "Force the wallet-scan status back to idle. The watchdog "
+            "does this automatically after 3 minutes, but this button "
+            "lets you do it immediately if a scan looks wedged."
+        ),
+    ):
+        _job_log("button_click", name="reset_scan_state")
+        try:
+            api_post("/run-scan/reset", json={})
+            st.success("Scan state reset to idle.")
+        except ApiError as exc:
+            render_api_error(exc, prefix="Reset failed")
+        st.cache_data.clear()
+        _job_log("rerun_trigger", source="reset_scan_state")
+        st.rerun()
 
 stale_positions_hidden = int(dashboard_debug_payload.get("stale_wallet_positions_hidden") or 0)
 stale_alerts_hidden = int(dashboard_debug_payload.get("stale_alerts_hidden") or 0)

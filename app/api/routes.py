@@ -54,6 +54,8 @@ from app.schemas import (
     WatchlistHealth,
 )
 from app.services.scanner import (
+    reset_scan_status,
+    run_scan_diagnostics,
     run_scan_once,
     scan_status,
     trigger_manual_scan_background,
@@ -2649,6 +2651,29 @@ def trigger_scan_status() -> dict[str, object]:
 @router.post("/run-scan/blocking", response_model=ScanResult)
 async def trigger_scan_blocking(date: str | None = None) -> ScanResult:
     return await run_scan_once(card_date=date)
+
+
+@router.get("/run-scan/diagnostics")
+async def trigger_scan_diagnostics(sample: int = 5) -> dict[str, object]:
+    """Cheap pre-flight probe.
+
+    Confirms tracked-wallet count, primary provider reachability, and a
+    sample of the first wallet's raw positions — *without* triggering a
+    full scan. Lets the operator validate the pipeline before committing
+    to a 3-minute run.
+    """
+    return await run_scan_diagnostics(sample_size=max(1, min(int(sample or 5), 20)))
+
+
+@router.post("/run-scan/reset")
+def trigger_scan_reset() -> dict[str, object]:
+    """Operator escape hatch — flip the manual scan status back to idle.
+
+    The watchdog already does this automatically once the wall-clock cap
+    expires, but this endpoint lets the dashboard offer a "Reset scan
+    state" button when an operator can see something is wedged sooner.
+    """
+    return reset_scan_status()
 
 
 # ---------------------------- falcon-test -----------------------------------
