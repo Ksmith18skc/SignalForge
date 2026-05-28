@@ -7,6 +7,8 @@ against the in-memory SQLite session provided by ``conftest``.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 bs4 = pytest.importorskip("bs4", reason="beautifulsoup4 required for BallparkPal tests")
@@ -402,6 +404,58 @@ def test_start_refresh_rejects_concurrent_run(db_session, monkeypatch):
 
     # Cleanup: clear handles so we don't leak state into later tests.
     jobs._ACTIVE_HANDLES.clear()
+
+
+def test_spawn_process_sets_cwd_and_pythonpath_to_repo_root(monkeypatch):
+    """Regression: the dashboard-triggered subprocess must launch with
+    cwd=repo_root and PYTHONPATH prefixed by repo_root so the child can
+    ``import app`` regardless of where Streamlit was started.
+    """
+    import subprocess as _sp
+
+    from app.services import ballparkpal_jobs as jobs
+
+    captured: dict[str, object] = {}
+
+    class _FakePopen:
+        def __init__(self, cmd, *, cwd, stdin, stdout, stderr, env, bufsize):  # noqa: ARG002
+            captured["cmd"] = cmd
+            captured["cwd"] = cwd
+            captured["env"] = env
+            self.pid = 4242
+            self.stdin = None
+            self.stdout = None
+
+        def poll(self):
+            return 0
+
+        @property
+        def returncode(self):
+            return 0
+
+    monkeypatch.setattr(_sp, "Popen", _FakePopen)
+    monkeypatch.setattr(jobs.subprocess, "Popen", _FakePopen)
+    # CLI_SCRIPT must exist on disk (it does in this repo) for the
+    # early-exit path not to fire. Assert it so the regression test is
+    # explicit about the precondition.
+    assert jobs.CLI_SCRIPT.exists(), f"CLI script missing: {jobs.CLI_SCRIPT}"
+
+    spec = jobs.JobSpec(
+        mode="refresh", pages=["positive_ev"], slate_date=None,
+        headless=True, timeout_seconds=60,
+    )
+    popen, error = jobs._spawn_process("test-job", spec)
+    assert popen is not None and error is None
+    assert captured["cwd"] == str(jobs.REPO_ROOT)
+    env = captured["env"]
+    assert isinstance(env, dict)
+    pp = env.get("PYTHONPATH", "")
+    # The very first PYTHONPATH segment must be repo_root so the child's
+    # `import app` resolves before any inherited PYTHONPATH entries.
+    first_segment = pp.split(os.pathsep, 1)[0] if pp else ""
+    assert first_segment == str(jobs.REPO_ROOT), (
+        f"PYTHONPATH first segment was {first_segment!r}, expected {str(jobs.REPO_ROOT)!r}"
+    )
 
 
 def test_start_refresh_marks_failed_when_cli_missing(db_session, monkeypatch):

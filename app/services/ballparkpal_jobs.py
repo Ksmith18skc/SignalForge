@@ -245,10 +245,18 @@ def _start(db: Session, spec: JobSpec) -> BallparkPalJob:
 
 
 def _spawn_process(job_id: str, spec: JobSpec) -> tuple[subprocess.Popen | None, str | None]:
-    """Launch the CLI script. Returns (popen, error_message)."""
-    if not CLI_SCRIPT.exists():
-        return None, f"CLI script missing: {CLI_SCRIPT}"
-    cmd: list[str] = [sys.executable, "-u", str(CLI_SCRIPT)]
+    """Launch the CLI script. Returns (popen, error_message).
+
+    The child must be able to ``import app`` even though it's launched from
+    a different working directory by the Streamlit process. We set
+    ``cwd=repo_root`` and prepend ``repo_root`` to ``PYTHONPATH`` so the
+    package is importable regardless of where the dashboard was started.
+    """
+    repo_root = REPO_ROOT
+    script_path = CLI_SCRIPT
+    if not script_path.exists():
+        return None, f"CLI script missing: {script_path}"
+    cmd: list[str] = [sys.executable, "-u", str(script_path)]
     if spec.mode == "login":
         cmd.append("--login")
     if spec.pages:
@@ -258,10 +266,28 @@ def _spawn_process(job_id: str, spec: JobSpec) -> tuple[subprocess.Popen | None,
     cmd.extend(["--headless", "true" if spec.headless else "false"])
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
+    # Without this the child's sys.path[0] is the scripts/ directory
+    # (because it's where the launched .py lives), not the repo root, so
+    # ``import app`` raises ModuleNotFoundError. Setting cwd alone is not
+    # enough — Python doesn't add cwd to sys.path automatically.
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        str(repo_root) + (os.pathsep + existing_pp if existing_pp else "")
+    )
+    cwd_str = str(repo_root)
+    logger.info(
+        "BallparkPal subprocess job=%s repo_root=%s script=%s cwd=%s "
+        "PYTHONPATH[0]=%s",
+        job_id,
+        repo_root,
+        script_path,
+        cwd_str,
+        env["PYTHONPATH"].split(os.pathsep, 1)[0],
+    )
     try:
         popen = subprocess.Popen(
             cmd,
-            cwd=str(REPO_ROOT),
+            cwd=cwd_str,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
