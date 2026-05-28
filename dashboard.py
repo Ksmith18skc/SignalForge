@@ -12,6 +12,7 @@ Launch: `streamlit run dashboard.py`.
 from __future__ import annotations
 
 import html
+import logging
 import os
 import re
 import time
@@ -23,6 +24,20 @@ from typing import Any, Iterable
 import httpx
 import pandas as pd
 import streamlit as st
+
+# Dashboard-side debug logger. Lines tagged sf.dash trace rerun triggers,
+# button clicks, job lifecycle events, backend request boundaries, and any
+# active_job session_state mutations — exactly what we need to debug the
+# "why is the spinner running forever?" failure mode.
+logger = logging.getLogger("signalforge.dashboard")
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("[%(asctime)s] %(levelname)s sf.dash: %(message)s")
+    )
+    logger.addHandler(_handler)
+logger.setLevel(os.environ.get("SIGNALFORGE_DASHBOARD_LOG_LEVEL", "INFO").upper())
+logger.propagate = False
 
 from app.components.pnl_dashboard import render_pnl_summary_cards, render_pnl_tracker
 from app.services import wallet_market_resolver as wmr
@@ -2261,63 +2276,282 @@ def render_empty_state(title: str, body: str, *, actions: list[tuple[str, callab
 
 
 # =============================================================================
+# Background-job state machine
+# =============================================================================
+#
+# Replaces ad-hoc `with st.spinner(...)` blocks + scattered reruns with a
+# single typed `active_job` dict in session_state. The command center owns
+# one small status line (render_active_job_panel) that always tells the
+# operator exactly what is in flight — or "Idle" if nothing is. Buttons
+# disable themselves while their job is running so a double-click can't
+# spawn a duplicate scan.
+#
+# active_job shape:
+#     {
+#         "name": "wallet_scan",
+#         "label": "Wallet scan",
+#         "started_at": "2026-05-28T20:11:43+00:00",
+#         "status": "Posting /run-scan...",
+#         "last_heartbeat": "2026-05-28T20:11:45+00:00",
+#     }
+#
+# last_job carries the same fields plus finished_at, success, result_message.
+
+JOB_TIMEOUT_SECONDS = int(os.environ.get("SIGNALFORGE_DASHBOARD_JOB_TIMEOUT", "240"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_log(event: str, **fields: Any) -> None:
+    """Structured trace for rerun/click/job/backend events."""
+    if not fields:
+        logger.info(event)
+        return
+    payload = " ".join(f"{k}={v!r}" for k, v in fields.items())
+    logger.info("%s %s", event, payload)
+
+
+def _active_job() -> dict[str, Any] | None:
+    return st.session_state.get("active_job")
+
+
+def is_job_running(name: str | None = None) -> bool:
+    job = _active_job()
+    if not job:
+        return False
+    return name is None or job.get("name") == name
+
+
+def clear_stale_job(timeout_seconds: int = JOB_TIMEOUT_SECONDS) -> None:
+    """Drop active_job if it's older than timeout_seconds.
+
+    The backend job itself may keep running — but the *dashboard's* tracking
+    should never get stuck on a flag set minutes ago and never cleared
+    (e.g. the user closed the tab mid-call, or a network timeout aborted
+    the script before finish_job ran).
+    """
+    job = _active_job()
+    if not job:
+        return
+    try:
+        started = datetime.fromisoformat(job["started_at"])
+    except (KeyError, ValueError):
+        _job_log("clear_stale_job.invalid_started_at", job=job)
+        st.session_state.pop("active_job", None)
+        return
+    elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+    if elapsed > timeout_seconds:
+        _job_log(
+            "clear_stale_job.timeout",
+            name=job.get("name"), elapsed=round(elapsed, 1),
+            timeout=timeout_seconds,
+        )
+        st.session_state["last_job"] = {
+            **job,
+            "finished_at": _now_iso(),
+            "success": False,
+            "result_message": (
+                f"Marked stale after {int(elapsed)}s "
+                f"(timeout={timeout_seconds}s). Backend may still be running — "
+                "refresh once it completes."
+            ),
+        }
+        st.session_state.pop("active_job", None)
+
+
+def start_job(name: str, label: str | None = None, *, status: str = "Starting...") -> bool:
+    """Acquire the single-job lock. Returns False if `name` is already running."""
+    clear_stale_job()
+    if is_job_running(name):
+        _job_log("start_job.duplicate", name=name)
+        return False
+    job = {
+        "name": name,
+        "label": label or name.replace("_", " ").title(),
+        "started_at": _now_iso(),
+        "status": status,
+        "last_heartbeat": _now_iso(),
+    }
+    st.session_state["active_job"] = job
+    _job_log("start_job", **job)
+    return True
+
+
+def update_job_status(message: str) -> None:
+    job = _active_job()
+    if not job:
+        return
+    job["status"] = message
+    job["last_heartbeat"] = _now_iso()
+    st.session_state["active_job"] = job
+    _job_log("update_job_status", name=job.get("name"), status=message)
+
+
+def finish_job(*, success: bool, result_message: str) -> None:
+    job = _active_job()
+    if not job:
+        _job_log("finish_job.no_active_job", success=success, message=result_message)
+        return
+    finished = {
+        **job,
+        "finished_at": _now_iso(),
+        "success": bool(success),
+        "result_message": result_message,
+    }
+    st.session_state["last_job"] = finished
+    st.session_state.pop("active_job", None)
+    _job_log(
+        "finish_job",
+        name=finished.get("name"), success=success, message=result_message,
+    )
+
+
+def render_active_job_panel() -> None:
+    """Single source of truth for 'what is running right now'.
+
+    Renders inline as a small card under the command-center action bar so
+    the dashboard never has to fall back on the page-wide Streamlit
+    spinner overlay. When there is no active job and no remembered last
+    job, it prints 'Idle' — exactly so the operator can tell the page is
+    at rest rather than silently doing work.
+    """
+    clear_stale_job()
+    job = _active_job()
+    last = st.session_state.get("last_job") or {}
+    if job:
+        try:
+            elapsed = (
+                datetime.now(timezone.utc)
+                - datetime.fromisoformat(job["started_at"])
+            ).total_seconds()
+        except (KeyError, ValueError):
+            elapsed = 0.0
+        st.markdown(
+            f"<div class='sf-card purple' style='padding:8px 12px;margin-top:6px;'>"
+            f"<div class='sf-card-row'>"
+            f"<span class='k'>Background activity:</span> "
+            f"<b>{html.escape(str(job.get('label') or job.get('name')))}</b> · "
+            f"running {elapsed:.0f}s · "
+            f"{html.escape(str(job.get('status') or ''))}</div>"
+            f"<div class='sf-meta'>"
+            f"Started: {fmt_dt_mst(job.get('started_at'))} · "
+            f"Last heartbeat: {fmt_dt_mst(job.get('last_heartbeat'))}"
+            f"</div></div>",
+            unsafe_allow_html=True,
+        )
+        return
+    if last:
+        tone = "green" if last.get("success") else "red"
+        st.markdown(
+            f"<div class='sf-card {tone}' style='padding:8px 12px;margin-top:6px;'>"
+            f"<div class='sf-card-row'>"
+            f"<span class='k'>Background activity:</span> Idle. "
+            f"Last: <b>{html.escape(str(last.get('label') or last.get('name')))}</b> · "
+            f"{'OK' if last.get('success') else 'FAILED'} · "
+            f"{html.escape(str(last.get('result_message') or ''))}</div>"
+            f"<div class='sf-meta'>Finished: {fmt_dt_mst(last.get('finished_at'))}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+        return
+    st.markdown(
+        "<div class='sf-card' style='padding:8px 12px;margin-top:6px;'>"
+        "<div class='sf-card-row'>"
+        "<span class='k'>Background activity:</span> Idle."
+        "</div></div>",
+        unsafe_allow_html=True,
+    )
+
+
+# =============================================================================
 # Action handlers (sidebar + buttons)
 # =============================================================================
 
 
 def action_run_wallet_scan() -> None:
-    with st.spinner("Starting wallet scan..."):
+    if not start_job("wallet_scan", "Wallet scan", status="Posting /run-scan..."):
+        st.toast("Wallet scan is already running.")
+        return
+    result: dict[str, Any] = {}
+    with st.status("Wallet scan: contacting backend…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="wallet_scan", path="/run-scan", date=selected_card_date)
         try:
             result = api_post("/run-scan", timeout=SCAN_TIMEOUT, params={"date": selected_card_date})
         except ApiError as exc:
+            _job_log("backend_request_end", job="wallet_scan", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"Wallet scan failed: {exc}")
+            status_box.update(label="Wallet scan failed", state="error")
             render_api_error(exc, prefix="Wallet scan failed")
             return
+        _job_log("backend_request_end", job="wallet_scan", ok=True)
     state = result.get("state")
     if state == "running":
-        st.success("Wallet scan started in the background. Refreshing status...")
-        time.sleep(2)
+        finish_job(success=True, result_message="Backend worker queued the scan.")
         st.cache_data.clear()
+        _job_log("rerun_trigger", source="action_run_wallet_scan.queued")
         st.rerun()
         return
     if state == "finished" and result.get("result"):
         result = result.get("result") or {}
-    st.toast(
-        f"Wallet scan {result.get('generated_for_date') or selected_card_date}: "
-        f"{result.get('markets_for_card_date', 0)}/{result.get('markets_seen', 0)} markets, "
-        f"skipped stale={result.get('stale_markets_skipped', 0)}, "
-        f"positions={result.get('positions_written', result.get('new_signals', 0))}, "
+    summary = (
+        f"{result.get('markets_for_card_date', 0)}/{result.get('markets_seen', 0)} markets · "
+        f"positions={result.get('positions_written', result.get('new_signals', 0))} · "
         f"alerts={result.get('alerts_written', result.get('new_alerts', 0))}"
     )
+    finish_job(success=True, result_message=summary)
+    st.toast(f"Wallet scan {result.get('generated_for_date') or selected_card_date}: {summary}")
     st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_run_wallet_scan.complete")
     st.rerun()
 
 
 def action_run_mlb_edge_scan() -> None:
-    with st.spinner("Running MLB edge engine (may take a moment)..."):
+    if not start_job("mlb_edge_scan", "MLB edge scan", status="Posting /mlb/edges/run..."):
+        st.toast("MLB edge scan is already running.")
+        return
+    result: dict[str, Any] = {}
+    with st.status("MLB edge scan: running engine…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="mlb_edge_scan", path="/mlb/edges/run", date=selected_card_date)
         try:
             result = api_post("/mlb/edges/run", timeout=MLB_RUN_TIMEOUT, params={"game_date": selected_card_date})
         except ApiError as exc:
+            _job_log("backend_request_end", job="mlb_edge_scan", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"MLB edge scan failed: {exc}")
+            status_box.update(label="MLB edge scan failed", state="error")
             render_api_error(exc, prefix="MLB edge scan failed")
             return
+        _job_log("backend_request_end", job="mlb_edge_scan", ok=True)
     if str(result.get("status") or "").lower() == "blocked":
-        st.warning(result.get("reason") or "Odds cache stale; refresh required before edge scan.")
+        reason = result.get("reason") or "Odds cache stale; refresh required before edge scan."
+        finish_job(success=False, result_message=f"Blocked: {reason}")
+        st.warning(reason)
         st.cache_data.clear()
+        _job_log("rerun_trigger", source="action_run_mlb_edge_scan.blocked")
         st.rerun()
         return
     generated_for = result.get("generated_for_date") or result.get("date") or "?"
     written = int(result.get("snapshots_written") or result.get("edges") or 0)
     preserved = int(result.get("snapshots_preserved_from_prior_dates") or 0)
-    st.success(
-        f"MLB scan for {generated_for}: {written} snapshot(s) written across "
-        f"{result.get('games', 0)} game(s) (odds events: {result.get('odds_events', 0)}). "
-        f"{preserved} snapshot(s) preserved from prior dates."
+    summary = (
+        f"{generated_for}: {written} snapshot(s) across {result.get('games', 0)} game(s) "
+        f"(odds events: {result.get('odds_events', 0)}, preserved: {preserved})"
     )
+    finish_job(success=True, result_message=summary)
+    st.toast(f"MLB scan complete · {summary}")
     st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_run_mlb_edge_scan.complete")
     st.rerun()
 
 
 def action_refresh_odds_cache() -> None:
-    with st.spinner("Refreshing odds cache..."):
+    if not start_job("odds_cache_refresh", "Odds cache refresh", status="Posting /mlb/debug/odds-cache/refresh..."):
+        st.toast("Odds cache refresh is already running.")
+        return
+    result: dict[str, Any] = {}
+    with st.status("Odds cache: refreshing…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="odds_cache_refresh", path="/mlb/debug/odds-cache/refresh", date=selected_card_date)
         try:
             result = api_post(
                 "/mlb/debug/odds-cache/refresh",
@@ -2325,34 +2559,56 @@ def action_refresh_odds_cache() -> None:
                 params={"game_date": selected_card_date},
             )
         except ApiError as exc:
+            _job_log("backend_request_end", job="odds_cache_refresh", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"Odds cache refresh failed: {exc}")
+            status_box.update(label="Odds cache refresh failed", state="error")
             render_api_error(exc, prefix="Odds cache refresh failed")
             return
-    st.success(
-        f"Cache refresh: events={result.get('events_fetched', 0)}, "
+        _job_log("backend_request_end", job="odds_cache_refresh", ok=True)
+    summary = (
+        f"events={result.get('events_fetched', 0)}, "
         f"odds_calls={result.get('odds_calls', 0)}, "
         f"rate_limited={result.get('rate_limited', 0)}"
     )
+    finish_job(success=True, result_message=summary)
+    st.toast(f"Cache refresh · {summary}")
     st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_refresh_odds_cache")
     st.rerun()
 
 
 def action_test_backend() -> None:
-    try:
-        payload = api_get("/health", timeout=HEALTH_TIMEOUT)
-    except ApiError as exc:
-        render_api_error(exc, prefix="Backend test failed")
+    if not start_job("backend_test", "Backend test", status="Calling /health..."):
+        st.toast("Backend test is already running.")
         return
-    st.success(
-        f"Backend OK · env={payload.get('environment')} · "
-        f"timestamp={payload.get('timestamp', '?')}"
+    with st.status("Backend test: calling /health…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="backend_test", path="/health")
+        try:
+            payload = api_get("/health", timeout=HEALTH_TIMEOUT)
+        except ApiError as exc:
+            _job_log("backend_request_end", job="backend_test", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"Backend test failed: {exc}")
+            status_box.update(label="Backend test failed", state="error")
+            render_api_error(exc, prefix="Backend test failed")
+            return
+        _job_log("backend_request_end", job="backend_test", ok=True)
+    summary = (
+        f"OK · env={payload.get('environment')} · ts={payload.get('timestamp', '?')}"
     )
+    finish_job(success=True, result_message=summary)
+    status_box.update(label=f"Backend {summary}", state="complete")
 
 
 def action_update_mlb_closing_lines(date: str | None = None) -> None:
+    if not start_job("mlb_closing_lines", "MLB closing-lines update", status="Posting /mlb/debug/closing-lines/run..."):
+        st.toast("Closing-lines update is already running.")
+        return
     params: dict[str, Any] = {}
     if date:
         params["date"] = date
-    with st.spinner("Updating MLB closing lines..."):
+    result: dict[str, Any] = {}
+    with st.status("MLB closing lines: updating…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="mlb_closing_lines", path="/mlb/debug/closing-lines/run", date=date)
         try:
             result = api_post(
                 "/mlb/debug/closing-lines/run",
@@ -2360,8 +2616,12 @@ def action_update_mlb_closing_lines(date: str | None = None) -> None:
                 params=params or None,
             )
         except ApiError as exc:
+            _job_log("backend_request_end", job="mlb_closing_lines", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"Closing-line update failed: {exc}")
+            status_box.update(label="Closing-line update failed", state="error")
             render_api_error(exc, prefix="Closing-line update failed")
             return
+        _job_log("backend_request_end", job="mlb_closing_lines", ok=True)
     updated = int(result.get("closing_lines_updated") or 0)
     candidates = int(result.get("candidates") or 0)
     skipped = int(result.get("skipped") or 0)
@@ -2380,15 +2640,25 @@ def action_update_mlb_closing_lines(date: str | None = None) -> None:
             f"Closing-line update finished{date_suffix}: 0 updated, {candidates} candidate(s), "
             f"{skipped} skipped, {failed} failed."
         )
+    summary = (
+        f"updated={updated}, candidates={candidates}, skipped={skipped}, failed={failed}"
+    )
+    finish_job(success=True, result_message=summary)
     st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_update_mlb_closing_lines")
     st.rerun()
 
 
 def action_grade_mlb_results(date: str | None = None) -> None:
+    if not start_job("mlb_grade_results", "MLB grading", status="Posting /mlb/debug/grade-results/run..."):
+        st.toast("MLB grading is already running.")
+        return
     params: dict[str, Any] = {}
     if date:
         params["date"] = date
-    with st.spinner("Grading MLB results..."):
+    result: dict[str, Any] = {}
+    with st.status("MLB grading: running…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="mlb_grade_results", path="/mlb/debug/grade-results/run", date=date)
         try:
             result = api_post(
                 "/mlb/debug/grade-results/run",
@@ -2396,8 +2666,12 @@ def action_grade_mlb_results(date: str | None = None) -> None:
                 params=params or None,
             )
         except ApiError as exc:
+            _job_log("backend_request_end", job="mlb_grade_results", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"MLB grading failed: {exc}")
+            status_box.update(label="MLB grading failed", state="error")
             render_api_error(exc, prefix="MLB grading failed")
             return
+        _job_log("backend_request_end", job="mlb_grade_results", ok=True)
     graded = int(result.get("graded") or 0)
     candidates = int(result.get("candidates") or 0)
     finals = int(result.get("finals_found") or 0)
@@ -2427,25 +2701,44 @@ def action_grade_mlb_results(date: str | None = None) -> None:
             f"finals={finals}, not_final={skipped_not_final}, failed={failed}, "
             f"ingested={upserted}."
         )
+    summary = (
+        f"graded={graded}, candidates={candidates}, finals={finals}, "
+        f"persisted={persisted}, live={live}, ingested={upserted}, "
+        f"not_final={skipped_not_final}, failed={failed}"
+    )
+    finish_job(success=True, result_message=summary)
     st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_grade_mlb_results")
     st.rerun()
 
 
 def action_sync_pnl_wallets() -> None:
-    with st.spinner("Syncing personal wallet P&L cache..."):
+    if not start_job("pnl_sync", "P&L wallet sync", status="Posting /pnl/sync..."):
+        st.toast("P&L sync is already running.")
+        return
+    result: dict[str, Any] = {}
+    with st.status("P&L sync: contacting backend…", expanded=False, state="running") as status_box:
+        _job_log("backend_request_start", job="pnl_sync", path="/pnl/sync")
         try:
             result = api_post("/pnl/sync", timeout=SCAN_TIMEOUT)
         except ApiError as exc:
+            _job_log("backend_request_end", job="pnl_sync", ok=False, error=str(exc))
+            finish_job(success=False, result_message=f"P&L sync failed: {exc}")
+            status_box.update(label="P&L sync failed", state="error")
             render_api_error(exc, prefix="P&L wallet sync failed")
             return
-    st.cache_data.clear()
+        _job_log("backend_request_end", job="pnl_sync", ok=True)
     warnings = result.get("warnings") or []
-    st.success(
-        f"P&L sync: {result.get('new_trades', 0)} new fills, "
-        f"{result.get('positions_rebuilt', 0)} positions rebuilt ({result.get('mode')})."
+    summary = (
+        f"new_trades={result.get('new_trades', 0)}, "
+        f"positions_rebuilt={result.get('positions_rebuilt', 0)} "
+        f"({result.get('mode')})"
     )
+    finish_job(success=True, result_message=summary)
     for warning in warnings[:3]:
         st.warning(warning)
+    st.cache_data.clear()
+    _job_log("rerun_trigger", source="action_sync_pnl_wallets")
     st.rerun()
 
 
@@ -3034,20 +3327,51 @@ st.markdown(
 )
 
 action_cols = st.columns([1, 1, 1, 1, 6])
+# Each button is disabled while its own dashboard-side job is in flight so a
+# double-click can't spawn a duplicate scan. The wallet-scan button also
+# respects the backend's own scan-status flag — the worker tracks long-running
+# scans across reloads, and we don't want to launch a second one on top.
+wallet_scan_active = is_job_running("wallet_scan") or scan_status_payload.get("state") == "running"
+mlb_edge_active = is_job_running("mlb_edge_scan")
+odds_cache_active = is_job_running("odds_cache_refresh")
+backend_test_active = is_job_running("backend_test")
+
 with action_cols[0]:
-    scan_running = scan_status_payload.get("state") == "running"
-    scan_label = "Wallet scan running" if scan_running else "Run wallet scan"
-    if st.button(scan_label, use_container_width=True, type="primary", disabled=scan_running):
+    scan_label = "Wallet scan running…" if wallet_scan_active else "Run wallet scan"
+    if st.button(
+        scan_label, use_container_width=True, type="primary",
+        disabled=wallet_scan_active, key="cc_btn_wallet_scan",
+    ):
+        _job_log("button_click", name="run_wallet_scan")
         action_run_wallet_scan()
 with action_cols[1]:
-    if st.button("Run MLB edge scan", use_container_width=True, type="primary"):
+    mlb_label = "MLB edge scan running…" if mlb_edge_active else "Run MLB edge scan"
+    if st.button(
+        mlb_label, use_container_width=True, type="primary",
+        disabled=mlb_edge_active, key="cc_btn_mlb_edge_scan",
+    ):
+        _job_log("button_click", name="run_mlb_edge_scan")
         action_run_mlb_edge_scan()
 with action_cols[2]:
-    if st.button("Refresh odds cache", use_container_width=True):
+    odds_label = "Refreshing odds…" if odds_cache_active else "Refresh odds cache"
+    if st.button(
+        odds_label, use_container_width=True,
+        disabled=odds_cache_active, key="cc_btn_refresh_odds_cache",
+    ):
+        _job_log("button_click", name="refresh_odds_cache")
         action_refresh_odds_cache()
 with action_cols[3]:
-    if st.button("Test backend", use_container_width=True):
+    test_label = "Testing backend…" if backend_test_active else "Test backend"
+    if st.button(
+        test_label, use_container_width=True,
+        disabled=backend_test_active, key="cc_btn_test_backend",
+    ):
+        _job_log("button_click", name="test_backend")
         action_test_backend()
+
+# Single scoped status line — replaces every page-wide `st.spinner` overlay
+# the dashboard used to throw up during background work.
+render_active_job_panel()
 
 if scan_status_payload.get("state") == "running":
     st.info(
@@ -4103,7 +4427,7 @@ with tab_bpp:
                 render_api_error(exc, prefix="Failed to start refresh")
             st.rerun()
 
-        # ----- Active job panel + auto-poll -------------------------------
+        # ----- Active job panel + opt-in auto-refresh ---------------------
         if bpp_active_job:
             job = bpp_active_job
             jc = st.columns([1, 1, 1, 1])
@@ -4116,27 +4440,61 @@ with tab_bpp:
                     "Finish Login (close browser)",
                     key=f"bpp_signal_{job.get('job_id')}",
                 ):
+                    _job_log("button_click", name="bpp_finish_login", job_id=job.get("job_id"))
                     try:
                         api_post(f"/ballparkpal/jobs/{job['job_id']}/signal", json={})
                         st.success("Sent finish signal. Browser should close shortly.")
                     except ApiError as exc:
                         render_api_error(exc, prefix="Signal failed")
+                    _job_log("rerun_trigger", source="bpp_finish_login")
                     st.rerun()
             else:
                 st.info(
-                    "Refresh in progress. This panel polls every few seconds — "
-                    "snapshots will update once the job finishes."
+                    "BallparkPal refresh job is running on the backend. The "
+                    "dashboard does **not** poll automatically — click "
+                    "**Refresh status** to update this panel, or tick "
+                    "**Auto-refresh** to poll every 8s while the job runs."
                 )
+
+            poll_cols = st.columns([1, 1, 4])
+            with poll_cols[0]:
+                if st.button(
+                    "Refresh status", key="bpp_refresh_status",
+                    use_container_width=True,
+                ):
+                    _job_log("button_click", name="bpp_refresh_status", job_id=job.get("job_id"))
+                    _job_log("rerun_trigger", source="bpp_refresh_status")
+                    st.rerun()
+            with poll_cols[1]:
+                bpp_auto_refresh = st.checkbox(
+                    "Auto-refresh (8s)",
+                    value=False,
+                    key="bpp_auto_refresh",
+                    help=(
+                        "Off by default. While checked, this panel polls the "
+                        "backend every 8 seconds — the only auto-rerun in the "
+                        "dashboard. Uncheck to stop."
+                    ),
+                )
+
             logs_text = job.get("logs") or ""
             if logs_text:
                 with st.expander("Live logs", expanded=True):
                     st.code(logs_text[-4000:], language="text")
-            # Poll-and-rerun loop. We don't block the dashboard — Streamlit
-            # reruns on its own after the sleep, which keeps other tabs
-            # responsive while the job runs.
-            import time as _time
-            _time.sleep(3.0)
-            st.rerun()
+
+            if bpp_auto_refresh:
+                st.caption(
+                    f"Auto-refreshing every 8s while bpp job {job.get('job_id')} "
+                    "is active. Uncheck the box above to stop."
+                )
+                import time as _time
+                _time.sleep(8.0)
+                _job_log(
+                    "rerun_trigger",
+                    source="bpp_auto_refresh",
+                    job_id=job.get("job_id"),
+                )
+                st.rerun()
         elif st.session_state.get("bpp_active_job_id"):
             # Job recently finished — drop the cache + clear the marker so
             # subtabs see fresh snapshots.
