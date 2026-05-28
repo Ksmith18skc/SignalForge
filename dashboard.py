@@ -2618,6 +2618,19 @@ def fetch_pnl_tracker() -> dict[str, Any]:
     return safe_get("/pnl/tracker", default={"summary": {}, "open_positions": [], "closed_positions": []})
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_ballparkpal_snapshots(slate_date: str | None = None) -> dict[str, Any]:
+    """Read BallparkPal cache via the API. Pure read — Playwright is never
+    invoked here. Cached for 60s so flipping subtabs feels instant.
+    """
+    params = {"slate_date": slate_date} if slate_date else None
+    return safe_get(
+        "/ballparkpal/snapshots",
+        default={"slate_date": slate_date, "pages": {}, "labels": {}},
+        params=params,
+    )
+
+
 # =============================================================================
 # Signal → position aggregation (kept from prior dashboard)
 # =============================================================================
@@ -3094,6 +3107,7 @@ render_pnl_summary_cards(pnl_payload, fmt_money=fmt_money, fmt_num=fmt_num)
     tab_pnl,
     tab_perf,
     tab_odds,
+    tab_bpp,
     tab_watchlist,
     tab_alerts,
     tab_health,
@@ -3104,6 +3118,7 @@ render_pnl_summary_cards(pnl_payload, fmt_money=fmt_money, fmt_num=fmt_num)
     "P&L Tracker",
     "Performance / CLV",
     "Odds Cache",
+    "BallparkPal",
     "Watchlist",
     "Alerts",
     "Health / Debug",
@@ -3949,6 +3964,521 @@ with tab_perf:
                 )
             else:
                 st.caption("None")
+
+
+# =============================================================================
+# BallparkPal — read-only view over the cached snapshots written by the
+# scripts/update_ballparkpal_cache.py ingestion CLI. The dashboard never
+# scrapes; if no snapshots exist yet, every subtab renders an honest empty
+# state with run instructions.
+# =============================================================================
+
+with tab_bpp:
+    bpp_payload = fetch_ballparkpal_snapshots(slate_date=None)
+    bpp_pages = (bpp_payload.get("pages") or {})
+    bpp_labels = (bpp_payload.get("labels") or {})
+
+    def _bpp_page(key: str) -> dict[str, Any]:
+        return bpp_pages.get(key) or {}
+
+    (
+        bpp_overview_tab,
+        bpp_ev_tab,
+        bpp_k_tab,
+        bpp_hr_tab,
+        bpp_hits_tab,
+        bpp_sims_tab,
+        bpp_debug_tab,
+    ) = st.tabs([
+        "Overview",
+        "Positive EV",
+        "Strikeouts",
+        "Home Run Zone",
+        "Hits",
+        "Game Sims",
+        "Raw Snapshots",
+    ])
+
+    # ---- Job control: refresh + login + operator logs --------------------
+    # Live job state. We poll /ballparkpal/jobs (uncached) so the panel
+    # reflects the running job in real time without re-rendering the
+    # whole dashboard.
+    try:
+        bpp_jobs_payload = api_get_once("/ballparkpal/jobs", timeout=8.0) or {}
+    except Exception:  # noqa: BLE001
+        bpp_jobs_payload = {}
+    bpp_active_job = bpp_jobs_payload.get("active")
+    bpp_has_profile = bool(bpp_jobs_payload.get("has_profile"))
+    bpp_recent_jobs = bpp_jobs_payload.get("jobs") or []
+
+    # ---- Overview --------------------------------------------------------
+    with bpp_overview_tab:
+        st.markdown("### BallparkPal Cache Overview")
+        st.caption(
+            "Background refresh runs `scripts/update_ballparkpal_cache.py` "
+            "as a subprocess — Playwright never loads in this dashboard "
+            "process. One job at a time."
+        )
+
+        # Controls row. Disabled while a job is active so two clicks can't
+        # spawn a second Playwright session against the same profile.
+        ctrl = st.columns([1.2, 1.2, 2, 1.4, 1.4])
+        with ctrl[0]:
+            launch_login = st.button(
+                "Launch Login Browser",
+                use_container_width=True,
+                disabled=bool(bpp_active_job),
+                help="Opens Playwright headed so you can sign in. Click 'Finish Login' when done.",
+            )
+        with ctrl[1]:
+            refresh_clicked = st.button(
+                "Refresh BallparkPal Data",
+                use_container_width=True,
+                disabled=bool(bpp_active_job) or not bpp_has_profile,
+                help=(
+                    "Run the scrape against cached login session."
+                    if bpp_has_profile
+                    else "Run login initialization first."
+                ),
+            )
+        with ctrl[2]:
+            sel_pages = st.multiselect(
+                "Pages",
+                options=list(bpp_labels.keys()) or [
+                    "positive_ev", "strikeouts", "hr_zone", "hits", "game_sims",
+                ],
+                default=list(bpp_labels.keys()) or [
+                    "positive_ev", "strikeouts", "hr_zone", "hits", "game_sims",
+                ],
+                format_func=lambda k: bpp_labels.get(k, k),
+                key="bpp_pages_selector",
+            )
+        with ctrl[3]:
+            sel_date = st.text_input(
+                "Slate date",
+                value="today",
+                key="bpp_date_input",
+                help="YYYY-MM-DD, 'today', or 'yesterday'.",
+            )
+        with ctrl[4]:
+            headless_choice = st.checkbox(
+                "Headless",
+                value=True,
+                key="bpp_headless_choice",
+                help="Uncheck to watch Playwright run.",
+            )
+
+        if not bpp_has_profile and not bpp_active_job:
+            st.warning(
+                "No persisted browser session found. Click **Launch Login Browser** "
+                "first; sign in to BallparkPal; then click **Finish Login**."
+            )
+
+        # ----- Action handlers --------------------------------------------
+        if launch_login:
+            try:
+                resp = api_post("/ballparkpal/login", json={})
+                st.session_state["bpp_active_job_id"] = resp.get("job_id")
+                st.success(
+                    f"Login browser launched (job {resp.get('job_id')}). "
+                    "Complete the sign-in in the opened window, then click 'Finish Login'."
+                )
+            except ApiError as exc:
+                render_api_error(exc, prefix="Failed to start login")
+            st.rerun()
+
+        if refresh_clicked:
+            try:
+                resp = api_post(
+                    "/ballparkpal/refresh",
+                    json={
+                        "pages": sel_pages,
+                        "slate_date": sel_date.strip() or None,
+                        "headless": bool(headless_choice),
+                    },
+                )
+                st.session_state["bpp_active_job_id"] = resp.get("job_id")
+                st.success(f"Refresh queued (job {resp.get('job_id')}).")
+            except ApiError as exc:
+                render_api_error(exc, prefix="Failed to start refresh")
+            st.rerun()
+
+        # ----- Active job panel + auto-poll -------------------------------
+        if bpp_active_job:
+            job = bpp_active_job
+            jc = st.columns([1, 1, 1, 1])
+            jc[0].metric("Job", job.get("job_id") or DASH)
+            jc[1].metric("Status", str(job.get("status") or "?").upper())
+            jc[2].metric("Mode", str(job.get("mode") or "?").upper())
+            jc[3].metric("Duration", f"{job.get('duration_seconds') or 0:.1f}s")
+            if job.get("mode") == "login":
+                if st.button(
+                    "Finish Login (close browser)",
+                    key=f"bpp_signal_{job.get('job_id')}",
+                ):
+                    try:
+                        api_post(f"/ballparkpal/jobs/{job['job_id']}/signal", json={})
+                        st.success("Sent finish signal. Browser should close shortly.")
+                    except ApiError as exc:
+                        render_api_error(exc, prefix="Signal failed")
+                    st.rerun()
+            else:
+                st.info(
+                    "Refresh in progress. This panel polls every few seconds — "
+                    "snapshots will update once the job finishes."
+                )
+            logs_text = job.get("logs") or ""
+            if logs_text:
+                with st.expander("Live logs", expanded=True):
+                    st.code(logs_text[-4000:], language="text")
+            # Poll-and-rerun loop. We don't block the dashboard — Streamlit
+            # reruns on its own after the sleep, which keeps other tabs
+            # responsive while the job runs.
+            import time as _time
+            _time.sleep(3.0)
+            st.rerun()
+        elif st.session_state.get("bpp_active_job_id"):
+            # Job recently finished — drop the cache + clear the marker so
+            # subtabs see fresh snapshots.
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.session_state.pop("bpp_active_job_id", None)
+
+        # ----- Operator log panel -----------------------------------------
+        with st.expander("Operator logs / recent jobs", expanded=False):
+            if not bpp_recent_jobs:
+                st.caption("No jobs run yet.")
+            else:
+                recent_rows = []
+                for j in bpp_recent_jobs:
+                    recent_rows.append({
+                        "job_id": j.get("job_id"),
+                        "mode": j.get("mode"),
+                        "status": j.get("status"),
+                        "started_at": j.get("started_at"),
+                        "finished_at": j.get("finished_at"),
+                        "duration_s": j.get("duration_seconds"),
+                        "pages": ", ".join(j.get("pages") or []) or DASH,
+                        "return_code": j.get("return_code"),
+                        "error": j.get("error_message") or DASH,
+                    })
+                st.dataframe(
+                    pd.DataFrame(recent_rows).fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                    height=min(280, 60 + 32 * len(recent_rows)),
+                )
+                last_logs = (bpp_recent_jobs[0] or {}).get("logs") or ""
+                if last_logs:
+                    st.markdown("**Last job logs (tail)**")
+                    st.code(last_logs[-4000:], language="text")
+
+        if not bpp_pages:
+            render_empty_state(
+                "NO BALLPARKPAL CACHE",
+                "Run `python scripts/update_ballparkpal_cache.py --login` once "
+                "to sign in, then `python scripts/update_ballparkpal_cache.py "
+                "--pages positive_ev,strikeouts,hr_zone,hits,game_sims --date today`.",
+            )
+        else:
+            ov_rows: list[dict[str, Any]] = []
+            stale_any = False
+            login_required = False
+            for key, label in bpp_labels.items():
+                page = _bpp_page(key)
+                if page.get("status") == "login_required":
+                    login_required = True
+                if page.get("stale"):
+                    stale_any = True
+                ov_rows.append(
+                    {
+                        "page": label,
+                        "status": page.get("status") or "missing",
+                        "rows": page.get("row_count") or 0,
+                        "slate_date": page.get("slate_date") or DASH,
+                        "fetched_at": page.get("fetched_at") or DASH,
+                        "last_updated_text": page.get("last_updated_text") or DASH,
+                        "stale": "yes" if page.get("stale") else "no",
+                        "error": page.get("error_message") or DASH,
+                    }
+                )
+            if login_required:
+                st.error(
+                    "BallparkPal session expired. Re-run "
+                    "`python scripts/update_ballparkpal_cache.py --login`."
+                )
+            if stale_any:
+                st.warning(
+                    "Some pages have not been refreshed in the last 24h. "
+                    "Re-run the ingestion script to refresh."
+                )
+            st.dataframe(
+                pd.DataFrame(ov_rows).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(ov_rows)),
+            )
+
+    # ---- Positive EV -----------------------------------------------------
+    with bpp_ev_tab:
+        ev = _bpp_page("positive_ev")
+        rows = ev.get("rows") or []
+        st.markdown("### Positive EV")
+        st.caption(
+            f"{ev.get('row_count') or 0} rows · last updated "
+            f"{ev.get('last_updated_text') or DASH}"
+        )
+        if not rows:
+            st.info("No Positive EV rows cached yet.")
+        else:
+            df_ev = pd.DataFrame(rows)
+            with st.expander("Filters", expanded=False):
+                col_a, col_b, col_c, col_d = st.columns(4)
+                markets = sorted({str(r.get("market") or "") for r in rows if r.get("market")})
+                teams = sorted({str(r.get("team") or "") for r in rows if r.get("team")})
+                books = sorted({str(r.get("book") or "") for r in rows if r.get("book")})
+                sel_market = col_a.multiselect("Market", markets, default=[])
+                sel_team = col_b.multiselect("Team", teams, default=[])
+                sel_book = col_c.multiselect("Book", books, default=[])
+                min_delta = col_d.number_input(
+                    "Min BP delta (%)", value=0.0, step=0.5,
+                    help="Filter to rows where ballparkpal_delta ≥ this.",
+                )
+
+            def _row_passes(r: dict[str, Any]) -> bool:
+                if sel_market and r.get("market") not in sel_market:
+                    return False
+                if sel_team and r.get("team") not in sel_team:
+                    return False
+                if sel_book and r.get("book") not in sel_book:
+                    return False
+                bp_delta = r.get("ballparkpal_delta")
+                if min_delta and (bp_delta is None or bp_delta < min_delta):
+                    return False
+                return True
+
+            filtered = [r for r in rows if _row_passes(r)]
+            df_ev_filtered = pd.DataFrame(filtered) if filtered else pd.DataFrame(columns=df_ev.columns)
+            # Highlight rows where both sportsbook-vs-consensus AND
+            # sportsbook-vs-BPP deltas are positive — that's the "double
+            # confirmation" the EV page is meant to surface.
+            cs_delta = df_ev_filtered.get("consensus_delta")
+            bp_delta = df_ev_filtered.get("ballparkpal_delta")
+            highlight_n = 0
+            if cs_delta is not None and bp_delta is not None:
+                try:
+                    highlight_n = int(((cs_delta > 0) & (bp_delta > 0)).sum())
+                except Exception:
+                    highlight_n = 0
+            st.caption(
+                f"{len(filtered)} of {len(rows)} rows after filters · "
+                f"{highlight_n} with both consensus & BPP edge positive."
+            )
+            if not df_ev_filtered.empty:
+                st.dataframe(
+                    df_ev_filtered.fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                    height=min(560, 60 + 32 * len(df_ev_filtered)),
+                )
+
+    # ---- Strikeouts ------------------------------------------------------
+    with bpp_k_tab:
+        k_payload = _bpp_page("strikeouts")
+        k_rows = k_payload.get("rows") or []
+        st.markdown("### Strikeout Center")
+        st.caption(
+            f"{k_payload.get('row_count') or 0} pitchers · last updated "
+            f"{k_payload.get('last_updated_text') or DASH}"
+        )
+        if not k_rows:
+            st.info("No strikeout rows cached yet.")
+        else:
+            # Compare against SignalForge pitcher_strikeouts edges from the
+            # already-loaded MLB-edges list. We do not refetch.
+            sf_k_by_pitcher: dict[str, dict[str, Any]] = {}
+            for edge in mlb_edges_all or []:
+                if str(edge.get("edge_type") or "") != "pitcher_strikeouts":
+                    continue
+                market = str(edge.get("market") or "")
+                pitcher_name = market.split(" Over ")[0].split(" Under ")[0].strip()
+                if pitcher_name:
+                    key = "".join(ch for ch in pitcher_name.lower() if ch.isalnum())
+                    sf_k_by_pitcher[key] = edge
+
+            display = []
+            for row in k_rows:
+                pname = row.get("pitcher") or ""
+                key = "".join(ch for ch in pname.lower() if ch.isalnum())
+                sf_edge = sf_k_by_pitcher.get(key) or {}
+                line = sf_edge.get("line")
+                k_proj = row.get("projected_k")
+                gap = (
+                    round(float(k_proj) - float(line), 2)
+                    if k_proj is not None and line is not None
+                    else None
+                )
+                display.append({
+                    **row,
+                    "sf_line": line,
+                    "sf_side": sf_edge.get("side"),
+                    "k_gap_vs_sf_line": gap,
+                })
+            st.dataframe(
+                pd.DataFrame(display).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(560, 60 + 32 * len(display)),
+            )
+
+    # ---- Home Run Zone ---------------------------------------------------
+    with bpp_hr_tab:
+        hr_payload = _bpp_page("hr_zone")
+        meta = hr_payload.get("meta") or {}
+        st.markdown("### Home Run Zone")
+        st.caption(
+            f"last updated {hr_payload.get('last_updated_text') or DASH}"
+        )
+        sub_totals = meta.get("totals") or []
+        sub_game = meta.get("by_game") or []
+        sub_team = meta.get("by_team") or []
+        sub_hitters = meta.get("hitters") or []
+        if not any([sub_totals, sub_game, sub_team, sub_hitters]):
+            st.info("No HR Zone tables cached yet.")
+        if sub_totals:
+            st.markdown("**Park totals**")
+            st.dataframe(
+                pd.DataFrame(sub_totals).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(sub_totals)),
+            )
+        if sub_game:
+            st.markdown("**By game**")
+            st.dataframe(
+                pd.DataFrame(sub_game).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(sub_game)),
+            )
+        if sub_team:
+            st.markdown("**By team**")
+            st.dataframe(
+                pd.DataFrame(sub_team).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(sub_team)),
+            )
+        if sub_hitters:
+            st.markdown("**Hitters**")
+            st.dataframe(
+                pd.DataFrame(sub_hitters).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(420, 60 + 32 * len(sub_hitters)),
+            )
+
+    # ---- Hits ------------------------------------------------------------
+    with bpp_hits_tab:
+        hits_payload = _bpp_page("hits")
+        hits_rows = hits_payload.get("rows") or []
+        st.markdown("### Hits")
+        st.caption(
+            f"{hits_payload.get('row_count') or 0} batters · last updated "
+            f"{hits_payload.get('last_updated_text') or DASH}"
+        )
+        if not hits_rows:
+            st.info("No hits rows cached yet.")
+        else:
+            st.dataframe(
+                pd.DataFrame(hits_rows).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(560, 60 + 32 * len(hits_rows)),
+            )
+
+    # ---- Game Sims -------------------------------------------------------
+    with bpp_sims_tab:
+        sims_payload = _bpp_page("game_sims")
+        sims_rows = sims_payload.get("rows") or []
+        st.markdown("### Game Simulations")
+        st.caption(
+            f"{sims_payload.get('row_count') or 0} games · last updated "
+            f"{sims_payload.get('last_updated_text') or DASH}"
+        )
+        if not sims_rows:
+            st.info("No game-sim rows cached yet.")
+        else:
+            # Join against SignalForge game_total edges already in memory.
+            # We use (home, away) keyed on uppercase team codes; mismatches
+            # leave the SF columns blank rather than guessing.
+            sf_totals: dict[tuple[str, str], dict[str, Any]] = {}
+            for edge in mlb_edges_all or []:
+                if str(edge.get("edge_type") or "") != "game_total":
+                    continue
+                home = str(edge.get("home_team") or "").upper()
+                away = str(edge.get("away_team") or "").upper()
+                if home and away:
+                    sf_totals.setdefault((home, away), edge)
+            display = []
+            for row in sims_rows:
+                home = str(row.get("home_team") or "").upper()
+                away = str(row.get("away_team") or "").upper()
+                sf_edge = sf_totals.get((home, away)) or {}
+                market_total = sf_edge.get("line")
+                sf_proj = (
+                    sf_edge.get("model_projected_total")
+                    or sf_edge.get("projected_total")
+                )
+                bpp_total = row.get("projected_total")
+                display.append({
+                    **row,
+                    "market_total": market_total,
+                    "sf_projected_total": sf_proj,
+                    "bpp_minus_market": (
+                        round(float(bpp_total) - float(market_total), 2)
+                        if bpp_total is not None and market_total is not None
+                        else None
+                    ),
+                    "sf_minus_bpp": (
+                        round(float(sf_proj) - float(bpp_total), 2)
+                        if sf_proj is not None and bpp_total is not None
+                        else None
+                    ),
+                    "sf_minus_market": (
+                        round(float(sf_proj) - float(market_total), 2)
+                        if sf_proj is not None and market_total is not None
+                        else None
+                    ),
+                })
+            st.dataframe(
+                pd.DataFrame(display).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(560, 60 + 32 * len(display)),
+            )
+
+    # ---- Raw snapshots / debug ------------------------------------------
+    with bpp_debug_tab:
+        st.markdown("### Raw Snapshots / Debug")
+        st.caption(
+            "Run `python scripts/update_ballparkpal_cache.py --login` first "
+            "if no session has been saved. Then `--pages "
+            "positive_ev,strikeouts,hr_zone,hits,game_sims --date today` "
+            "writes one snapshot row per page to `ballparkpal_snapshots`."
+        )
+        debug_rows = []
+        for key, label in bpp_labels.items():
+            page = _bpp_page(key)
+            debug_rows.append({
+                "page": label,
+                "status": page.get("status") or "missing",
+                "rows": page.get("row_count") or 0,
+                "slate_date": page.get("slate_date") or DASH,
+                "fetched_at": page.get("fetched_at") or DASH,
+                "source_url": page.get("source_url") or DASH,
+                "raw_html_path": page.get("raw_html_path") or DASH,
+                "warnings": ", ".join(page.get("warnings") or []) or DASH,
+                "error_message": page.get("error_message") or DASH,
+            })
+        if debug_rows:
+            st.dataframe(
+                pd.DataFrame(debug_rows).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(360, 60 + 32 * len(debug_rows)),
+            )
 
 
 # =============================================================================

@@ -2057,6 +2057,146 @@ def mlb_factor_attribution(
     )
 
 
+# -----------------------------------------------------------------------------
+# BallparkPal — read-only routes that serve the cached snapshots written by
+# scripts/update_ballparkpal_cache.py. The dashboard hits these endpoints; it
+# must NEVER scrape BPP on its own.
+# -----------------------------------------------------------------------------
+
+@router.get("/ballparkpal/snapshots")
+def ballparkpal_all_snapshots(
+    slate_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """One row per page — the latest cached snapshot for each."""
+    from app.services.ballparkpal_cache import (
+        PAGE_LABELS,
+        all_latest_snapshots,
+        snapshot_payload,
+    )
+
+    snaps = {snap.page: snap for snap in all_latest_snapshots(db, slate_date=slate_date)}
+    payload: dict[str, object] = {}
+    for page in PAGE_LABELS:
+        payload[page] = snapshot_payload(snaps.get(page))
+    return {"slate_date": slate_date, "pages": payload, "labels": PAGE_LABELS}
+
+
+@router.post("/ballparkpal/refresh")
+def ballparkpal_refresh(
+    body: dict[str, object] | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Spawn a background scrape job. Returns immediately with the job id.
+
+    The API process never imports Playwright; it shells out to
+    ``scripts/update_ballparkpal_cache.py``. Concurrent refreshes are
+    rejected with 409 — only one job may hold the persistent profile
+    at a time.
+    """
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    payload = body or {}
+    pages = payload.get("pages") or None
+    if isinstance(pages, str):
+        pages = [p.strip() for p in pages.split(",") if p.strip()]
+    if pages is not None and not isinstance(pages, list):
+        raise HTTPException(status_code=400, detail="pages must be a list or comma-separated string")
+    slate_date = payload.get("slate_date") or payload.get("date")
+    headless_raw = payload.get("headless", True)
+    headless = bool(headless_raw) if not isinstance(headless_raw, str) else headless_raw.lower() == "true"
+    timeout = payload.get("timeout_seconds")
+    try:
+        job = bpp_jobs.start_refresh(
+            db,
+            pages=pages,
+            slate_date=slate_date if isinstance(slate_date, str) else None,
+            headless=headless,
+            timeout_seconds=int(timeout) if timeout else bpp_jobs.DEFAULT_REFRESH_TIMEOUT_S,
+        )
+    except bpp_jobs.BallparkPalBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"started": True, "job_id": job.job_id, "job": bpp_jobs.job_payload(job)}
+
+
+@router.post("/ballparkpal/login")
+def ballparkpal_login(
+    body: dict[str, object] | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Spawn a headed login session. The CLI opens Playwright headed and
+    blocks on stdin; the dashboard surfaces a 'Finish Login' button that
+    posts to /signal to send EOF.
+    """
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    payload = body or {}
+    timeout = payload.get("timeout_seconds")
+    try:
+        job = bpp_jobs.start_login(
+            db,
+            timeout_seconds=int(timeout) if timeout else bpp_jobs.DEFAULT_LOGIN_TIMEOUT_S,
+        )
+    except bpp_jobs.BallparkPalBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"started": True, "job_id": job.job_id, "job": bpp_jobs.job_payload(job)}
+
+
+@router.get("/ballparkpal/jobs")
+def ballparkpal_recent_jobs(
+    limit: int = 10,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    jobs = bpp_jobs.list_recent(db, limit=max(1, min(int(limit or 10), 100)))
+    active = bpp_jobs.active_job(db)
+    return {
+        "active": bpp_jobs.job_payload(active) if active else None,
+        "has_profile": bpp_jobs.has_persistent_profile(),
+        "jobs": [bpp_jobs.job_payload(j) for j in jobs],
+    }
+
+
+@router.get("/ballparkpal/jobs/{job_id}")
+def ballparkpal_job_detail(
+    job_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    job = bpp_jobs.get_job(db, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    return bpp_jobs.job_payload(job)
+
+
+@router.post("/ballparkpal/jobs/{job_id}/signal")
+def ballparkpal_job_signal(
+    job_id: str,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Close the running job's stdin. Used by the dashboard's
+    'Finish Login' button so the CLI's input() unblocks cleanly.
+    """
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    sent = bpp_jobs.signal_finish(db, job_id)
+    return {"signaled": sent, "job": bpp_jobs.job_payload(bpp_jobs.get_job(db, job_id))}
+
+
+@router.get("/ballparkpal/snapshot/{page}")
+def ballparkpal_one_snapshot(
+    page: str,
+    slate_date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    from app.services.ballparkpal_cache import latest_snapshot, snapshot_payload
+
+    snap = latest_snapshot(db, page=page, slate_date=slate_date)
+    return snapshot_payload(snap)
+
+
 def _optional_float(value: object) -> float | None:
     if value is None or value == "":
         return None

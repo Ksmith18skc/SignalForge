@@ -806,6 +806,58 @@ class ProviderHealthState(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, onupdate=_utcnow, index=True)
 
 
+class BallparkPalJob(Base):
+    """Tracks a dashboard-triggered BallparkPal scrape or login flow.
+
+    The API spawns ``scripts/update_ballparkpal_cache.py`` as a
+    subprocess and a daemon watcher thread updates this row as the
+    process progresses. Playwright is **never** imported into the API
+    process — only spawned as a child process.
+    """
+
+    __tablename__ = "ballparkpal_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    job_id: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    mode: Mapped[str] = mapped_column(String(16), default="refresh")  # refresh | login
+    status: Mapped[str] = mapped_column(String(16), default="queued", index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    pages: Mapped[list[Any] | None] = mapped_column(JSON, default=list)
+    slate_date: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    headless: Mapped[bool] = mapped_column(Boolean, default=True)
+    pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    return_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Log tail is capped at ~16KB by the watcher so a long-running scrape
+    # can't bloat the DB or the dashboard payload.
+    logs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class BallparkPalSnapshot(Base):
+    """Cached snapshot of a single BallparkPal page.
+
+    One row per (page, slate_date). Reads stay local — the dashboard
+    never scrapes; only ``scripts/update_ballparkpal_cache.py`` writes
+    here. ``raw_html_path`` points at a debug HTML dump on disk and is
+    optional so the parser can be re-run offline.
+    """
+
+    __tablename__ = "ballparkpal_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    page: Mapped[str] = mapped_column(String(64), index=True)
+    slate_date: Mapped[str | None] = mapped_column(String(10), index=True, nullable=True)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
+    last_updated_text: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_url: Mapped[str] = mapped_column(String(512))
+    raw_html_path: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    parsed_json: Mapped[dict[str, Any] | list[Any] | None] = mapped_column(JSON, default=dict)
+    row_count: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String(32), default="ok", index=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class MlbDailyCard(Base):
     __tablename__ = "mlb_daily_cards"
 
