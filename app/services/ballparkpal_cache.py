@@ -113,6 +113,9 @@ def snapshot_payload(snap: BallparkPalSnapshot | None) -> dict[str, Any]:
             "source_url": None,
             "error_message": None,
             "stale": True,
+            "source": None,
+            "filename": None,
+            "uploaded_at": None,
             "meta": {},
             "warnings": [],
         }
@@ -120,6 +123,12 @@ def snapshot_payload(snap: BallparkPalSnapshot | None) -> dict[str, Any]:
     rows = parsed.get("rows") if isinstance(parsed, dict) else parsed
     meta = parsed.get("meta") if isinstance(parsed, dict) else {}
     warnings = parsed.get("warnings") if isinstance(parsed, dict) else []
+    meta = meta or {}
+    # `source` is set by the manual-CSV upload path (ballparkpal_csv.py).
+    # Anything else is assumed to be the Playwright scraper. Surface it as
+    # a top-level field so the dashboard cache table can show it without
+    # having to dig through nested meta.
+    source = meta.get("source") or "playwright"
     return {
         "page": snap.page,
         "status": snap.status,
@@ -132,7 +141,10 @@ def snapshot_payload(snap: BallparkPalSnapshot | None) -> dict[str, Any]:
         "raw_html_path": snap.raw_html_path,
         "error_message": snap.error_message,
         "stale": _is_stale(snap.fetched_at),
-        "meta": meta or {},
+        "source": source,
+        "filename": meta.get("filename"),
+        "uploaded_at": meta.get("uploaded_at"),
+        "meta": meta,
         "warnings": warnings or [],
     }
 

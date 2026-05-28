@@ -7,7 +7,7 @@ from datetime import date, datetime, timedelta
 import logging
 from urllib.parse import unquote, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile, status
 from sqlalchemy import delete, desc, func, select
 from sqlalchemy.orm import Session
 
@@ -2183,6 +2183,91 @@ def ballparkpal_job_signal(
 
     sent = bpp_jobs.signal_finish(db, job_id)
     return {"signaled": sent, "job": bpp_jobs.job_payload(bpp_jobs.get_job(db, job_id))}
+
+
+@router.post("/ballparkpal/jobs/reset")
+def ballparkpal_jobs_reset(
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Force-fail every active BallparkPal job and kill any tracked
+    subprocess. The dashboard's 'Cancel stuck job' button calls this
+    when the operator can see a job has been stuck for hours — the
+    Playwright login flow on Render never opens a real window, so
+    these jobs need a manual escape hatch.
+    """
+    from app.services import ballparkpal_jobs as bpp_jobs
+
+    return bpp_jobs.cancel_active_jobs(db)
+
+
+@router.post("/ballparkpal/upload-csv")
+async def ballparkpal_upload_csv(
+    page: str = Form(...),
+    slate_date: str | None = Form(default=None),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Persist a manually-exported BallparkPal CSV as a cache snapshot.
+
+    Primary ingestion path — far more reliable than Playwright in any
+    hosted environment. The MLB edge scan reads from
+    ``ballparkpal_snapshots`` exactly the same way regardless of how a
+    row got there, so a successful upload is functionally identical to
+    a successful scrape.
+    """
+    from app.services import ballparkpal_csv as bpp_csv
+    from app.services.ballparkpal_cache import PAGE_LABELS, snapshot_payload, upsert_snapshot
+
+    if page not in PAGE_LABELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown page '{page}'. Expected one of: {sorted(PAGE_LABELS)}",
+        )
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    filename = file.filename or "manual_upload.csv"
+    slate = (slate_date or "").strip() or None
+    try:
+        result = bpp_csv.parse_uploaded_csv(
+            page=page,
+            csv_bytes=raw,
+            filename=filename,
+            slate_date=slate,
+        )
+    except bpp_csv.CsvParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    parsed = result["parsed"]
+    parsed_row_count = result["parsed_row_count"]
+    # Even a zero-row CSV gets persisted — the operator may have
+    # uploaded an empty slate (e.g. off-day) and the dashboard should
+    # reflect that rather than continuing to show yesterday's stale
+    # snapshot as fresh.
+    snap = upsert_snapshot(
+        db,
+        page=page,
+        slate_date=slate,
+        source_url=f"manual_upload://{filename}",
+        parsed=parsed,
+        raw_html_path=None,
+        last_updated_text=(parsed.get("meta") or {}).get("uploaded_at"),
+        status="ok" if parsed_row_count > 0 else "ok_empty",
+        error_message=None,
+    )
+    db.commit()
+    return {
+        "ok": True,
+        "page": page,
+        "slate_date": slate,
+        "filename": filename,
+        "header": result["header"],
+        "raw_row_count": result["raw_row_count"],
+        "parsed_row_count": parsed_row_count,
+        "warnings": result["warnings"],
+        "rows_preview": result["rows_preview"],
+        "snapshot": snapshot_payload(snap),
+    }
 
 
 @router.get("/ballparkpal/snapshot/{page}")

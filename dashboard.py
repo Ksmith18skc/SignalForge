@@ -4291,11 +4291,26 @@ with tab_perf:
 
 
 # =============================================================================
-# BallparkPal — read-only view over the cached snapshots written by the
-# scripts/update_ballparkpal_cache.py ingestion CLI. The dashboard never
-# scrapes; if no snapshots exist yet, every subtab renders an honest empty
-# state with run instructions.
+# BallparkPal — manual CSV upload is the primary ingestion path. The scraper
+# (scripts/update_ballparkpal_cache.py) remains available behind an Advanced
+# expander for local workstations that can actually open a headed browser.
+# Hosted environments (Render) can't open a real window, which is why the
+# legacy Playwright-only flow used to stick in RUNNING_LOGIN for hours.
 # =============================================================================
+
+# Fallback list used when the backend returns no labels (e.g. offline mode).
+PAGE_DEFAULT_OPTIONS = ("positive_ev", "strikeouts", "hr_zone", "hits", "game_sims")
+# Backend job states that block the dashboard's "is something running?" checks.
+ACTIVE_JOB_STATUSES = {"queued", "running"}
+# Map raw backend state → operator-friendly label so the dashboard never
+# shows "RUNNING LOGIN" without saying what that means.
+BPP_DISPLAY_STATE_LABELS = {
+    "idle": "Idle",
+    "waiting_for_login": "Waiting for login",
+    "processing": "Processing",
+    "complete": "Complete",
+    "failed": "Failed",
+}
 
 with tab_bpp:
     bpp_payload = fetch_ballparkpal_snapshots(slate_date=None)
@@ -4339,170 +4354,440 @@ with tab_bpp:
     with bpp_overview_tab:
         st.markdown("### BallparkPal Cache Overview")
         st.caption(
-            "Background refresh runs `scripts/update_ballparkpal_cache.py` "
-            "as a subprocess — Playwright never loads in this dashboard "
-            "process. One job at a time."
+            "**Manual CSV upload is the primary path.** Export each page from "
+            "BallparkPal, upload below, and the MLB edge scan reads the "
+            "snapshots exactly the same way it would after a scrape. "
+            "Playwright automation is optional and lives in the Advanced "
+            "expander."
         )
 
-        # Controls row. Disabled while a job is active so two clicks can't
-        # spawn a second Playwright session against the same profile.
-        ctrl = st.columns([1.2, 1.2, 2, 1.4, 1.4])
-        with ctrl[0]:
-            launch_login = st.button(
-                "Launch Login Browser",
-                use_container_width=True,
-                disabled=bool(bpp_active_job),
-                help="Opens Playwright headed so you can sign in. Click 'Finish Login' when done.",
-            )
-        with ctrl[1]:
-            refresh_clicked = st.button(
-                "Refresh BallparkPal Data",
-                use_container_width=True,
-                disabled=bool(bpp_active_job) or not bpp_has_profile,
-                help=(
-                    "Run the scrape against cached login session."
-                    if bpp_has_profile
-                    else "Run login initialization first."
-                ),
-            )
-        with ctrl[2]:
-            sel_pages = st.multiselect(
-                "Pages",
-                options=list(bpp_labels.keys()) or [
-                    "positive_ev", "strikeouts", "hr_zone", "hits", "game_sims",
-                ],
-                default=list(bpp_labels.keys()) or [
-                    "positive_ev", "strikeouts", "hr_zone", "hits", "game_sims",
-                ],
-                format_func=lambda k: bpp_labels.get(k, k),
-                key="bpp_pages_selector",
-            )
-        with ctrl[3]:
-            sel_date = st.text_input(
-                "Slate date",
-                value="today",
-                key="bpp_date_input",
-                help="YYYY-MM-DD, 'today', or 'yesterday'.",
-            )
-        with ctrl[4]:
-            headless_choice = st.checkbox(
-                "Headless",
-                value=True,
-                key="bpp_headless_choice",
-                help="Uncheck to watch Playwright run.",
-            )
-
-        if not bpp_has_profile and not bpp_active_job:
-            st.warning(
-                "No persisted browser session found. Click **Launch Login Browser** "
-                "first; sign in to BallparkPal; then click **Finish Login**."
-            )
-
-        # ----- Action handlers --------------------------------------------
-        if launch_login:
-            try:
-                resp = api_post("/ballparkpal/login", json={})
-                st.session_state["bpp_active_job_id"] = resp.get("job_id")
-                st.success(
-                    f"Login browser launched (job {resp.get('job_id')}). "
-                    "Complete the sign-in in the opened window, then click 'Finish Login'."
-                )
-            except ApiError as exc:
-                render_api_error(exc, prefix="Failed to start login")
-            st.rerun()
-
-        if refresh_clicked:
-            try:
-                resp = api_post(
-                    "/ballparkpal/refresh",
-                    json={
-                        "pages": sel_pages,
-                        "slate_date": sel_date.strip() or None,
-                        "headless": bool(headless_choice),
-                    },
-                )
-                st.session_state["bpp_active_job_id"] = resp.get("job_id")
-                st.success(f"Refresh queued (job {resp.get('job_id')}).")
-            except ApiError as exc:
-                render_api_error(exc, prefix="Failed to start refresh")
-            st.rerun()
-
-        # ----- Active job panel + opt-in auto-refresh ---------------------
+        # ----- Stuck-job recovery -----------------------------------------
+        # A login job that's been running 5+ minutes on a hosted environment
+        # is never going to finish — Playwright can't open a headed browser
+        # on Render. The backend now reaps these automatically (5-minute
+        # cap) but the operator may want to clear them immediately. This is
+        # the manual escape hatch.
         if bpp_active_job:
-            job = bpp_active_job
-            jc = st.columns([1, 1, 1, 1])
-            jc[0].metric("Job", job.get("job_id") or DASH)
-            jc[1].metric("Status", str(job.get("status") or "?").upper())
-            jc[2].metric("Mode", str(job.get("mode") or "?").upper())
-            jc[3].metric("Duration", f"{job.get('duration_seconds') or 0:.1f}s")
-            if job.get("mode") == "login":
-                if st.button(
-                    "Finish Login (close browser)",
-                    key=f"bpp_signal_{job.get('job_id')}",
-                ):
-                    _job_log("button_click", name="bpp_finish_login", job_id=job.get("job_id"))
-                    try:
-                        api_post(f"/ballparkpal/jobs/{job['job_id']}/signal", json={})
-                        st.success("Sent finish signal. Browser should close shortly.")
-                    except ApiError as exc:
-                        render_api_error(exc, prefix="Signal failed")
-                    _job_log("rerun_trigger", source="bpp_finish_login")
-                    st.rerun()
-            else:
-                st.info(
-                    "BallparkPal refresh job is running on the backend. The "
-                    "dashboard does **not** poll automatically — click "
-                    "**Refresh status** to update this panel, or tick "
-                    "**Auto-refresh** to poll every 8s while the job runs."
-                )
-
-            poll_cols = st.columns([1, 1, 4])
-            with poll_cols[0]:
-                if st.button(
-                    "Refresh status", key="bpp_refresh_status",
-                    use_container_width=True,
-                ):
-                    _job_log("button_click", name="bpp_refresh_status", job_id=job.get("job_id"))
-                    _job_log("rerun_trigger", source="bpp_refresh_status")
-                    st.rerun()
-            with poll_cols[1]:
-                bpp_auto_refresh = st.checkbox(
-                    "Auto-refresh (8s)",
-                    value=False,
-                    key="bpp_auto_refresh",
-                    help=(
-                        "Off by default. While checked, this panel polls the "
-                        "backend every 8 seconds — the only auto-rerun in the "
-                        "dashboard. Uncheck to stop."
-                    ),
-                )
-
-            logs_text = job.get("logs") or ""
-            if logs_text:
-                with st.expander("Live logs", expanded=True):
-                    st.code(logs_text[-4000:], language="text")
-
-            if bpp_auto_refresh:
-                st.caption(
-                    f"Auto-refreshing every 8s while bpp job {job.get('job_id')} "
-                    "is active. Uncheck the box above to stop."
-                )
-                import time as _time
-                _time.sleep(8.0)
-                _job_log(
-                    "rerun_trigger",
-                    source="bpp_auto_refresh",
-                    job_id=job.get("job_id"),
-                )
-                st.rerun()
-        elif st.session_state.get("bpp_active_job_id"):
-            # Job recently finished — drop the cache + clear the marker so
-            # subtabs see fresh snapshots.
-            try:
+            active_age = float(bpp_active_job.get("duration_seconds") or 0)
+            tone = "🟥" if active_age > 300 else "🟧"
+            stuck_msg = (
+                f"{tone} Background job **{bpp_active_job.get('job_id')}** "
+                f"(mode={bpp_active_job.get('mode')}) has been "
+                f"{bpp_active_job.get('status')} for {active_age:.0f}s."
+            )
+            if active_age > 300:
+                stuck_msg += " The backend will reap it automatically — click below to clear it now."
+            st.warning(stuck_msg)
+            if st.button(
+                "Cancel stuck job / reset BallparkPal job state",
+                type="primary",
+                key="bpp_cancel_stuck_job",
+                use_container_width=False,
+            ):
+                _job_log("button_click", name="bpp_cancel_stuck_job", job_id=bpp_active_job.get("job_id"))
+                try:
+                    cleared = api_post("/ballparkpal/jobs/reset", json={})
+                    st.success(
+                        f"Cleared {cleared.get('count', 0)} stuck job(s). "
+                        f"You can now upload a CSV or trigger a new run."
+                    )
+                except ApiError as exc:
+                    render_api_error(exc, prefix="Could not reset job state")
                 st.cache_data.clear()
-            except Exception:
-                pass
-            st.session_state.pop("bpp_active_job_id", None)
+                _job_log("rerun_trigger", source="bpp_cancel_stuck_job")
+                st.rerun()
+
+        # ----- Manual CSV upload (PRIMARY PATH) ---------------------------
+        st.markdown("#### Manual CSV Upload (recommended)")
+        st.caption(
+            "Drop one or more CSVs exported from BallparkPal. For each file, "
+            "pick the page it came from — the parser uses the same column "
+            "aliasing as the scraper, so the resulting cache rows are "
+            "indistinguishable from an automated refresh."
+        )
+
+        # File uploader. ``key`` is bumped after a successful upload (see
+        # ``bpp_uploader_nonce``) so the widget resets — otherwise the same
+        # files would keep getting re-uploaded on every rerun.
+        uploader_nonce = st.session_state.setdefault("bpp_uploader_nonce", 0)
+        uploaded_files = st.file_uploader(
+            "Upload CSV files (one per BallparkPal page)",
+            type=["csv", "tsv", "txt"],
+            accept_multiple_files=True,
+            key=f"bpp_csv_uploader_{uploader_nonce}",
+            help=(
+                "Strikeout Center, Positive EV, Home Run Zone, Hits, and "
+                "Game Simulations are the supported pages. The mapping "
+                "dropdown below each file controls which page the rows "
+                "land in."
+            ),
+        )
+
+        # Slate date applies to every file in the batch — BallparkPal
+        # exports are slate-specific so it's fair to pick one date.
+        upload_date_col, upload_btn_col = st.columns([1, 1])
+        with upload_date_col:
+            upload_slate_date = st.text_input(
+                "Slate date (applies to all files)",
+                value=selected_card_date,
+                key="bpp_upload_slate_date",
+                help="YYYY-MM-DD. Defaults to the card date selected in the sidebar.",
+            )
+        # Status placeholder for upload feedback — keeps it scoped to the
+        # CSV section instead of a page-wide spinner.
+        upload_state_placeholder = st.empty()
+
+        # Per-file controls: page mapping dropdown + name.
+        upload_specs: list[tuple[Any, str]] = []
+        page_options = list(bpp_labels.keys()) or list(PAGE_DEFAULT_OPTIONS)
+        if uploaded_files:
+            st.caption("Map each uploaded file to its BallparkPal page:")
+            for file_obj in uploaded_files:
+                file_cols = st.columns([3, 2])
+                with file_cols[0]:
+                    st.markdown(
+                        f"<div class='sf-meta'>📄 <b>{html.escape(file_obj.name)}</b> "
+                        f"· {file_obj.size or 0} bytes</div>",
+                        unsafe_allow_html=True,
+                    )
+                with file_cols[1]:
+                    # Best-effort autodetect based on filename hints —
+                    # "strikeout-center.csv" → strikeouts. Operator can
+                    # override.
+                    lower = file_obj.name.lower()
+                    if "strike" in lower:
+                        autodetect = "strikeouts"
+                    elif "positive" in lower or "ev" in lower:
+                        autodetect = "positive_ev"
+                    elif "home" in lower or "hr" in lower:
+                        autodetect = "hr_zone"
+                    elif "hit" in lower:
+                        autodetect = "hits"
+                    elif "sim" in lower or "game" in lower:
+                        autodetect = "game_sims"
+                    else:
+                        autodetect = page_options[0] if page_options else "positive_ev"
+                    default_idx = (
+                        page_options.index(autodetect) if autodetect in page_options else 0
+                    )
+                    page_choice = st.selectbox(
+                        "Page",
+                        options=page_options,
+                        index=default_idx,
+                        format_func=lambda k: bpp_labels.get(k, k),
+                        key=f"bpp_csv_page_{uploader_nonce}_{file_obj.name}",
+                    )
+                upload_specs.append((file_obj, page_choice))
+
+        process_clicked = st.button(
+            "Process uploaded CSVs",
+            type="primary",
+            disabled=not upload_specs,
+            key="bpp_process_csv_uploads",
+            use_container_width=False,
+        )
+
+        if process_clicked and upload_specs:
+            _job_log(
+                "button_click",
+                name="bpp_process_csv_uploads",
+                file_count=len(upload_specs),
+            )
+            upload_state_placeholder.empty()
+            with upload_state_placeholder.container():
+                with st.status(
+                    f"Processing {len(upload_specs)} CSV upload(s)…",
+                    expanded=True, state="running",
+                ) as status_box:
+                    success_count = 0
+                    failures: list[tuple[str, str]] = []
+                    upload_results: list[dict[str, Any]] = []
+                    for file_obj, page_key in upload_specs:
+                        try:
+                            file_obj.seek(0)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raw_bytes = file_obj.read()
+                        _job_log(
+                            "backend_request_start",
+                            job="bpp_csv_upload",
+                            page=page_key,
+                            filename=file_obj.name,
+                            bytes=len(raw_bytes),
+                        )
+                        try:
+                            with httpx.Client(base_url=API_BASE, timeout=60.0) as client:
+                                resp = client.post(
+                                    "/ballparkpal/upload-csv",
+                                    data={"page": page_key, "slate_date": upload_slate_date.strip() or ""},
+                                    files={"file": (file_obj.name, raw_bytes, "text/csv")},
+                                )
+                            if resp.status_code >= 400:
+                                err_text = resp.text[:600]
+                                _job_log(
+                                    "backend_request_end",
+                                    job="bpp_csv_upload", ok=False,
+                                    status=resp.status_code,
+                                    filename=file_obj.name,
+                                )
+                                failures.append((file_obj.name, err_text))
+                                continue
+                            payload = resp.json()
+                        except (httpx.HTTPError, ValueError) as exc:
+                            _job_log(
+                                "backend_request_end",
+                                job="bpp_csv_upload", ok=False,
+                                error=str(exc), filename=file_obj.name,
+                            )
+                            failures.append((file_obj.name, str(exc)))
+                            continue
+                        _job_log(
+                            "backend_request_end",
+                            job="bpp_csv_upload", ok=True,
+                            filename=file_obj.name,
+                            parsed_rows=payload.get("parsed_row_count"),
+                        )
+                        success_count += 1
+                        upload_results.append(payload)
+                    if success_count and not failures:
+                        status_box.update(
+                            label=f"Processed {success_count} CSV(s) — cache marked fresh.",
+                            state="complete",
+                        )
+                    elif success_count:
+                        status_box.update(
+                            label=f"Processed {success_count} of {len(upload_specs)} CSV(s) with errors.",
+                            state="error",
+                        )
+                    else:
+                        status_box.update(
+                            label="No CSVs processed — see errors below.",
+                            state="error",
+                        )
+
+            # Result previews — required columns detected, row counts,
+            # parse warnings, first 10 rows.
+            for payload in upload_results:
+                p_label = bpp_labels.get(payload.get("page"), payload.get("page"))
+                with st.expander(
+                    f"✅ {p_label} · {payload.get('filename')} "
+                    f"(raw_rows={payload.get('raw_row_count')}, "
+                    f"parsed_rows={payload.get('parsed_row_count')})",
+                    expanded=False,
+                ):
+                    st.markdown(
+                        f"**Detected columns:** `{', '.join(payload.get('header') or []) or DASH}`"
+                    )
+                    for warning in payload.get("warnings") or []:
+                        st.warning(warning)
+                    rows_preview = payload.get("rows_preview") or []
+                    if rows_preview:
+                        st.markdown("**Preview (first 10 parsed rows):**")
+                        st.dataframe(
+                            pd.DataFrame(rows_preview).fillna(DASH),
+                            use_container_width=True, hide_index=True,
+                            height=min(280, 60 + 32 * len(rows_preview)),
+                        )
+                    else:
+                        st.caption("No parsed rows to preview.")
+            for filename, err_text in failures:
+                with st.expander(f"❌ {filename} — failed", expanded=True):
+                    st.code(err_text, language="text")
+
+            if success_count:
+                # Bump the uploader nonce so the file_uploader widget
+                # resets — otherwise the same files are visible on every
+                # rerun and would re-upload if the operator clicked
+                # Process again.
+                st.session_state["bpp_uploader_nonce"] = uploader_nonce + 1
+                st.cache_data.clear()
+                _job_log("rerun_trigger", source="bpp_csv_upload_success", success_count=success_count)
+                st.rerun()
+
+        # ----- Advanced: Playwright (off by default) ----------------------
+        with st.expander(
+            "🔧 Advanced · Browser automation (Playwright login + scrape)",
+            expanded=False,
+        ):
+            st.caption(
+                "Playwright automation works only on a workstation that can "
+                "actually open a headed browser. On Render or any hosted "
+                "container, the login flow hangs forever — use the manual "
+                "CSV upload above instead."
+            )
+            ctrl = st.columns([1.2, 1.2, 2, 1.4, 1.4])
+            with ctrl[0]:
+                launch_login = st.button(
+                    "Launch Login Browser",
+                    use_container_width=True,
+                    disabled=bool(bpp_active_job),
+                    help="Local-only. Opens Playwright headed so you can sign in.",
+                    key="bpp_advanced_launch_login",
+                )
+            with ctrl[1]:
+                refresh_clicked = st.button(
+                    "Refresh BallparkPal Data",
+                    use_container_width=True,
+                    disabled=bool(bpp_active_job) or not bpp_has_profile,
+                    help=(
+                        "Run the scrape against cached login session."
+                        if bpp_has_profile
+                        else "Run login initialization first."
+                    ),
+                    key="bpp_advanced_refresh",
+                )
+            with ctrl[2]:
+                sel_pages = st.multiselect(
+                    "Pages",
+                    options=list(bpp_labels.keys()) or list(PAGE_DEFAULT_OPTIONS),
+                    default=list(bpp_labels.keys()) or list(PAGE_DEFAULT_OPTIONS),
+                    format_func=lambda k: bpp_labels.get(k, k),
+                    key="bpp_pages_selector",
+                )
+            with ctrl[3]:
+                sel_date = st.text_input(
+                    "Slate date",
+                    value="today",
+                    key="bpp_date_input",
+                    help="YYYY-MM-DD, 'today', or 'yesterday'.",
+                )
+            with ctrl[4]:
+                headless_choice = st.checkbox(
+                    "Headless",
+                    value=True,
+                    key="bpp_headless_choice",
+                    help="Uncheck to watch Playwright run.",
+                )
+
+            if not bpp_has_profile and not bpp_active_job:
+                st.info(
+                    "No persisted browser session found. If you're running "
+                    "locally, click **Launch Login Browser** to sign in. On "
+                    "Render, stick with the CSV upload above."
+                )
+
+            if launch_login:
+                _job_log("button_click", name="bpp_launch_login")
+                try:
+                    resp = api_post("/ballparkpal/login", json={})
+                    st.session_state["bpp_active_job_id"] = resp.get("job_id")
+                    st.success(
+                        f"Login browser launched (job {resp.get('job_id')}). "
+                        "Complete the sign-in in the opened window, then click 'Finish Login'."
+                    )
+                except ApiError as exc:
+                    render_api_error(exc, prefix="Failed to start login")
+                _job_log("rerun_trigger", source="bpp_advanced_launch_login")
+                st.rerun()
+
+            if refresh_clicked:
+                _job_log("button_click", name="bpp_advanced_refresh")
+                try:
+                    resp = api_post(
+                        "/ballparkpal/refresh",
+                        json={
+                            "pages": sel_pages,
+                            "slate_date": sel_date.strip() or None,
+                            "headless": bool(headless_choice),
+                        },
+                    )
+                    st.session_state["bpp_active_job_id"] = resp.get("job_id")
+                    st.success(f"Refresh queued (job {resp.get('job_id')}).")
+                except ApiError as exc:
+                    render_api_error(exc, prefix="Failed to start refresh")
+                _job_log("rerun_trigger", source="bpp_advanced_refresh")
+                st.rerun()
+
+            # Active job panel + opt-in auto-refresh. Lives inside the
+            # Advanced expander since manual CSV upload makes this panel
+            # purely informational for most operators.
+            if bpp_active_job:
+                job = bpp_active_job
+                mode = str(job.get("mode") or "").lower()
+                job_status = str(job.get("status") or "").lower()
+                duration = float(job.get("duration_seconds") or 0)
+                # Friendly status labels — never just "RUNNING LOGIN" with
+                # no context. Each maps to one of: idle / waiting /
+                # processing / complete / failed.
+                if job_status not in ACTIVE_JOB_STATUSES:
+                    display_state = "complete" if job_status == "success" else "failed"
+                elif mode == "login":
+                    display_state = "waiting_for_login"
+                else:
+                    display_state = "processing"
+                state_label = BPP_DISPLAY_STATE_LABELS.get(display_state, display_state)
+                jc = st.columns([1, 1, 1, 1])
+                jc[0].metric("Job", job.get("job_id") or DASH)
+                jc[1].metric("State", state_label)
+                jc[2].metric("Mode", str(job.get("mode") or "?").upper())
+                jc[3].metric("Duration", f"{duration:.1f}s")
+                if mode == "login":
+                    if st.button(
+                        "Finish Login (close browser)",
+                        key=f"bpp_signal_{job.get('job_id')}",
+                    ):
+                        _job_log("button_click", name="bpp_finish_login", job_id=job.get("job_id"))
+                        try:
+                            api_post(f"/ballparkpal/jobs/{job['job_id']}/signal", json={})
+                            st.success("Sent finish signal. Browser should close shortly.")
+                        except ApiError as exc:
+                            render_api_error(exc, prefix="Signal failed")
+                        _job_log("rerun_trigger", source="bpp_finish_login")
+                        st.rerun()
+                else:
+                    st.info(
+                        "BallparkPal refresh job is running on the backend. "
+                        "Click **Refresh status** to update, or tick "
+                        "**Auto-refresh** to poll every 8s."
+                    )
+
+                poll_cols = st.columns([1, 1, 4])
+                with poll_cols[0]:
+                    if st.button(
+                        "Refresh status", key="bpp_refresh_status",
+                        use_container_width=True,
+                    ):
+                        _job_log("button_click", name="bpp_refresh_status", job_id=job.get("job_id"))
+                        _job_log("rerun_trigger", source="bpp_refresh_status")
+                        st.rerun()
+                with poll_cols[1]:
+                    bpp_auto_refresh = st.checkbox(
+                        "Auto-refresh (8s)",
+                        value=False,
+                        key="bpp_auto_refresh",
+                        help=(
+                            "Off by default. While checked, this panel polls "
+                            "the backend every 8 seconds — the only "
+                            "auto-rerun in the dashboard. Uncheck to stop."
+                        ),
+                    )
+
+                logs_text = job.get("logs") or ""
+                if logs_text:
+                    with st.expander("Live logs", expanded=True):
+                        st.code(logs_text[-4000:], language="text")
+
+                if bpp_auto_refresh:
+                    st.caption(
+                        f"Auto-refreshing every 8s while bpp job "
+                        f"{job.get('job_id')} is active. Uncheck to stop."
+                    )
+                    import time as _time
+                    _time.sleep(8.0)
+                    _job_log(
+                        "rerun_trigger",
+                        source="bpp_auto_refresh",
+                        job_id=job.get("job_id"),
+                    )
+                    st.rerun()
+            elif st.session_state.get("bpp_active_job_id"):
+                # Job recently finished — drop the cache + clear the marker
+                # so subtabs see fresh snapshots.
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                st.session_state.pop("bpp_active_job_id", None)
 
         # ----- Operator log panel -----------------------------------------
         with st.expander("Operator logs / recent jobs", expanded=False):
@@ -4532,12 +4817,13 @@ with tab_bpp:
                     st.markdown("**Last job logs (tail)**")
                     st.code(last_logs[-4000:], language="text")
 
+        st.markdown("#### Cached pages")
         if not bpp_pages:
             render_empty_state(
                 "NO BALLPARKPAL CACHE",
-                "Run `python scripts/update_ballparkpal_cache.py --login` once "
-                "to sign in, then `python scripts/update_ballparkpal_cache.py "
-                "--pages positive_ev,strikeouts,hr_zone,hits,game_sims --date today`.",
+                "Upload a CSV per page above, or (locally) run "
+                "`python scripts/update_ballparkpal_cache.py --pages "
+                "positive_ev,strikeouts,hr_zone,hits,game_sims --date today`.",
             )
         else:
             ov_rows: list[dict[str, Any]] = []
@@ -4549,9 +4835,17 @@ with tab_bpp:
                     login_required = True
                 if page.get("stale"):
                     stale_any = True
+                src = page.get("source") or "—"
+                # Show "manual_csv · filename" so the overview makes the
+                # source unmistakable. Defensive on missing filename.
+                if src == "manual_csv" and page.get("filename"):
+                    src_display = f"manual_csv · {page.get('filename')}"
+                else:
+                    src_display = src
                 ov_rows.append(
                     {
                         "page": label,
+                        "source": src_display,
                         "status": page.get("status") or "missing",
                         "rows": page.get("row_count") or 0,
                         "slate_date": page.get("slate_date") or DASH,
@@ -4562,14 +4856,15 @@ with tab_bpp:
                     }
                 )
             if login_required:
-                st.error(
-                    "BallparkPal session expired. Re-run "
-                    "`python scripts/update_ballparkpal_cache.py --login`."
+                st.warning(
+                    "BallparkPal session expired in the (advanced) scraper "
+                    "path. Use the manual CSV upload above — it never needs "
+                    "a session."
                 )
             if stale_any:
                 st.warning(
                     "Some pages have not been refreshed in the last 24h. "
-                    "Re-run the ingestion script to refresh."
+                    "Upload a fresh CSV or re-run the scraper locally."
                 )
             st.dataframe(
                 pd.DataFrame(ov_rows).fillna(DASH),

@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta as _td
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,11 @@ logger = logging.getLogger(__name__)
 DEFAULT_REFRESH_TIMEOUT_S = 600     # 10 minutes for a full scrape
 DEFAULT_LOGIN_TIMEOUT_S = 600       # 10 minutes for the operator to finish
 LOG_TAIL_CAP_BYTES = 16_000          # rolling tail kept in the DB row
+# Defensive reaper cap. Any "queued" / "running" job older than this is
+# force-failed by reap_stuck_jobs(). Lower than the per-job timeouts so a
+# crashed watcher thread (which is what causes "stuck for 35,000 seconds")
+# can never leave the dashboard in a fake running state forever.
+STUCK_JOB_MAX_AGE_S = int(os.environ.get("BALLPARKPAL_STUCK_JOB_MAX_AGE_S", "300"))
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLI_SCRIPT = REPO_ROOT / "scripts" / "update_ballparkpal_cache.py"
@@ -67,9 +72,12 @@ class JobSpec:
 def active_job(db: Session) -> BallparkPalJob | None:
     """Return whichever job is currently queued/running, if any.
 
-    Used both by the concurrency guard and by the dashboard's "is something
-    running right now?" polling state.
+    Reaps any stuck job first — a crashed watcher thread (most often the
+    cause of a "running" status frozen for hours) would otherwise hold
+    the concurrency lock and keep the dashboard showing a fake running
+    spinner. This is the defensive cleanup the dashboard relies on.
     """
+    reap_stuck_jobs(db)
     query = (
         select(BallparkPalJob)
         .where(BallparkPalJob.status.in_(list(ACTIVE_STATUSES)))
@@ -77,6 +85,73 @@ def active_job(db: Session) -> BallparkPalJob | None:
         .limit(1)
     )
     return db.scalar(query)
+
+
+def reap_stuck_jobs(db: Session, *, max_age_seconds: int = STUCK_JOB_MAX_AGE_S) -> int:
+    """Force-fail any active job older than ``max_age_seconds``.
+
+    Returns the number of jobs reaped. Called from active_job() so the
+    cleanup happens on every dashboard poll without an extra cron. We
+    also best-effort kill the in-memory subprocess handle if it's still
+    around (it usually isn't — the typical failure mode is a crashed
+    watcher thread that left the DB row stuck).
+    """
+    cutoff = datetime.utcnow() - _td(seconds=max_age_seconds)
+    stale_jobs = list(
+        db.scalars(
+            select(BallparkPalJob)
+            .where(BallparkPalJob.status.in_(list(ACTIVE_STATUSES)))
+            .where(BallparkPalJob.started_at < cutoff)
+        )
+    )
+    if not stale_jobs:
+        return 0
+    for job in stale_jobs:
+        logger.warning(
+            "Reaping stuck BallparkPal job %s (status=%s, age=%.0fs, max=%ds)",
+            job.job_id, job.status,
+            (datetime.utcnow() - job.started_at).total_seconds(),
+            max_age_seconds,
+        )
+        handle = _ACTIVE_HANDLES.pop(job.job_id, None)
+        if handle and handle.popen is not None:
+            _kill_tree(handle.popen)
+        job.status = "failed"
+        job.finished_at = datetime.utcnow()
+        job.error_message = (
+            f"Reaped after {max_age_seconds}s wall-clock cap — watcher likely "
+            "crashed or browser never started. Use manual CSV upload instead."
+        )
+    db.commit()
+    return len(stale_jobs)
+
+
+def cancel_active_jobs(db: Session) -> dict[str, Any]:
+    """Operator-facing 'reset' button. Force-fails every active job and
+    kills any tracked subprocess. Returns counts so the dashboard can
+    show 'Cleared N stuck job(s)'.
+    """
+    cancelled: list[str] = []
+    for job in list(
+        db.scalars(
+            select(BallparkPalJob)
+            .where(BallparkPalJob.status.in_(list(ACTIVE_STATUSES)))
+        )
+    ):
+        logger.warning(
+            "Operator cancelled BallparkPal job %s (status=%s, age=%.0fs)",
+            job.job_id, job.status,
+            (datetime.utcnow() - job.started_at).total_seconds(),
+        )
+        handle = _ACTIVE_HANDLES.pop(job.job_id, None)
+        if handle and handle.popen is not None:
+            _kill_tree(handle.popen)
+        job.status = "failed"
+        job.finished_at = datetime.utcnow()
+        job.error_message = "Cancelled by operator via dashboard reset button."
+        cancelled.append(job.job_id)
+    db.commit()
+    return {"cancelled": cancelled, "count": len(cancelled)}
 
 
 def get_job(db: Session, job_id: str) -> BallparkPalJob | None:
