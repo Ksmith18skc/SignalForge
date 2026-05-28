@@ -171,12 +171,11 @@ def _humanize_market(signal: Signal) -> dict[str, str]:
 
 
 def _market_url(signal: Signal) -> str | None:
+    from app.services.wallet_market_resolver import market_url_for as _impl
     market = signal.market
     if not market or not market.slug:
         return None
-    if market.platform and market.platform.lower() == "kalshi":
-        return f"https://kalshi.com/markets/{market.slug.upper()}"
-    return f"https://polymarket.com/event/{market.slug}"
+    return _impl(market.slug, market.platform)
 
 
 def _trader_url(signal: Signal) -> str | None:

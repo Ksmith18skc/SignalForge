@@ -122,7 +122,10 @@ def test_aligned_exposure_and_profile_url(db_session):
     by_name = {w["trader_name"]: w for w in ctx["aligned_wallets"]}
     assert by_name["surf"]["profile_url"] == "https://polymarketanalytics.com/traders/0xabc"
     assert by_name["anon"]["profile_url"] is None
-    assert by_name["surf"]["market_url"] == "https://polymarket.com/event/mlb-nyy-kc-2026-05-27-total-10pt5"
+    # Polymarket events live at the matchup level, not per-line — the
+    # ``-total-10pt5`` suffix on the slug stays as the internal key but
+    # must be stripped from the clickable URL.
+    assert by_name["surf"]["market_url"] == "https://polymarket.com/event/mlb-nyy-kc-2026-05-27"
 
 
 def test_elite_disagreement_reduces_score(db_session):
@@ -183,7 +186,9 @@ def test_execution_block_populated_from_priced_market(db_session):
     assert ex["side"] == "under"
     assert ex["side_price"] == 0.59          # Under leg = no_price
     assert ex["implied_prob"] == 0.59
-    assert ex["market_url"].endswith("mlb-nyy-kc-2026-05-27-total-10pt5")
+    # Execution block's clickable URL must point at the event page, not
+    # the line-specific event slug that 404s on Polymarket.
+    assert ex["market_url"] == "https://polymarket.com/event/mlb-nyy-kc-2026-05-27"
 
 
 def test_execution_none_when_no_market(db_session):

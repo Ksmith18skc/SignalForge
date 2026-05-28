@@ -325,6 +325,50 @@ class TestCardTitleFormat:
         }
         assert format_card_title(edge) == "Joe Ryan — Over 7 Ks"
 
+    def test_game_total_title_uses_executable_line_when_supplied_explicitly(self):
+        """`market_line` is the explicit executable-line field. When
+        present it always wins, even if the legacy `line` field has
+        somehow been clobbered with a model projection.
+        """
+        edge = {
+            "edge_type": "game_total",
+            "side": "over",
+            "market_line": 8.5,         # executable line
+            "line": 9.77,               # leaked projection — must be ignored
+            "home_team": "Baltimore Orioles",
+            "away_team": "Toronto Blue Jays",
+        }
+        assert format_card_title(edge) == "TOR @ BAL — Over 8.5"
+
+    def test_game_total_title_rejects_non_half_step_line(self):
+        """A projection (e.g. 9.77) leaked into `line` must never end
+        up in the card title — sportsbook totals always land on whole
+        or half steps, so we drop anything else.
+        """
+        edge = {
+            "edge_type": "game_total",
+            "side": "over",
+            "line": 9.77,
+            "home_team": "Texas Rangers",
+            "away_team": "Houston Astros",
+        }
+        title = format_card_title(edge)
+        assert "9.77" not in title
+        assert "9.8" not in title
+        # When the model-projection guard fires the line is dropped from
+        # the title; the matchup-only headline still reads cleanly.
+        assert title == "HOU @ TEX — Over"
+
+    def test_game_total_title_accepts_half_step_line(self):
+        edge = {
+            "edge_type": "game_total",
+            "side": "over",
+            "line": 8.5,
+            "home_team": "Baltimore Orioles",
+            "away_team": "Toronto Blue Jays",
+        }
+        assert format_card_title(edge) == "TOR @ BAL — Over 8.5"
+
 
 class TestTeamShort:
     def test_known_team(self):

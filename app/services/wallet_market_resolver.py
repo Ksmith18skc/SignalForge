@@ -242,17 +242,140 @@ def _is_opposite(market_type: str, a: str, b: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# URL builders — single source of truth shared with the alerts engine. Return
-# None whenever a real URL can't be formed (never fabricate a fake link).
+# URL + internal-key builders — single source of truth shared with the alerts
+# engine and the dashboard. Two concepts kept strictly separate:
+#
+#   polymarket_event_slug / polymarket_event_url
+#       Event-level identifier — what a Polymarket page actually exists at.
+#       Strips the market-type/line suffix (``-total-9pt5``, ``-spread-home-1pt5``,
+#       ``-moneyline``) because Polymarket events live at the matchup level,
+#       not the per-line level. Clickable links must use this.
+#
+#   internal_market_key
+#       Line-specific identifier used for joins between MLB edges and wallet
+#       trades. Must NEVER leak into a user-facing URL.
+#
+# Return None whenever a real URL can't be formed — never fabricate a link
+# that won't load.
 # ---------------------------------------------------------------------------
 
 
+# `total-10pt5` , `spread-home-1pt5` , `moneyline` — segments we want to
+# strip off the *event* slug. The full slug stays available for internal
+# matching via parse_market_slug / internal_market_key.
+_MARKET_TYPE_SEGMENTS = ("total", "spread", "moneyline")
+
+
+def polymarket_event_slug(slug: str | None) -> str | None:
+    """Strip the market-type/line suffix from a slug.
+
+    ``mlb-tor-bal-2026-05-28-total-9pt5`` → ``mlb-tor-bal-2026-05-28``
+    ``mlb-tor-bal-2026-05-28-spread-home-1pt5`` → ``mlb-tor-bal-2026-05-28``
+    ``mlb-tor-bal-2026-05-28-moneyline`` → ``mlb-tor-bal-2026-05-28``
+    ``mlb-tor-bal-2026-05-28`` (already event-level) → unchanged
+
+    Falls back to the original slug if the date/team layout isn't
+    recognized — we'd rather link to a possibly-correct page than to a
+    URL we know is wrong.
+    """
+    if not slug:
+        return None
+    parts = slug.split("-")
+    if len(parts) < 5:
+        # Doesn't even have league + away + home + YYYY-MM-DD; nothing to strip.
+        return slug
+    # Locate the YYYY-MM-DD triple. Event slug = everything up to and
+    # including the date; whatever follows is the market-type suffix we
+    # explicitly do not want in the URL.
+    for i in range(1, len(parts) - 2):
+        if (
+            re.fullmatch(r"20\d{2}", parts[i] or "")
+            and re.fullmatch(r"\d{2}", parts[i + 1] or "")
+            and re.fullmatch(r"\d{2}", parts[i + 2] or "")
+        ):
+            tail = parts[i + 3 : i + 4]
+            if not tail or tail[0] not in _MARKET_TYPE_SEGMENTS:
+                # Already an event-level slug (no recognized suffix to strip).
+                return slug
+            return "-".join(parts[: i + 3])
+    return slug
+
+
+def polymarket_event_url(
+    slug: str | None,
+    *,
+    captured_url: str | None = None,
+) -> str | None:
+    """Return the user-facing Polymarket event URL.
+
+    If a real ``captured_url`` was scraped from the Polymarket API for
+    this market we prefer it verbatim — the platform sometimes changes
+    its URL scheme and a captured URL is authoritative. Otherwise we
+    derive the event-level URL from the slug (with the market-type
+    suffix stripped).
+    """
+    if captured_url:
+        return captured_url
+    event_slug = polymarket_event_slug(slug)
+    if not event_slug:
+        return None
+    return f"https://polymarket.com/event/{event_slug}"
+
+
+def internal_market_key(
+    parsed: ParsedMarket | None,
+    *,
+    side: str | None = None,
+) -> str | None:
+    """Stable internal join key for an MLB market.
+
+    ``mlb:tor-bal:2026-05-28:game_total:over:9.5``
+    ``mlb:tor-bal:2026-05-28:game_spread:home:1.5``
+    ``mlb:tor-bal:2026-05-28:game_moneyline:home``
+
+    The format is intentionally distinct from any URL (colon separator,
+    not hyphen) so a code search for ``polymarket.com/event/`` never
+    catches an internal key by mistake.
+    """
+    if parsed is None:
+        return None
+    if not parsed.away_abbr or not parsed.home_abbr:
+        return None
+    market_type = {
+        "total": "game_total",
+        "spread": "game_spread",
+        "moneyline": "game_moneyline",
+    }.get(parsed.market_type, parsed.market_type)
+    tail: list[str] = [
+        parsed.league,
+        f"{parsed.away_abbr}-{parsed.home_abbr}",
+        parsed.event_date or "unknown_date",
+        market_type,
+    ]
+    side_token = (side or parsed.side_hint or "").strip().lower()
+    if side_token:
+        tail.append(side_token)
+    if parsed.line is not None:
+        # Strip trailing zeros so 9.5 and 9.50 produce the same key.
+        line_str = f"{parsed.line:.2f}".rstrip("0").rstrip(".")
+        if line_str:
+            tail.append(line_str)
+    return ":".join(tail)
+
+
 def market_url_for(slug: str | None, platform: str | None) -> str | None:
+    """Public-facing market URL for a slug + platform pair.
+
+    Kalshi gets the legacy capital-slug market page. Polymarket gets the
+    event-level page — the market-type/line suffix is stripped because
+    Polymarket events live at the matchup level. Line-specific matching
+    stays in ``internal_market_key``, which never appears in a URL.
+    """
     if not slug:
         return None
     if (platform or "").strip().lower() == "kalshi":
         return f"https://kalshi.com/markets/{slug.upper()}"
-    return f"https://polymarket.com/event/{slug}"
+    return polymarket_event_url(slug)
 
 
 def trader_profile_url(wallet_address: str | None, platform: str | None = None) -> str | None:

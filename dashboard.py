@@ -1940,6 +1940,10 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     factors = edge.get("factors") or {}
 
     # --- Prioritized sections (#10 visual hierarchy) ---
+    # Structured Market/Model/Edge/Wallet trader block — sits at the top
+    # so the executable line, projection, and edge-vs-line are visible
+    # without expanding the technical-factors block.
+    trader_debug = _trader_debug_block(edge)
     source_stack = _render_source_stack(edge)          # 1
     execution_section = _render_execution(edge)        # 2
     wallet_section = render_wallet_flow_section(edge)  # 3
@@ -1997,6 +2001,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
           {''.join(prob_row_parts)}
         </div>
       </div>
+      {trader_debug}
       {source_stack}
       {execution_section}
       {wallet_section}
@@ -2011,6 +2016,157 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     st.markdown(body, unsafe_allow_html=True)
 
 
+def _trader_card_title(signal: dict[str, Any]) -> str:
+    """Build the "TOR @ BAL — Over 8.5" headline.
+
+    The title is composed from the slug whenever the slug parses into
+    a recognized matchup + market_type, because the slug always carries
+    the *executable* market line. The DB-stored market_title is the
+    fallback path — historically it sometimes inherited a model
+    projection (e.g. "mlb hou@tex total 9.3 Over") from upstream
+    ingestion bugs, so we use it only when slug parsing fails.
+    """
+    slug = signal.get("market_slug") or ""
+    parsed = wmr.parse_market_slug(slug) if slug else None
+    if parsed and parsed.away_abbr and parsed.home_abbr:
+        matchup = f"{parsed.away_abbr.upper()} @ {parsed.home_abbr.upper()}"
+        side = (signal.get("side") or signal.get("outcome") or "").strip()
+        side_label = side.title() if side else ""
+        line_str = ""
+        if parsed.line is not None:
+            f = float(parsed.line)
+            line_str = f"{int(round(f))}" if abs(f - round(f)) < 1e-9 else f"{f:.1f}"
+        if parsed.market_type == "total":
+            if side_label and line_str:
+                return f"{matchup} — {side_label} {line_str}"
+            return f"{matchup} — Total"
+        if parsed.market_type == "spread":
+            if side_label and line_str:
+                return f"{matchup} — Spread {side_label} {line_str}"
+            return f"{matchup} — Spread"
+        if parsed.market_type == "moneyline":
+            return f"{matchup} — Moneyline {side_label}".strip()
+        return matchup
+    return signal.get("market_title") or signal.get("market_slug") or DASH
+
+
+def _trader_debug_block(signal: dict[str, Any]) -> str:
+    """Render the structured trader-card lines requested in the spec::
+
+        Market: TOR @ BAL Over 8.5
+        Model: 9.77
+        Edge: +1.27 runs
+        Best executable price: <book> <price> / <implied>
+        Wallet confirmation: yes/no
+        Internal key: mlb:tor-bal:2026-05-28:game_total:over:8.5
+
+    All values are pulled from the signal/edge dict directly — no
+    field is invented. A row is omitted when its value isn't available,
+    so the block never displays "—" or a fabricated default.
+    """
+    slug = signal.get("market_slug") or ""
+    parsed = wmr.parse_market_slug(slug) if slug else None
+
+    market_line = signal.get("market_line")
+    if market_line is None and parsed and parsed.line is not None:
+        market_line = parsed.line
+
+    model_projection = (
+        signal.get("model_projection")
+        or signal.get("projected_total")
+        or signal.get("model_projected_total")
+    )
+
+    side = (signal.get("side") or signal.get("outcome") or "").strip().title()
+    matchup = ""
+    if parsed and parsed.away_abbr and parsed.home_abbr:
+        matchup = f"{parsed.away_abbr.upper()} @ {parsed.home_abbr.upper()}"
+
+    rows: list[tuple[str, str]] = []
+
+    # Market line — exact sportsbook value, no extra rounding so a
+    # 10.0 line displays as "10.0" exactly as listed.
+    if market_line is not None:
+        line_disp = f"{float(market_line):.1f}".rstrip("0").rstrip(".")
+        if "." not in line_disp:
+            line_disp = f"{line_disp}.0"
+        market_label = f"{matchup} {side} {line_disp}".strip() if matchup else f"{side} {line_disp}".strip()
+        rows.append(("Market", market_label))
+    elif matchup:
+        rows.append(("Market", f"{matchup} {side}".strip()))
+
+    # Model projection — 2 decimals.
+    if model_projection is not None:
+        try:
+            rows.append(("Model", f"{float(model_projection):.2f}"))
+        except (TypeError, ValueError):
+            pass
+
+    # Edge vs line — model − market, 2 decimals, signed.
+    if model_projection is not None and market_line is not None:
+        try:
+            delta = float(model_projection) - float(market_line)
+            sign = "+" if delta >= 0 else ""
+            unit = " runs" if (parsed and parsed.market_type == "total") else ""
+            rows.append(("Edge vs line", f"{sign}{delta:.2f}{unit}"))
+        except (TypeError, ValueError):
+            pass
+
+    # Best executable price — straight pass-through from the
+    # backend-supplied execution block; not derived locally.
+    exec_block = (signal.get("execution") or signal.get("wallet_context") or {}).get("execution") \
+        if isinstance(signal.get("wallet_context"), dict) else signal.get("execution")
+    if isinstance(exec_block, dict):
+        book = exec_block.get("book") or exec_block.get("platform") or ""
+        price = exec_block.get("price") or exec_block.get("side_price")
+        implied = exec_block.get("implied_prob") or exec_block.get("implied_probability")
+        if price is not None or implied is not None:
+            price_part = f"{price:+d}" if isinstance(price, int) else (
+                str(price) if price is not None else ""
+            )
+            implied_part = (
+                f"{float(implied) * 100:.1f}%" if isinstance(implied, (int, float)) else ""
+            )
+            parts = [p for p in (book, price_part, implied_part) if p]
+            if parts:
+                rows.append(("Best executable price", " · ".join(parts)))
+
+    # Wallet confirmation — derived from consensus_wallets count.
+    consensus = int(signal.get("consensus_wallets") or 0)
+    if consensus:
+        rows.append(("Wallet confirmation", f"yes ({consensus} tracked)"))
+    else:
+        # Only show "no" when we have a confirmed market context;
+        # otherwise the row is misleading (it's not "no", we just
+        # didn't measure).
+        if exec_block or market_line is not None:
+            rows.append(("Wallet confirmation", "no"))
+
+    # Prediction-market match status.
+    pm_status = signal.get("prediction_market_status")
+    if pm_status == "not_listed" or (
+        signal.get("source") and not signal.get("market_url") and slug == ""
+    ):
+        rows.append(("Prediction market", "not listed"))
+
+    # Internal join key — colon-separated, never appears in a URL.
+    if parsed:
+        side_for_key = (signal.get("side") or signal.get("outcome") or "").strip().lower()
+        key = wmr.internal_market_key(parsed, side=side_for_key)
+        if key:
+            rows.append(("Internal key", key))
+
+    if not rows:
+        return ""
+
+    body = "".join(
+        f"<div class='sf-card-row sf-meta'><span class='k'>{k}:</span> "
+        f"{html.escape(str(v))}</div>"
+        for k, v in rows
+    )
+    return f"<div class='sf-section'>{body}</div>"
+
+
 def render_wallet_card(signal: dict[str, Any]) -> None:
     score = signal.get("score")
     tier, tier_kind = tier_for_score(score)
@@ -2018,7 +2174,12 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
 
     trader = signal.get("trader_nickname") or DASH
     wallet = shorten_wallet(signal.get("wallet"))
-    market = signal.get("market_title") or signal.get("market_slug") or DASH
+    # Title: prefer a clean trader-card line derived from the slug
+    # (always carries the executable market line). Falls back to the
+    # backend-supplied title only when the slug isn't recognized — that
+    # path is the one that historically leaked model projections into
+    # the title.
+    market = _trader_card_title(signal)
     side = signal.get("side") or DASH
     outcome = signal.get("outcome") or ""
     entry = fmt_num(signal.get("entry_price"), fmt="{:.3f}")
@@ -2103,6 +2264,12 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             "</div>"
         )
 
+    # Structured trader-card details block — sits below the headline
+    # market label and surfaces Market vs Model vs Edge vs Wallet
+    # confirmation without ever conflating the executable line with the
+    # model projection.
+    trader_block = _trader_debug_block(signal)
+
     body = f"""
     <div class="sf-card {card_kind}">
       <div class="sf-card-head">
@@ -2127,6 +2294,7 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
         </div>
       </div>
       <div style="margin-bottom:4px;">{pills_html}</div>
+      {trader_block}
       {sharp_block}
       {consensus_chips}
       {('<div class="sf-card-row sf-meta">' + reason + '</div>') if reason else ''}
@@ -2938,13 +3106,21 @@ def _market_slug(sig: dict[str, Any]) -> str:
 
 
 def _market_url(sig: dict[str, Any]) -> str | None:
+    """Resolve a click-through URL for a signal/edge.
+
+    Delegates to ``wallet_market_resolver.market_url_for`` so Polymarket
+    URLs always land on the event page rather than a (non-existent)
+    line-specific event slug. The ``source_url`` already captured by
+    the provider, if any, wins over the derived URL.
+    """
+    captured = sig.get("market_url") or sig.get("source_url")
+    if captured and "polymarket.com/event/" in str(captured):
+        # Trust an authoritative captured URL over a derived one — same
+        # fallback policy as ``polymarket_event_url``.
+        return str(captured)
     slug = _market_slug(sig)
-    if not slug:
-        return None
     platform = str(sig.get("market_platform") or sig.get("source") or "").lower()
-    if "kalshi" in platform:
-        return f"https://kalshi.com/markets/{slug.upper()}"
-    return f"https://polymarket.com/event/{slug}"
+    return wmr.market_url_for(slug, platform)
 
 
 def _trader_url(sig: dict[str, Any]) -> str | None:

@@ -368,10 +368,11 @@ def _enrich_signal(signal: Signal) -> SignalOut:
         base.market_updated_at = signal.market.updated_at
         base.market_end_date = signal.market.end_date
         if signal.market.slug:
-            if signal.market.platform and signal.market.platform.lower() == "kalshi":
-                base.market_url = f"https://kalshi.com/markets/{signal.market.slug.upper()}"
-            else:
-                base.market_url = f"https://polymarket.com/event/{signal.market.slug}"
+            # Single source of truth — keeps the URL event-level for
+            # Polymarket so a click never lands on a stale /event/...-total-9pt5
+            # page that doesn't exist on the platform.
+            from app.services.wallet_market_resolver import market_url_for as _market_url_for
+            base.market_url = _market_url_for(signal.market.slug, signal.market.platform)
     return base
 
 
@@ -2344,18 +2345,16 @@ def _mlb_environment_payload(env: MlbGameEnvironmentSnapshot) -> dict[str, objec
 
 
 def _market_url_for_signal(signal: Signal) -> str | None:
+    from app.services.wallet_market_resolver import market_url_for as _impl
     market = signal.market
     if not market or not market.slug:
         return None
-    if market.platform and market.platform.lower() == "kalshi":
-        return f"https://kalshi.com/markets/{market.slug.upper()}"
-    return f"https://polymarket.com/event/{market.slug}"
+    return _impl(market.slug, market.platform)
 
 
 def _market_url(market: Market) -> str:
-    if market.platform and market.platform.lower() == "kalshi":
-        return f"https://kalshi.com/markets/{market.slug.upper()}"
-    return f"https://polymarket.com/event/{market.slug}"
+    from app.services.wallet_market_resolver import market_url_for as _impl
+    return _impl(market.slug, market.platform) or ""
 
 
 def _extract_market_slug(market_url: str) -> str:

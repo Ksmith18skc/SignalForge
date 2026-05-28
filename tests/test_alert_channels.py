@@ -114,7 +114,11 @@ def test_format_signal_includes_market_and_trader_links():
     message = _format_signal(signal)
 
     assert "outcome=Over" in message
-    assert "https://polymarket.com/event/wnba-por-nyl-2026-05-25-total-176pt5" in message
+    # Polymarket events live at the matchup level; the -total-176pt5
+    # suffix is line-specific and would 404. The alerter must strip it
+    # from the URL even though the slug field still carries it.
+    assert "market_url=https://polymarket.com/event/wnba-por-nyl-2026-05-25 " in message
+    assert "polymarket.com/event/wnba-por-nyl-2026-05-25-total" not in message
     assert (
         "https://polymarketanalytics.com/traders/"
         "0x0720803c7cb0d0c5a928787b3b7ea148c6831cdb"

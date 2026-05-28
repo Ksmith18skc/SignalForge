@@ -457,6 +457,38 @@ def _pitcher_name_from_market(market: str | None) -> str | None:
     return head or None
 
 
+def _resolve_market_line(edge: dict[str, Any]) -> Any:
+    """Return the executable market line, never the model projection.
+
+    Fields are checked in order of strongest guarantee that the value
+    came from a sportsbook / prediction-market quote, *not* from our
+    internal model:
+
+    1. ``market_line`` — explicit field, when callers populate it
+    2. ``line`` — the legacy field that *should* be the market line
+       (but historically has been overloaded). When ``line`` is a
+       non-standard step (e.g. 9.77) we ignore it: real sportsbook
+       totals always end in ``.0`` or ``.5``, so any other value is
+       almost certainly a projection that leaked into the wrong field.
+    3. ``None`` — render the title without a line rather than
+       displaying a projection-derived value.
+    """
+    explicit = edge.get("market_line")
+    if explicit is not None:
+        return explicit
+    candidate = edge.get("line")
+    try:
+        f = float(candidate)
+    except (TypeError, ValueError):
+        return candidate
+    # Sportsbook totals/spreads land on whole or half steps; a model
+    # projection like 9.77 must never reach the card title.
+    doubled = f * 2.0
+    if abs(doubled - round(doubled)) < 1e-6:
+        return candidate
+    return None
+
+
 def format_card_title(edge: dict[str, Any]) -> str:
     """Concise, decision-first headline. Examples:
         'Joe Ryan — Over 6.5 Ks'
@@ -469,7 +501,9 @@ def format_card_title(edge: dict[str, Any]) -> str:
     """
     edge_type = str(edge.get("edge_type") or "").lower()
     side_label = _side_label(edge.get("side"))
-    line_label = _line_label(edge.get("line"))
+    # Title must reflect the *executable* market line, never the model
+    # projection — see _resolve_market_line for the half-step guard.
+    line_label = _line_label(_resolve_market_line(edge))
     market_scope = str(edge.get("market_scope") or "").lower()
     home = team_short(edge.get("home_team"))
     away = team_short(edge.get("away_team"))
@@ -494,6 +528,11 @@ def format_card_title(edge: dict[str, Any]) -> str:
             scope_prefix = "Team Total "
         if side_label and line_label:
             return f"{matchup or 'Game'} — {scope_prefix}{side_label} {line_label}".strip()
+        # Side present but no usable executable line — better to render
+        # "HOU @ TEX — Over" than to silently swap in a model projection
+        # or fall back to a generic "Total" that drops the side.
+        if side_label:
+            return f"{matchup or 'Game'} — {scope_prefix}{side_label}".strip()
         return f"{matchup or 'Game'} — {scope_prefix}Total".strip()
 
     if "moneyline" in edge_type or "moneyline" in market_scope:
