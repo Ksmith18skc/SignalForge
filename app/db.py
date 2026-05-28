@@ -134,6 +134,10 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
+        # Research-upgrade fields: nullable so legacy rows keep working.
+        _add_sqlite_column_if_missing("mlb_edges", "model_projected_total", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "closing_snapshot_at", "DATETIME")
+        _add_sqlite_column_if_missing("mlb_edges", "actual_total", "FLOAT")
         _ensure_mlb_edge_validation_columns()
     if _is_postgres:
         _ensure_signal_date_columns()
@@ -175,6 +179,9 @@ def _ensure_mlb_edge_validation_columns() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
         _add_sqlite_column_if_missing("mlb_edges", "wallet_context", "JSON")
         _add_sqlite_column_if_missing("mlb_edges", "score_contributions", "JSON")
+        _add_sqlite_column_if_missing("mlb_edges", "model_projected_total", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "closing_snapshot_at", "DATETIME")
+        _add_sqlite_column_if_missing("mlb_edges", "actual_total", "FLOAT")
         return
     if dialect.startswith("postgres"):
         statements = [
@@ -184,6 +191,9 @@ def _ensure_mlb_edge_validation_columns() -> None:
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS validation_reason TEXT",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS wallet_context JSONB",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS score_contributions JSONB",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS model_projected_total DOUBLE PRECISION",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS closing_snapshot_at TIMESTAMP",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS actual_total DOUBLE PRECISION",
         ]
         try:
             with engine.begin() as conn:

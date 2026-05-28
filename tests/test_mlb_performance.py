@@ -10,12 +10,21 @@ from app.services.mlb_performance import (
     arizona_window,
     arizona_yesterday,
     clv_report,
+    factor_attribution,
     grade_edge,
     lookup_edge_score_band,
     performance_by_market,
+    performance_by_projection_bucket,
     performance_by_score_band,
+    performance_by_side,
+    performance_by_timing,
     performance_diagnostics,
     performance_summary,
+    projection_bucket,
+    projection_calibration,
+    research_health,
+    sample_size_label,
+    score_band,
 )
 
 
@@ -47,7 +56,8 @@ def test_grade_edge_calculates_clv_and_roi():
     assert edge.implied_probability_at_entry == 0.5
     assert edge.implied_probability_at_close == 0.5556
     assert edge.clv_points == 0.5
-    assert edge.clv_percent == 0.1112
+    # clv_percent is now line-based: clv_points / entry_total = 0.5 / 8.5.
+    assert edge.clv_percent == round(0.5 / 8.5, 4)
     assert edge.roi_units == 1.0
     assert edge.result == "Final 6-4"
 
@@ -242,3 +252,169 @@ def test_arizona_window_and_yesterday_rollover():
         start, end = arizona_window(7)
         assert end == "2026-05-26"
         assert start == "2026-05-20"
+
+
+# ---------------------------------------------------------------------------
+# Research-upgrade analytics
+# ---------------------------------------------------------------------------
+
+
+def test_score_band_five_tier_segmentation():
+    assert score_band(40) == "<55"
+    assert score_band(60) == "55-64"
+    assert score_band(70) == "65-74"
+    assert score_band(80) == "75-84"
+    assert score_band(90) == "85+"
+    # Bad input lands in the weakest band rather than raising.
+    assert score_band(None) == "<55"
+
+
+def test_projection_bucket_boundaries():
+    assert projection_bucket(7.0) == "<7.5"
+    assert projection_bucket(8.0) == "7.5-8.5"
+    assert projection_bucket(9.0) == "8.5-9.5"
+    assert projection_bucket(10.0) == "9.5-10.5"
+    assert projection_bucket(11.0) == "10.5+"
+    assert projection_bucket(None) is None
+
+
+def test_sample_size_label_tiers():
+    assert sample_size_label(5)["tier"] == "exploratory"
+    assert sample_size_label(100)["tier"] == "early"
+    assert sample_size_label(300)["tier"] == "moderate"
+    assert sample_size_label(1000)["tier"] == "strong"
+
+
+def test_performance_by_side_emits_directional_bias_warning(db_session):
+    # 8 overs vs 2 unders → over_share = 0.8 → over-bias warning fires.
+    edges = []
+    for i in range(8):
+        edges.append(
+            _edge(game_pk=100 + i, side="over", best_price=2.0, recommended_line=8.5, score=70)
+        )
+    for i in range(2):
+        edges.append(
+            _edge(game_pk=200 + i, side="under", best_price=2.0, recommended_line=8.5, score=70)
+        )
+    for edge in edges:
+        grade_edge(edge, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    db_session.add_all(edges)
+    db_session.commit()
+
+    side_report = performance_by_side(db_session)
+    assert side_report["over"]["count"] == 8
+    assert side_report["under"]["count"] == 2
+    assert side_report["directional_bias_warning"] == "Model may be directionally biased toward over."
+
+
+def test_projection_calibration_inflated_close_warning(db_session):
+    edges = []
+    for i in range(3):
+        e = _edge(
+            game_pk=300 + i,
+            side="over",
+            best_price=2.0,
+            recommended_line=9.5,
+            score=80,
+            model_projected_total=11.0,
+        )
+        # Closing line stays at 9.0 → model proj. (11.0) - close (9.0) = 2.0 > 0.75.
+        grade_edge(e, closing_line=9.0, closing_price=1.9, win_loss_push="win")
+        e.actual_total = 8.0  # projection error = +3.0 → over-projecting warning.
+        edges.append(e)
+    db_session.add_all(edges)
+    db_session.commit()
+
+    cal = projection_calibration(db_session)
+    assert cal["graded_game_totals"] == 3
+    assert cal["rows_with_projection"] == 3
+    assert any("inflated" in w for w in cal["warnings"])
+    assert any("over-projecting" in w for w in cal["warnings"])
+
+
+def test_performance_by_score_band_returns_all_five_bands_with_stable_flag(db_session):
+    e = _edge(game_pk=400, score=90, best_price=2.0, recommended_line=8.5)
+    grade_edge(e, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    db_session.add(e)
+    db_session.commit()
+
+    rows = performance_by_score_band(db_session)
+    bands = [row["score_band"] for row in rows]
+    assert bands == ["<55", "55-64", "65-74", "75-84", "85+"]
+    # Single graded edge → unstable flag for that band.
+    band_row = next(r for r in rows if r["score_band"] == "85+")
+    assert band_row["graded_edges"] == 1
+    assert band_row["stable"] is False
+    assert band_row["over_count"] == 1
+
+
+def test_research_health_clv_first_ordering(db_session):
+    e = _edge(game_pk=500, score=80, best_price=2.0, recommended_line=8.5)
+    grade_edge(e, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    db_session.add(e)
+    db_session.commit()
+
+    health = research_health(db_session)
+    # Headline payload must include CLV-first metrics, ROI/win-rate, and the
+    # sample-size tier so the panel can render the warning bar.
+    assert "positive_clv_rate" in health
+    assert "average_clv_points" in health
+    assert "roi_units" in health
+    assert "win_rate" in health
+    assert health["graded_sample_size"] == 1
+    assert health["sample_size_tier"] == "exploratory"
+
+
+def test_factor_attribution_flags_unstable_factors(db_session):
+    e = _edge(
+        game_pk=600,
+        score=80,
+        best_price=2.0,
+        recommended_line=8.5,
+        factors={"environment": 80, "odds_edge": 90},
+    )
+    grade_edge(e, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    db_session.add(e)
+    db_session.commit()
+
+    rows = factor_attribution(db_session)
+    assert all(row["unstable"] for row in rows)  # sample size < 50
+
+
+def test_performance_by_projection_bucket_groups_by_model_total(db_session):
+    e_low = _edge(
+        game_pk=701, score=80, best_price=2.0, recommended_line=7.0,
+        model_projected_total=7.0,
+    )
+    e_high = _edge(
+        game_pk=702, score=80, best_price=2.0, recommended_line=11.0,
+        model_projected_total=11.0,
+    )
+    grade_edge(e_low, closing_line=7.5, closing_price=1.8, win_loss_push="win")
+    grade_edge(e_high, closing_line=10.5, closing_price=1.8, win_loss_push="loss")
+    db_session.add_all([e_low, e_high])
+    db_session.commit()
+
+    rows = performance_by_projection_bucket(db_session)
+    by_bucket = {r["projection_bucket"]: r for r in rows}
+    assert by_bucket["<7.5"]["graded_edges"] == 1
+    assert by_bucket["10.5+"]["graded_edges"] == 1
+
+
+def test_performance_by_timing_buckets_by_hours_before_game(db_session):
+    from datetime import datetime as _dt
+
+    edge = _edge(game_pk=800, score=80, best_price=2.0, recommended_line=8.5)
+    grade_edge(edge, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    edge.created_at = _dt(2026, 5, 26, 18, 0)
+    game = MlbGame(
+        game_pk=800, game_date="2026-05-26", home_team="H", away_team="A",
+        game_status="Final",
+        start_time=_dt(2026, 5, 27, 12, 0),  # 18h after creation → ">12h" bucket
+    )
+    db_session.add_all([edge, game])
+    db_session.commit()
+
+    rows = performance_by_timing(db_session)
+    by_bucket = {r["timing_bucket"]: r for r in rows}
+    assert by_bucket[">12h"]["graded_edges"] == 1

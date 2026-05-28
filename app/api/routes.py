@@ -73,12 +73,18 @@ from app.services.mlb_performance import (
     arizona_today,
     arizona_window,
     clv_report,
+    factor_attribution,
     grade_edge,
     lookup_edge_score_band,
     performance_by_market,
+    performance_by_projection_bucket,
     performance_by_score_band,
+    performance_by_side,
+    performance_by_timing,
     performance_diagnostics,
     performance_summary,
+    projection_calibration,
+    research_health,
     top_factors_by_performance,
     update_closing_line_fields,
 )
@@ -1977,6 +1983,78 @@ def mlb_performance_diagnostics(
     """Visibility counts so the dashboard can explain *why* the tab is empty."""
     start_date, end_date = _perf_window(days, date)
     return performance_diagnostics(db, start_date=start_date, end_date=end_date)
+
+
+# --- Research-upgrade endpoints ------------------------------------------------
+# All new endpoints are additive and return null-friendly payloads so legacy
+# dashboards keep rendering even when extended analytics are missing.
+
+@router.get("/mlb/performance/research-health")
+def mlb_research_health(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    start_date, end_date = _perf_window(days, date)
+    return research_health(db, start_date=start_date, end_date=end_date)
+
+
+@router.get("/mlb/performance/by-side")
+def mlb_performance_by_side(
+    days: int | None = None,
+    date: str | None = None,
+    edge_type: str = "game_total",
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    start_date, end_date = _perf_window(days, date)
+    return performance_by_side(
+        db, start_date=start_date, end_date=end_date, edge_type=edge_type,
+    )
+
+
+@router.get("/mlb/performance/projection-calibration")
+def mlb_projection_calibration(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    start_date, end_date = _perf_window(days, date)
+    return projection_calibration(db, start_date=start_date, end_date=end_date)
+
+
+@router.get("/mlb/performance/by-projection-bucket")
+def mlb_performance_by_projection_bucket(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    return performance_by_projection_bucket(
+        db, start_date=start_date, end_date=end_date,
+    )
+
+
+@router.get("/mlb/performance/by-timing")
+def mlb_performance_by_timing(
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    return performance_by_timing(db, start_date=start_date, end_date=end_date)
+
+
+@router.get("/mlb/performance/factor-attribution")
+def mlb_factor_attribution(
+    days: int | None = None,
+    date: str | None = None,
+    side: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    return factor_attribution(
+        db, start_date=start_date, end_date=end_date, side=side,
+    )
 
 
 def _optional_float(value: object) -> float | None:

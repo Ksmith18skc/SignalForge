@@ -2589,6 +2589,26 @@ def fetch_mlb_performance(
         "by_market": safe_get("/mlb/performance/by-market", default=[], params=params or None),
         "by_score_band": safe_get("/mlb/performance/by-score-band", default=[], params=params or None),
         "clv": safe_get("/mlb/performance/clv", default={}, params=params or None),
+        # Research-upgrade additions. Each endpoint degrades to {} or [] when
+        # absent so older backends keep rendering the dashboard.
+        "research_health": safe_get(
+            "/mlb/performance/research-health", default={}, params=params or None,
+        ),
+        "by_side": safe_get(
+            "/mlb/performance/by-side", default={}, params=params or None,
+        ),
+        "projection_calibration": safe_get(
+            "/mlb/performance/projection-calibration", default={}, params=params or None,
+        ),
+        "by_projection_bucket": safe_get(
+            "/mlb/performance/by-projection-bucket", default=[], params=params or None,
+        ),
+        "by_timing": safe_get(
+            "/mlb/performance/by-timing", default=[], params=params or None,
+        ),
+        "factor_attribution": safe_get(
+            "/mlb/performance/factor-attribution", default=[], params=params or None,
+        ),
     }
     return out
 
@@ -3626,23 +3646,255 @@ with tab_perf:
             ],
         )
     if graded:
-        pc1, pc2, pc3, pc4, pc5, pc6, pc7 = st.columns(7)
-        pc1.metric("Graded edges", graded)
-        pc2.metric("Win rate", fmt_pct(perf_summary.get("win_rate")))
-        pc3.metric("ROI units", fmt_num(perf_summary.get("roi_units"), fmt="{:+.2f}"))
-        pc4.metric("Avg CLV", fmt_pct(clv_block.get("average_clv_percent")))
-        pc5.metric("Positive CLV rate", fmt_pct(clv_block.get("positive_clv_rate")))
-        by_market = mlb_performance.get("by_market") or []
-        best = max(by_market, key=lambda m: m.get("roi_units") or -999, default=None)
-        worst = min(by_market, key=lambda m: m.get("roi_units") or 999, default=None)
-        pc6.metric("Best market", str((best or {}).get("edge_type") or DASH))
-        pc7.metric("Worst market", str((worst or {}).get("edge_type") or DASH))
+        # ------------------------------------------------------------------
+        # Research Mode filter. Applies to the displayed analytics only —
+        # the raw stored grading history is never mutated by this control.
+        # ------------------------------------------------------------------
+        research_modes = [
+            "All candidates",
+            "65+ only",
+            "75+ only",
+            "85+ only",
+            "Paper only / watchlist",
+        ]
+        rmode = st.selectbox(
+            "Research Mode",
+            research_modes,
+            index=0,
+            key="perf_research_mode",
+            help=(
+                "Filtering changes research view only. It does not alter "
+                "stored grading history."
+            ),
+        )
+        st.caption(
+            "Filtering changes research view only. It does not alter stored "
+            "grading history."
+        )
 
-        st.markdown("### ROI by edge type")
+        def _score_min_from_mode(mode: str) -> float | None:
+            """Translate the Research Mode selector to a minimum score floor."""
+            if mode == "65+ only":
+                return 65.0
+            if mode == "75+ only":
+                return 75.0
+            if mode == "85+ only":
+                return 85.0
+            if mode == "Paper only / watchlist":
+                # Watchlist tier = scores 55-64, neither weak nor playable.
+                return 55.0
+            return None
+
+        score_min = _score_min_from_mode(rmode)
+        paper_only = rmode == "Paper only / watchlist"
+
+        def _band_in_scope(band: str) -> bool:
+            """Whether a score band passes the active Research Mode filter."""
+            if rmode == "All candidates":
+                return True
+            if rmode == "Paper only / watchlist":
+                return band == "55-64"
+            if score_min is None:
+                return True
+            order = ["<55", "55-64", "65-74", "75-84", "85+"]
+            try:
+                return order.index(band) >= order.index(
+                    "85+" if score_min >= 85 else "75-84" if score_min >= 75
+                    else "65-74" if score_min >= 65 else "<55"
+                )
+            except ValueError:
+                return True
+
+        # ------------------------------------------------------------------
+        # 1. Research Health — CLV-first headline. ROI/win-rate intentionally
+        # sit below CLV because they're noisier on small samples.
+        # ------------------------------------------------------------------
+        health = mlb_performance.get("research_health") or {}
+        st.markdown("### Research Health")
+        h1, h2, h3, h4, h5, h6 = st.columns(6)
+        h1.metric("Positive CLV rate", fmt_pct(health.get("positive_clv_rate")))
+        h2.metric("Avg CLV points", fmt_num(health.get("average_clv_points"), fmt="{:+.3f}"))
+        h3.metric("Avg CLV %", fmt_pct(health.get("average_clv_percent")))
+        h4.metric("ROI units", fmt_num(health.get("roi_units"), fmt="{:+.2f}"))
+        h5.metric("Win rate", fmt_pct(health.get("win_rate")))
+        h6.metric("Graded sample", health.get("graded_sample_size") or graded)
+
+        # ------------------------------------------------------------------
+        # 2. Sample Size Warning — surface the confidence tier inline rather
+        # than burying it inside a tooltip.
+        # ------------------------------------------------------------------
+        st.markdown("### Sample Size")
+        tier = health.get("sample_size_tier") or "exploratory"
+        sample_label = health.get("sample_size_label") or "exploratory only"
+        sample_n = health.get("graded_sample_size") or graded
+        if tier == "exploratory":
+            st.warning(
+                f"Sample size {sample_n} — **{sample_label}**. "
+                "Do not draw firm conclusions; ROI and band-level win rates "
+                "are likely dominated by variance."
+            )
+        elif tier == "early":
+            st.info(f"Sample size {sample_n} — **{sample_label}**.")
+        else:
+            st.success(f"Sample size {sample_n} — **{sample_label}**.")
+
+        # ------------------------------------------------------------------
+        # 3. CLV Overview — primary research metric. Side / band / edge-type
+        # CLV breakdowns sit here.
+        # ------------------------------------------------------------------
+        st.markdown("### CLV Overview")
+        co1, co2, co3, co4 = st.columns(4)
+        co1.metric("Avg CLV points", fmt_num(clv_block.get("average_clv_points"), fmt="{:+.3f}"))
+        co2.metric("Avg CLV %", fmt_pct(clv_block.get("average_clv_percent")))
+        co3.metric("Positive CLV rate", fmt_pct(clv_block.get("positive_clv_rate")))
+        co4.metric("Edges w/ CLV", clv_block.get("edges_with_clv") or 0)
+        missing_clv = clv_block.get("missing_clv_count") or 0
+        if missing_clv:
+            st.caption(
+                f"{missing_clv} graded edge(s) have no CLV — usually missing "
+                "closing line. Run 'Update closing lines' before grading."
+            )
+        by_side_clv = (clv_block.get("by_side") or {})
+        by_edge_type_clv = (clv_block.get("by_edge_type") or {})
+        clv_rows = []
+        for side_name, payload in by_side_clv.items():
+            clv_rows.append({
+                "scope": f"side: {side_name}",
+                "count": payload.get("count"),
+                "avg_clv_points": payload.get("average_clv_points"),
+                "avg_clv_percent": payload.get("average_clv_percent"),
+                "positive_clv_rate": payload.get("positive_clv_rate"),
+            })
+        for etype, payload in by_edge_type_clv.items():
+            clv_rows.append({
+                "scope": f"edge: {etype}",
+                "count": payload.get("count"),
+                "avg_clv_points": payload.get("average_clv_points"),
+                "avg_clv_percent": payload.get("average_clv_percent"),
+                "positive_clv_rate": payload.get("positive_clv_rate"),
+            })
+        if clv_rows:
+            st.dataframe(
+                pd.DataFrame(clv_rows).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(280, 60 + 32 * len(clv_rows)),
+            )
+
+        # ------------------------------------------------------------------
+        # 4. Over vs Under Split — directional bias diagnostic.
+        # ------------------------------------------------------------------
+        st.markdown("### Over vs Under Split (game_total)")
+        side_block = mlb_performance.get("by_side") or {}
+        over_stats = side_block.get("over") or {}
+        under_stats = side_block.get("under") or {}
+        if side_block.get("directional_bias_warning"):
+            st.warning(side_block["directional_bias_warning"])
+        s1, s2 = st.columns(2)
+        with s1:
+            st.markdown("**Over**")
+            st.metric("Count", over_stats.get("count") or 0)
+            st.metric("Win rate", fmt_pct(over_stats.get("win_rate")))
+            st.metric("ROI units", fmt_num(over_stats.get("roi_units"), fmt="{:+.2f}"))
+            st.metric("Avg score", fmt_num(over_stats.get("average_score"), fmt="{:.1f}"))
+            st.metric("Avg CLV", fmt_num(over_stats.get("average_clv_points"), fmt="{:+.3f}"))
+        with s2:
+            st.markdown("**Under**")
+            st.metric("Count", under_stats.get("count") or 0)
+            st.metric("Win rate", fmt_pct(under_stats.get("win_rate")))
+            st.metric("ROI units", fmt_num(under_stats.get("roi_units"), fmt="{:+.2f}"))
+            st.metric("Avg score", fmt_num(under_stats.get("average_score"), fmt="{:.1f}"))
+            st.metric("Avg CLV", fmt_num(under_stats.get("average_clv_points"), fmt="{:+.3f}"))
+
+        # ------------------------------------------------------------------
+        # 5. Score Band Performance — five-band segmentation with stability
+        # flag. Bands with <30 graded edges render in a muted style.
+        # ------------------------------------------------------------------
+        st.markdown("### Score Band Performance")
+        by_band = mlb_performance.get("by_score_band") or []
+        if rmode != "All candidates":
+            by_band = [row for row in by_band if _band_in_scope(row.get("score_band") or "")]
+        if by_band:
+            df_band = pd.DataFrame(by_band).fillna(DASH)
+            st.dataframe(
+                df_band, use_container_width=True, hide_index=True,
+                height=min(280, 60 + 32 * len(df_band)),
+            )
+            unstable_bands = [
+                row["score_band"] for row in by_band
+                if not row.get("stable", True) and (row.get("graded_edges") or 0) > 0
+            ]
+            if unstable_bands:
+                st.caption(
+                    "Bands with <30 graded edges shouldn't be treated as profitable: "
+                    + ", ".join(unstable_bands)
+                )
+        else:
+            render_empty_state("NO SCORE-BAND BREAKDOWN", "Grade more edges to populate.")
+
+        # ------------------------------------------------------------------
+        # 6. Projection Calibration — diagnoses model_proj vs market_close
+        # vs actual_total. Warnings only fire on absolute miss > 0.75 runs.
+        # ------------------------------------------------------------------
+        st.markdown("### Projection Calibration")
+        cal = mlb_performance.get("projection_calibration") or {}
+        for w in cal.get("warnings") or []:
+            st.warning(w)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("Avg model proj.", fmt_num(cal.get("avg_model_projected_total"), fmt="{:.2f}"))
+        c2.metric("Avg entry total", fmt_num(cal.get("avg_market_entry_total"), fmt="{:.2f}"))
+        c3.metric("Avg close total", fmt_num(cal.get("avg_closing_total"), fmt="{:.2f}"))
+        c4.metric("Avg actual total", fmt_num(cal.get("avg_actual_total"), fmt="{:.2f}"))
+        c5.metric("Avg proj. error", fmt_num(cal.get("avg_projection_error"), fmt="{:+.2f}"))
+        c6.metric("Avg |proj. error|", fmt_num(cal.get("avg_absolute_projection_error"), fmt="{:.2f}"))
+        rows_with_proj = cal.get("rows_with_projection") or 0
+        graded_gt = cal.get("graded_game_totals") or 0
+        if graded_gt and rows_with_proj == 0:
+            st.caption(
+                "Model projection field not yet populated by the scan pipeline — "
+                "calibration falls back to market entry total. Wire "
+                "`MlbEdge.model_projected_total` at scan time to enable full "
+                "calibration."
+            )
+
+        # ------------------------------------------------------------------
+        # 7. Projection Buckets — answers "are 10+ projected totals failing?"
+        # ------------------------------------------------------------------
+        st.markdown("### Projection Buckets")
+        bucket_rows = mlb_performance.get("by_projection_bucket") or []
+        if bucket_rows and any((r.get("graded_edges") or 0) > 0 for r in bucket_rows):
+            df_bucket = pd.DataFrame(bucket_rows).fillna(DASH)
+            st.dataframe(
+                df_bucket, use_container_width=True, hide_index=True,
+                height=min(280, 60 + 32 * len(df_bucket)),
+            )
+        else:
+            st.caption("No projection-bucket data yet.")
+
+        # ------------------------------------------------------------------
+        # 8. Timing Analytics — detect late signals via hours-before-game.
+        # ------------------------------------------------------------------
+        st.markdown("### Timing Analytics")
+        timing_rows = mlb_performance.get("by_timing") or []
+        if timing_rows and any((r.get("graded_edges") or 0) > 0 for r in timing_rows):
+            df_timing = pd.DataFrame(timing_rows).fillna(DASH)
+            st.dataframe(
+                df_timing, use_container_width=True, hide_index=True,
+                height=min(260, 60 + 32 * len(df_timing)),
+            )
+        else:
+            st.caption("No timing data yet (requires game start_time + edge created_at).")
+
+        # ------------------------------------------------------------------
+        # 9. ROI by Edge Type — kept from the prior dashboard.
+        # ------------------------------------------------------------------
+        st.markdown("### ROI by Edge Type")
+        by_market = mlb_performance.get("by_market") or []
         if by_market:
             df_market = pd.DataFrame(by_market).fillna(DASH)
-            st.dataframe(df_market, use_container_width=True, hide_index=True,
-                         height=min(280, 60 + 32 * len(df_market)))
+            st.dataframe(
+                df_market, use_container_width=True, hide_index=True,
+                height=min(280, 60 + 32 * len(df_market)),
+            )
             try:
                 chart_df = pd.DataFrame(by_market).set_index("edge_type")[["roi_units"]]
                 if not chart_df.empty:
@@ -3652,41 +3904,51 @@ with tab_perf:
         else:
             render_empty_state("NO EDGE-TYPE BREAKDOWN", "Need at least one graded edge per type.")
 
-        st.markdown("### By score band")
-        by_band = mlb_performance.get("by_score_band") or []
-        if by_band:
-            df_band = pd.DataFrame(by_band).fillna(DASH)
-            st.dataframe(df_band, use_container_width=True, hide_index=True,
-                         height=min(220, 60 + 32 * len(df_band)))
+        # ------------------------------------------------------------------
+        # 10. Factor Attribution — avg-on-wins, avg-on-losses, correlations.
+        # Factors marked unstable (sample <50) are flagged in their row.
+        # ------------------------------------------------------------------
+        st.markdown("### Factor Attribution")
+        factor_rows = mlb_performance.get("factor_attribution") or []
+        if factor_rows:
+            df_factors = pd.DataFrame(factor_rows).fillna(DASH)
+            st.dataframe(
+                df_factors, use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(df_factors)),
+            )
+            unstable_factors = [r["factor"] for r in factor_rows if r.get("unstable")]
+            if unstable_factors:
+                st.caption(
+                    "Unstable factors (sample <50): " + ", ".join(unstable_factors)
+                )
         else:
-            render_empty_state("NO SCORE-BAND BREAKDOWN", "Grade more edges to populate.")
+            st.caption("No factor attribution available.")
 
-        st.markdown("### CLV leaders")
+        # ------------------------------------------------------------------
+        # 11. Raw Graded Edges + CLV leaders for spot-checks.
+        # ------------------------------------------------------------------
+        st.markdown("### Raw Graded Edges — CLV leaders")
         clv_cols = st.columns(2)
         with clv_cols[0]:
             st.markdown("**Top positive CLV**")
             top_pos = clv_block.get("top_positive") or []
             if top_pos:
-                st.dataframe(pd.DataFrame(top_pos).fillna(DASH), use_container_width=True,
-                             hide_index=True, height=min(280, 60 + 32 * len(top_pos)))
+                st.dataframe(
+                    pd.DataFrame(top_pos).fillna(DASH), use_container_width=True,
+                    hide_index=True, height=min(280, 60 + 32 * len(top_pos)),
+                )
             else:
                 st.caption("None")
         with clv_cols[1]:
             st.markdown("**Top negative CLV**")
             top_neg = clv_block.get("top_negative") or []
             if top_neg:
-                st.dataframe(pd.DataFrame(top_neg).fillna(DASH), use_container_width=True,
-                             hide_index=True, height=min(280, 60 + 32 * len(top_neg)))
+                st.dataframe(
+                    pd.DataFrame(top_neg).fillna(DASH), use_container_width=True,
+                    hide_index=True, height=min(280, 60 + 32 * len(top_neg)),
+                )
             else:
                 st.caption("None")
-
-        st.markdown("### Factor attribution")
-        factors = perf_summary.get("top_factors_by_performance") or []
-        if factors:
-            st.dataframe(pd.DataFrame(factors).fillna(DASH), use_container_width=True,
-                         hide_index=True, height=min(280, 60 + 32 * len(factors)))
-        else:
-            st.caption("No factor attribution available.")
 
 
 # =============================================================================

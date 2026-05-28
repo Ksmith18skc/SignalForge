@@ -381,6 +381,13 @@ class MlbEdge(Base):
     clv_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     roi_units: Mapped[float | None] = mapped_column(Float, nullable=True)
     graded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Optional, backwards-compatible research fields. Older rows leave them
+    # NULL and the dashboard renders "not available" rather than crashing.
+    # ``model_projected_total`` is the model's projected run total at scan
+    # time (only meaningful for game_total edges).
+    model_projected_total: Mapped[float | None] = mapped_column(Float, nullable=True)
+    closing_snapshot_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    actual_total: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow, index=True)
 
 
