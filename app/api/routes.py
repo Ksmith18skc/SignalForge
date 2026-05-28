@@ -2244,6 +2244,18 @@ async def ballparkpal_upload_csv(
     # uploaded an empty slate (e.g. off-day) and the dashboard should
     # reflect that rather than continuing to show yesterday's stale
     # snapshot as fresh.
+    # Status reflects which branch of the parser produced the rows so
+    # the dashboard cache overview can distinguish a clean strict parse
+    # from a generic fallback. The MLB edge integration treats both as
+    # equally valid — it only reads ``rows`` — but operators benefit
+    # from seeing the difference.
+    used_generic = bool(result.get("used_generic_fallback"))
+    if parsed_row_count == 0:
+        snap_status = "ok_empty"
+    elif used_generic:
+        snap_status = "ok_generic"
+    else:
+        snap_status = "ok"
     snap = upsert_snapshot(
         db,
         page=page,
@@ -2252,7 +2264,7 @@ async def ballparkpal_upload_csv(
         parsed=parsed,
         raw_html_path=None,
         last_updated_text=(parsed.get("meta") or {}).get("uploaded_at"),
-        status="ok" if parsed_row_count > 0 else "ok_empty",
+        status=snap_status,
         error_message=None,
     )
     db.commit()
@@ -2261,11 +2273,17 @@ async def ballparkpal_upload_csv(
         "page": page,
         "slate_date": slate,
         "filename": filename,
-        "header": result["header"],
+        "raw_headers": result["raw_headers"],
+        "canonical_headers": result["canonical_headers"],
+        "detected_header_row_index": result["detected_header_row_index"],
+        "header_detection_score": result["header_detection_score"],
+        "raw_rows_preview": result["raw_rows_preview"],
         "raw_row_count": result["raw_row_count"],
         "parsed_row_count": parsed_row_count,
+        "used_generic_fallback": used_generic,
         "warnings": result["warnings"],
         "rows_preview": result["rows_preview"],
+        "rejection_reasons": result["rejection_reasons"],
         "snapshot": snapshot_payload(snap),
     }
 

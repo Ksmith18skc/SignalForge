@@ -4565,31 +4565,101 @@ with tab_bpp:
                             state="error",
                         )
 
-            # Result previews — required columns detected, row counts,
-            # parse warnings, first 10 rows.
+            # Result previews — raw headers, raw rows, parsed rows, parse
+            # warnings, rejection reasons. Expanded by default when
+            # something looks wrong (zero parsed rows or generic fallback)
+            # so the operator doesn't have to hunt for the diagnostics.
             for payload in upload_results:
                 p_label = bpp_labels.get(payload.get("page"), payload.get("page"))
+                parsed_rows_n = int(payload.get("parsed_row_count") or 0)
+                raw_rows_n = int(payload.get("raw_row_count") or 0)
+                used_fallback = bool(payload.get("used_generic_fallback"))
+                indicator = "✅"
+                if parsed_rows_n == 0:
+                    indicator = "❌"
+                elif used_fallback or (payload.get("rejection_reasons") or []):
+                    indicator = "⚠️"
                 with st.expander(
-                    f"✅ {p_label} · {payload.get('filename')} "
-                    f"(raw_rows={payload.get('raw_row_count')}, "
-                    f"parsed_rows={payload.get('parsed_row_count')})",
-                    expanded=False,
+                    f"{indicator} {p_label} · {payload.get('filename')} "
+                    f"(raw_rows={raw_rows_n}, parsed_rows={parsed_rows_n})",
+                    expanded=(parsed_rows_n == 0 or used_fallback),
                 ):
+                    # Detection summary
+                    det_idx = payload.get("detected_header_row_index")
+                    det_score = payload.get("header_detection_score")
                     st.markdown(
-                        f"**Detected columns:** `{', '.join(payload.get('header') or []) or DASH}`"
+                        f"**Header row:** index `{det_idx}` "
+                        f"(detection score `{det_score}`) · "
+                        f"**Generic fallback:** "
+                        f"{'yes' if used_fallback else 'no'}"
                     )
+                    raw_headers = payload.get("raw_headers") or []
+                    canon_headers = payload.get("canonical_headers") or []
+                    st.markdown(
+                        f"**Detected raw headers:** `{', '.join(raw_headers) or DASH}`"
+                    )
+                    st.markdown(
+                        f"**Canonical (aliased) headers:** "
+                        f"`{', '.join(c for c in canon_headers if c) or DASH}`"
+                    )
+
+                    # First 20 RAW rows — what the file actually looks
+                    # like before header detection / parsing.
+                    raw_preview = payload.get("raw_rows_preview") or []
+                    if raw_preview:
+                        st.markdown("**First 20 raw CSV rows (before parsing):**")
+                        st.dataframe(
+                            pd.DataFrame(raw_preview).fillna(DASH),
+                            use_container_width=True, hide_index=False,
+                            height=min(420, 60 + 24 * len(raw_preview)),
+                        )
+
+                    # Warnings + parse errors
                     for warning in payload.get("warnings") or []:
                         st.warning(warning)
+
+                    # Per-row rejection reasons — only shown when at
+                    # least one row was rejected by the strict parser
+                    rejections = payload.get("rejection_reasons") or []
+                    if rejections:
+                        st.markdown(
+                            f"**Rejected rows: {len(rejections)} of "
+                            f"{raw_rows_n}.** Each row below is shown with "
+                            "the required field(s) it was missing."
+                        )
+                        rej_rows = [
+                            {
+                                "row_index": r.get("row_index"),
+                                "missing": ", ".join(r.get("missing") or []),
+                                "sample": "; ".join(
+                                    f"{k}={v}" for k, v in (r.get("sample") or {}).items()
+                                ),
+                            }
+                            for r in rejections[:50]
+                        ]
+                        st.dataframe(
+                            pd.DataFrame(rej_rows).fillna(DASH),
+                            use_container_width=True, hide_index=True,
+                            height=min(280, 60 + 28 * len(rej_rows)),
+                        )
+
+                    # Parsed-row preview (first 10 canonical rows)
                     rows_preview = payload.get("rows_preview") or []
                     if rows_preview:
-                        st.markdown("**Preview (first 10 parsed rows):**")
+                        label = "Preview (first 10 parsed rows)"
+                        if used_fallback:
+                            label += " — generic fallback (canonical headers as keys)"
+                        st.markdown(f"**{label}:**")
                         st.dataframe(
                             pd.DataFrame(rows_preview).fillna(DASH),
                             use_container_width=True, hide_index=True,
                             height=min(280, 60 + 32 * len(rows_preview)),
                         )
                     else:
-                        st.caption("No parsed rows to preview.")
+                        st.error(
+                            "Zero rows parsed. Inspect the raw rows + "
+                            "rejection reasons above to see why."
+                        )
             for filename, err_text in failures:
                 with st.expander(f"❌ {filename} — failed", expanded=True):
                     st.code(err_text, language="text")
