@@ -42,8 +42,17 @@ def _pitcher_edge(
     summary = statcast.get("summary") or {}
     k_per_start = _num(summary.get("strikeouts_per_start"))
     line = _num(prop.get(f"best_{side}_line")) or _num(prop.get("line"))
+    projected_k = _num(
+        prop.get("ballparkpal_projected_k")
+        or prop.get("projected_k")
+        or prop.get("projected_strikeouts")
+    )
     recent_form = 50.0
-    if k_per_start is not None and line is not None:
+    if projected_k is not None and line is not None:
+        recent_form = 50 + (projected_k - line) * 8
+        if side == "under":
+            recent_form = 100 - recent_form
+    elif k_per_start is not None and line is not None:
         recent_form = 50 + (k_per_start - line) * 8
         if side == "under":
             recent_form = 100 - recent_form
@@ -67,6 +76,8 @@ def _pitcher_edge(
             odds_ok=bool(prop.get("rows")),
         ),
     }
+    if projected_k is not None:
+        factors["projected_k"] = projected_k
     score = weighted_score(factors, PITCHER_K_WEIGHTS)
     warnings.extend(environment.get("warnings") or [])
     cls = classify_edge(score, warnings)
@@ -104,9 +115,13 @@ def _pitcher_edge(
         ),
         "reasons": reasons,
         "warnings": _dedupe(warnings),
-        "data_sources_used": ["MLB StatsAPI", "WeatherAPI", "Cached Statcast", "Odds-API.io"],
+        "data_sources_used": _data_sources(prop),
         "factors": factors,
         "score_contributions": additive_contributions(factors, PITCHER_K_WEIGHTS),
+        "projected_strikeouts": projected_k,
+        "source": prop.get("source"),
+        "execution_source": prop.get("execution_source"),
+        "market_type": prop.get("market_type"),
     }
 
 
@@ -123,6 +138,9 @@ def _reasons(
         f"Best {side} price from {prop.get(f'best_{side}_book') or 'no book available'}",
         f"K environment score: {environment.get('k_environment_score', 50)}",
     ]
+    projected_k = prop.get("ballparkpal_projected_k") or prop.get("projected_k")
+    if projected_k is not None:
+        reasons.insert(0, f"BallparkPal projected Ks: {projected_k}")
     if summary.get("strikeouts_per_start") is not None:
         reasons.insert(0, f"Recent strikeouts/start: {summary['strikeouts_per_start']}")
     return reasons[:4]
@@ -141,3 +159,9 @@ def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:
 
 def _dedupe(values: list[str]) -> list[str]:
     return list(dict.fromkeys(v for v in values if v))
+
+
+def _data_sources(prop: dict[str, Any]) -> list[str]:
+    if str(prop.get("source") or "") == "ballparkpal_csv":
+        return ["MLB StatsAPI", "WeatherAPI", "Cached Statcast", "ballparkpal_csv"]
+    return ["MLB StatsAPI", "WeatherAPI", "Cached Statcast", "Odds-API.io"]

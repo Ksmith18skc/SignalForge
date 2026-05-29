@@ -1,4 +1,4 @@
-"""BallparkPal fallback for pitcher K cards.
+"""BallparkPal CSV source for pitcher K cards.
 
 When the sportsbook odds cache is empty for pitcher strikeout props —
 or just doesn't contain the pitcher we care about — we synthesize a
@@ -9,10 +9,10 @@ so we display nothing." The cache already exposes the data; we just
 have to plug it into the same shape that ``consensus_for_pitcher``
 returns.
 
-The synthesized payload is clearly marked with
-``source="ballparkpal_fallback"`` so downstream consumers (and the
-dashboard card) can label the card "BallparkPal fallback odds" and
-the operator never thinks the line came from DraftKings.
+New synthesized payloads are clearly marked with
+``source="ballparkpal_csv"`` and
+``execution_source="BallparkPal BP odds"`` so downstream consumers
+label them as BallparkPal CSV cards, not sportsbook-cache fallbacks.
 """
 
 from __future__ import annotations
@@ -53,6 +53,21 @@ _OPP_KEYS = ("opp", "opponent")
 
 
 FALLBACK_SOURCE = "ballparkpal_fallback"
+# First-class source label for BPP-derived K cards. ``FALLBACK_SOURCE``
+# remains a recognized alias for back-compat with already-persisted edges
+# / older daily-card payloads, but new cards are written with
+# ``CSV_SOURCE`` so the dashboard can label them as primary BPP cards
+# instead of "fallback odds." Both labels share the same downstream
+# rendering path; the rename is purely operator-facing language.
+CSV_SOURCE = "ballparkpal_csv"
+# Operator-facing label for the execution side of a BPP card. Rendered
+# on the card itself so it never reads "DraftKings" when the price came
+# from the BPP odds column.
+CSV_EXECUTION_SOURCE = "BallparkPal BP odds"
+# Market type used by the consumer-side card renderer + downstream
+# enrichment hook (Kalshi/Polymarket). Pinned here so additions like
+# pitcher_outs / pitcher_earned_runs don't accidentally share it.
+CSV_MARKET_TYPE = "pitcher_k"
 
 
 # Sanity ranges. Anything outside these is either a parse mistake (an
@@ -153,55 +168,53 @@ def validate_bpp_row(
     the single chokepoint that ensures a card title can never read
     ``"Over 174 Ks"``: 174 fails the K-line range and is rejected with
     ``reason="line_looks_like_american_odds"``.
+
+    Every rejection's ``details`` payload now includes the FULL parsed
+    triple (projected_k, over_line, over_odds) plus the keys actually
+    present in the row, so the diagnostics panel can show the operator
+    exactly what the validator saw rather than forcing them to guess.
     """
     projected_k = _first_float(bpp_row, _PROJECTED_K_KEYS)
     line = _first_float(bpp_row, _OVER_LINE_KEYS)
     over_price = _first_float(bpp_row, _OVER_ODDS_KEYS)
     under_price = _first_float(bpp_row, _UNDER_ODDS_KEYS)
 
+    def _base_details() -> dict[str, Any]:
+        # Always emit the same three K-prop fields so the operator can
+        # spot the column-mapping bug at a glance. Plus the raw row's
+        # keys for diagnosing alias drift.
+        return {
+            "pitcher": pitcher_name,
+            "projected_k": projected_k,
+            "over_line": line,
+            "over_odds": over_price,
+            "row_keys": sorted(bpp_row.keys()),
+        }
+
     if projected_k is None:
-        raise FallbackRejection(
-            "projected_k_missing",
-            details={"pitcher": pitcher_name},
-        )
+        raise FallbackRejection("projected_k_missing", details=_base_details())
     if line is None:
-        raise FallbackRejection(
-            "over_line_missing",
-            details={"pitcher": pitcher_name, "projected_k": projected_k},
-        )
+        raise FallbackRejection("over_line_missing", details=_base_details())
     if not (PROJECTED_K_RANGE[0] <= projected_k <= PROJECTED_K_RANGE[1]):
-        raise FallbackRejection(
-            "projected_k_out_of_range",
-            details={"pitcher": pitcher_name, "projected_k": projected_k},
-        )
+        raise FallbackRejection("projected_k_out_of_range", details=_base_details())
     # If the K-line value is large enough to look like american odds,
     # the parser almost certainly swapped over_line ↔ over_odds. Reject
     # the row rather than publish a "Over 174 Ks" card.
     if abs(line) > LINE_LOOKS_LIKE_ODDS_THRESHOLD:
         raise FallbackRejection(
-            "line_looks_like_american_odds",
-            details={
-                "pitcher": pitcher_name,
-                "over_line": line,
-                "over_odds": over_price,
-            },
+            "line_looks_like_american_odds", details=_base_details(),
         )
     if not (OVER_LINE_RANGE[0] <= line <= OVER_LINE_RANGE[1]):
-        raise FallbackRejection(
-            "over_line_out_of_range",
-            details={"pitcher": pitcher_name, "over_line": line},
-        )
+        raise FallbackRejection("over_line_out_of_range", details=_base_details())
     # Odds sanity: accept either american (-1000..+1000) or decimal
     # (1.01..10). A value of None is fine — the card will render
-    # without a best price.
+    # without a best price. We DON'T reject on bad over_odds anymore —
+    # the K card is still useful with just the projection + line, and
+    # bad odds values were too easy to false-positive on (decimal odds
+    # like 1.91 sit inside the "looks like a line" band).
     if over_price is not None and not _is_valid_odds(over_price):
-        raise FallbackRejection(
-            "over_odds_out_of_range",
-            details={"pitcher": pitcher_name, "over_odds": over_price},
-        )
+        over_price = None
     if under_price is not None and not _is_valid_odds(under_price):
-        # Don't reject — just drop the under price. Some CSVs only
-        # ship over odds and this should not block the over card.
         under_price = None
 
     return {
@@ -254,7 +267,10 @@ def build_fallback_prop_analysis(
         "line": line,
         "over_price": over_price,
         "under_price": under_price,
-        "sportsbook": FALLBACK_SOURCE,
+        "sportsbook": CSV_EXECUTION_SOURCE,
+        "source": CSV_SOURCE,
+        "execution_source": CSV_EXECUTION_SOURCE,
+        "market_type": CSV_MARKET_TYPE,
         "timestamp": ts,
         "raw": bpp_row,
     }
@@ -265,10 +281,10 @@ def build_fallback_prop_analysis(
         "average_line": line,
         "best_over_line": line,
         "best_over_price": over_price,
-        "best_over_book": FALLBACK_SOURCE,
+        "best_over_book": CSV_EXECUTION_SOURCE,
         "best_under_line": line,
         "best_under_price": under_price,
-        "best_under_book": FALLBACK_SOURCE,
+        "best_under_book": CSV_EXECUTION_SOURCE,
         "consensus_price": over_price,
         "average_implied_probability": None,
         "line_disagreement": 0.0,
@@ -276,7 +292,7 @@ def build_fallback_prop_analysis(
         "book_count": 0,
         "movement_direction": None,
         "steam_velocity": None,
-        "warnings": ["BallparkPal fallback odds — no live sportsbook coverage"],
+        "warnings": ["BallparkPal BP odds - no external pitcher prop market required"],
         "is_valid": True,
         "validation_reason": "",
         "market_scope": MarketSubtype.PLAYER_PROP.value,
@@ -285,10 +301,13 @@ def build_fallback_prop_analysis(
         # short-circuit the recent-form computation (we have the
         # projected_k directly from BPP) and the card renderer reads
         # them to label the card as BPP-sourced.
-        "source": FALLBACK_SOURCE,
+        "source": CSV_SOURCE,
+        "execution_source": CSV_EXECUTION_SOURCE,
+        "market_type": CSV_MARKET_TYPE,
         "ballparkpal_projected_k": projected_k,
         "ballparkpal_team": bpp_row.get("team") or bpp_row.get("tm"),
         "ballparkpal_opponent": bpp_row.get("opp") or bpp_row.get("opponent"),
+        "external_pitcher_prop": None,
     }
 
 
@@ -321,4 +340,7 @@ def _first_float(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
 
 def is_fallback_payload(prop: dict[str, Any] | None) -> bool:
     """Convenience used by the card renderer + diagnostics."""
-    return bool(prop) and str(prop.get("source") or "") == FALLBACK_SOURCE
+    return bool(prop) and str(prop.get("source") or "") in {
+        FALLBACK_SOURCE,
+        CSV_SOURCE,
+    }

@@ -19,6 +19,7 @@ shows 'No qualifying edges'" bug:
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 
 from app.services.mlb_pitcher_k_diagnostics import (
@@ -29,6 +30,9 @@ from app.services.mlb_pitcher_k_diagnostics import (
     classify_k_edge_magnitude,
 )
 from app.services.mlb_pitcher_k_fallback import (
+    CSV_EXECUTION_SOURCE,
+    CSV_MARKET_TYPE,
+    CSV_SOURCE,
     FALLBACK_SOURCE,
     FallbackRejection,
     build_fallback_prop_analysis,
@@ -76,7 +80,10 @@ def test_bradley_row_produces_fallback_prop_analysis():
     prop = build_fallback_prop_analysis(pitcher_name="Taj Bradley", bpp_row=row)
     assert prop is not None
     assert prop["line"] == 6.5
-    assert prop["best_over_book"] == FALLBACK_SOURCE
+    assert prop["best_over_book"] == CSV_EXECUTION_SOURCE
+    assert prop["source"] == CSV_SOURCE
+    assert prop["execution_source"] == CSV_EXECUTION_SOURCE
+    assert prop["market_type"] == CSV_MARKET_TYPE
     assert prop["ballparkpal_projected_k"] == 6.38
     assert is_fallback_payload(prop)
     # k_edge is negative for Bradley (projection below line).
@@ -94,6 +101,8 @@ def test_meyer_row_produces_over_watchlist_candidate():
     assert prop is not None
     k_edge = k_edge_from_fallback(prop)
     assert k_edge == 0.26
+    assert prop["source"] == CSV_SOURCE
+    assert prop["best_over_price"] == 1.85
     # Positive edge above the watchlist floor → watchlist band.
     assert classify_k_edge_magnitude(k_edge) == "watchlist"
 
@@ -209,6 +218,151 @@ def test_empty_state_says_threshold_when_candidates_rejected():
     assert "rejected by K-edge thresholds" in msg or "0.15-run" in msg
 
 
+def test_empty_state_says_bpp_cards_when_external_props_absent():
+    diag = PitcherKDiagnostics(
+        strikeout_projections_loaded=30,
+        external_pitcher_prop_markets_found=0,
+        candidates_built_from_ballparkpal_fallback=2,
+    )
+    msg = diag.empty_state_message()
+    assert msg == (
+        "30 BallparkPal K projections loaded. 0 external pitcher prop "
+        "markets found. Showing BallparkPal-based model cards."
+    )
+
+
+def test_external_pitcher_props_zero_still_produces_bpp_k_cards(
+    db_session, monkeypatch,
+):
+    from app.models import MlbEdge
+    from app.services import mlb_edge_engine, odds_cache
+    from app.services.ballparkpal_cache import upsert_snapshot
+
+    upsert_snapshot(
+        db_session,
+        page="strikeouts",
+        slate_date="2026-05-29",
+        source_url="file://strikeouts.csv",
+        parsed={
+            "rows": [
+                {
+                    "pitcher": "Max Meyer",
+                    "team": "MIA",
+                    "opp": "PHI",
+                    "projected_k": 5.76,
+                    "over_line": 5.5,
+                    "over_odds": -110,
+                }
+            ]
+        },
+        raw_html_path=None,
+        last_updated_text=None,
+        status="ok",
+    )
+    db_session.commit()
+
+    async def fake_load_games(_mlb, card_date: str):
+        return [
+            {
+                "game_pk": 99001,
+                "game_date": card_date,
+                "home_team": "Miami Marlins",
+                "away_team": "Philadelphia Phillies",
+                "venue": "loanDepot park",
+                "probable_home_pitcher": "Max Meyer",
+                "probable_home_pitcher_id": 42,
+                "probable_away_pitcher": None,
+                "probable_away_pitcher_id": None,
+                "game_status": "Scheduled",
+                "start_time": None,
+                "weather_location_query": "Miami, FL",
+            }
+        ]
+
+    async def fake_refresh(*_args, **kwargs):
+        return odds_cache.RefreshResult(
+            refreshed=False,
+            reason="events fetch failed and no cached events",
+            game_date=kwargs["game_date"],
+        )
+
+    async def fake_environment_for_game(*_args, **_kwargs):
+        return {"k_environment_score": 50.0, "warnings": []}
+
+    async def fake_external_props(**_kwargs):
+        return []
+
+    monkeypatch.setattr(mlb_edge_engine, "_load_games", fake_load_games)
+    monkeypatch.setattr(mlb_edge_engine, "MlbStatsApiProvider", lambda: object())
+    monkeypatch.setattr(mlb_edge_engine.odds_cache, "refresh_mlb_odds_cache", fake_refresh)
+    monkeypatch.setattr(mlb_edge_engine, "_environment_for_game", fake_environment_for_game)
+    monkeypatch.setattr(mlb_edge_engine, "fetch_external_pitcher_k_props", fake_external_props)
+    monkeypatch.setattr(
+        mlb_edge_engine,
+        "statcast_context",
+        lambda *_args, **_kwargs: {"summary": {}, "warnings": []},
+    )
+
+    result = asyncio.run(
+        mlb_edge_engine.run_daily_mlb_edges(
+            db_session,
+            game_date="2026-05-29",
+        )
+    )
+
+    assert result["events_with_pitcher_props"] == 0
+    edges = db_session.query(MlbEdge).filter_by(edge_type="pitcher_strikeouts").all()
+    assert edges
+    assert any(edge.best_book == CSV_EXECUTION_SOURCE for edge in edges)
+    assert any(edge.best_price == -110 for edge in edges)
+
+    card_rows = result["daily_card"]["top_pitcher_strikeouts"]
+    assert card_rows
+    assert any(row.get("source") == CSV_SOURCE for row in card_rows)
+    assert any(row.get("execution_source") == CSV_EXECUTION_SOURCE for row in card_rows)
+    assert any(row.get("market_type") == CSV_MARKET_TYPE for row in card_rows)
+    assert any(row.get("projected_strikeouts") == 5.76 for row in card_rows)
+
+    diag = result["diagnostics"]["pitcher_k"]
+    assert diag["strikeout_projections_loaded"] == 1
+    assert diag["sportsbook_pitcher_k_props_loaded"] == 0
+    assert diag["external_pitcher_prop_markets_found"] == 0
+    assert diag["candidates_built_from_ballparkpal_fallback"] == 1
+    assert result["daily_card"]["data_quality_summary"]["pitcher_k_empty_state_message"] == (
+        "1 BallparkPal K projections loaded. 0 external pitcher prop "
+        "markets found. Showing BallparkPal-based model cards."
+    )
+
+
+def test_external_pitcher_prop_matcher_normalizes_name_date_and_line():
+    from app.services.mlb_external_pitcher_props import (
+        match_external_pitcher_k_prop,
+        normalize_external_pitcher_k_market,
+    )
+
+    market = normalize_external_pitcher_k_market(
+        {
+            "title": "Will Taj Bradley record over 6.5 strikeouts on 2026-05-29?",
+            "slug": "mlb-taj-bradley-2026-05-29-strikeouts-6pt5",
+            "yes_price": 57,
+        },
+        platform="polymarket",
+        default_date="2026-05-29",
+    )
+
+    assert market is not None
+    assert market["pitcher_name"] == "Taj Bradley"
+    assert market["line"] == 6.5
+    assert market["price"] == 0.57
+
+    assert match_external_pitcher_k_prop(
+        pitcher_name="T. Bradley",
+        game_date="2026-05-29",
+        line=6.5,
+        markets=[market],
+    )["market_url"].startswith("https://polymarket.com/event/")
+
+
 # ---------------------------------------------------------------------------
 # Name normalization
 # ---------------------------------------------------------------------------
@@ -304,6 +458,8 @@ def test_bradley_field_mapping_uses_correct_columns():
     assert prop is not None
     assert prop["line"] == 6.5  # NOT 116
     assert prop["best_over_price"] == 116  # the odds
+    assert prop["source"] == CSV_SOURCE
+    assert prop["execution_source"] == CSV_EXECUTION_SOURCE
     assert prop["ballparkpal_projected_k"] == 6.38
     assert k_edge_from_fallback(prop) == pytest.approx(-0.12, abs=1e-6)
 
@@ -317,7 +473,57 @@ def test_meyer_field_mapping_produces_correct_over_edge():
     assert prop is not None
     assert prop["line"] == 5.5
     assert prop["best_over_price"] == -110
+    assert prop["source"] == CSV_SOURCE
+    assert prop["execution_source"] == CSV_EXECUTION_SOURCE
     assert k_edge_from_fallback(prop) == pytest.approx(0.26, abs=1e-6)
+
+
+def test_bradley_bpp_row_produces_valid_pitcher_k_card_payload():
+    from app.services.mlb_pitcher_k_model import pitcher_k_edges
+
+    row = {
+        "pitcher": "Taj Bradley", "team": "TB", "opp": "BAL",
+        "projected_k": 6.38, "over_line": 6.5, "over_odds": 116,
+    }
+    prop = build_fallback_prop_analysis(pitcher_name="Taj Bradley", bpp_row=row)
+    cards = pitcher_k_edges(
+        game={"game_pk": 1, "home_team": "Tampa Bay Rays", "away_team": "Baltimore Orioles"},
+        pitcher={"id": 1, "name": "Taj Bradley"},
+        prop_analysis=prop,
+        statcast_context={"summary": {}, "warnings": []},
+        environment={"k_environment_score": 50.0, "warnings": []},
+    )
+    over = next(card for card in cards if card["side"] == "over")
+    assert over["line"] == 6.5
+    assert over["best_price"] == 116
+    assert over["source"] == CSV_SOURCE
+    assert over["execution_source"] == CSV_EXECUTION_SOURCE
+    assert over["market_type"] == CSV_MARKET_TYPE
+    assert over["projected_strikeouts"] == 6.38
+
+
+def test_meyer_bpp_row_produces_valid_pitcher_k_card_payload():
+    from app.services.mlb_pitcher_k_model import pitcher_k_edges
+
+    row = {
+        "pitcher": "Max Meyer", "team": "MIA", "opp": "PHI",
+        "projected_k": 5.76, "over_line": 5.5, "over_odds": -110,
+    }
+    prop = build_fallback_prop_analysis(pitcher_name="Max Meyer", bpp_row=row)
+    cards = pitcher_k_edges(
+        game={"game_pk": 2, "home_team": "Miami Marlins", "away_team": "Philadelphia Phillies"},
+        pitcher={"id": 2, "name": "Max Meyer"},
+        prop_analysis=prop,
+        statcast_context={"summary": {}, "warnings": []},
+        environment={"k_environment_score": 50.0, "warnings": []},
+    )
+    over = next(card for card in cards if card["side"] == "over")
+    assert over["line"] == 5.5
+    assert over["best_price"] == -110
+    assert over["source"] == CSV_SOURCE
+    assert over["execution_source"] == CSV_EXECUTION_SOURCE
+    assert over["market_type"] == CSV_MARKET_TYPE
+    assert over["projected_strikeouts"] == 5.76
 
 
 # ---------------------------------------------------------------------------
@@ -375,14 +581,21 @@ def test_missing_projected_k_rejected_with_named_reason():
     assert info.value.reason == "projected_k_missing"
 
 
-def test_over_odds_outside_american_range_rejected():
+def test_over_odds_outside_range_drops_price_but_does_not_reject_row():
+    """A K card is still useful with just the projection + line, so a
+    bad over_odds value must NOT block the card. Decimal odds like 1.91
+    were sitting inside the "looks like a line" heuristic and the
+    aggressive earlier rejection was eating real cards. We now silently
+    drop the price and keep going."""
     row = {
         "pitcher": "X", "projected_k": 5.0, "over_line": 5.5,
-        "over_odds": 5000,  # not plausible american or decimal odds
+        "over_odds": 5000,  # implausible odds
     }
-    with pytest.raises(FallbackRejection) as info:
-        validate_bpp_row(pitcher_name="X", bpp_row=row)
-    assert info.value.reason == "over_odds_out_of_range"
+    out = validate_bpp_row(pitcher_name="X", bpp_row=row)
+    # Validator accepts the row; the bad price simply becomes None so
+    # the card renders without a best price.
+    assert out["line"] == 5.5
+    assert out["over_price"] is None
 
 
 def test_valid_row_returns_validated_values():

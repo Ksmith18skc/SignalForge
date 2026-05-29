@@ -144,7 +144,16 @@ def chase_risk(*, movement_score: float, line_disagreement: float, score: float)
 
 
 def edge_to_dict(edge: Any) -> dict[str, Any]:
-    return {
+    sources = [str(s) for s in (edge.data_sources_used or [])]
+    factors = edge.factors or {}
+    is_ballparkpal_k = any(
+        s in {"ballparkpal_csv", "ballparkpal_fallback"} for s in sources
+    )
+    projected_ks = (
+        factors.get("projected_k")
+        or factors.get("ballparkpal_projected_k")
+    )
+    payload = {
         "id": edge.id,
         "game_pk": edge.game_pk,
         "edge_type": edge.edge_type,
@@ -170,8 +179,8 @@ def edge_to_dict(edge: Any) -> dict[str, Any]:
         "chase_risk": edge.chase_risk,
         "reasons": edge.reasons or [],
         "warnings": edge.warnings or [],
-        "data_sources_used": edge.data_sources_used or [],
-        "factors": edge.factors or {},
+        "data_sources_used": sources,
+        "factors": factors,
         "wallet_context": edge.wallet_context or None,
         "score_contributions": edge.score_contributions or None,
         "generated_for_date": edge.generated_for_date,
@@ -191,6 +200,15 @@ def edge_to_dict(edge: Any) -> dict[str, Any]:
         "graded_at": edge.graded_at.isoformat() if edge.graded_at else None,
         "created_at": edge.created_at.isoformat() if edge.created_at else None,
     }
+    if is_ballparkpal_k:
+        payload["source"] = "ballparkpal_csv"
+        payload["execution_source"] = "BallparkPal BP odds"
+        payload["market_type"] = "pitcher_k"
+        payload["odds_snapshot_source"] = "ballparkpal_csv"
+    if projected_ks is not None and edge.edge_type == "pitcher_strikeouts":
+        payload["projected_strikeouts"] = projected_ks
+        payload["model_projected_ks"] = projected_ks
+    return payload
 
 
 def _clamp(value: float, lo: float = 0.0, hi: float = 100.0) -> float:

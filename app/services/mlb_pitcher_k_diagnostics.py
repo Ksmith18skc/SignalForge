@@ -30,6 +30,8 @@ class PitcherKDiagnostics:
     # Input availability
     strikeout_projections_loaded: int = 0
     sportsbook_pitcher_k_props_loaded: int = 0
+    external_pitcher_prop_markets_found: int = 0
+    external_pitcher_prop_markets_matched: int = 0
     games_with_pitchers: int = 0
 
     # Name matching (per-pitcher × per-source)
@@ -71,6 +73,11 @@ class PitcherKDiagnostics:
     # scan.
     mlb_probable_pitchers_today: list[dict[str, Any]] = field(default_factory=list)
     ballparkpal_pitchers_in_cache: list[str] = field(default_factory=list)
+    # First 5 raw cached BPP rows (verbatim) so the operator can SEE
+    # what the validator is reading — the dashboard panel renders this
+    # as a JSON dump. When a fresh re-upload still produces rejections,
+    # this is what tells us whether the alias map ran or not.
+    ballparkpal_sample_rows: list[dict[str, Any]] = field(default_factory=list)
 
     def empty_state_message(self) -> str:
         """Choose the most specific message for the current counter state.
@@ -105,6 +112,16 @@ class PitcherKDiagnostics:
             )
         # Name mismatch is the next most specific failure. 30 rows
         # loaded but none of today's MLB probable pitchers found a row.
+        if (
+            self.strikeout_projections_loaded > 0
+            and self.external_pitcher_prop_markets_found == 0
+            and self.candidates_built_from_ballparkpal_fallback > 0
+        ):
+            return (
+                f"{self.strikeout_projections_loaded} BallparkPal K "
+                "projections loaded. 0 external pitcher prop markets "
+                "found. Showing BallparkPal-based model cards."
+            )
         if (
             self.strikeout_projections_loaded > 0
             and self.pitcher_names_matched_ballparkpal == 0

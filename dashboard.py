@@ -2063,7 +2063,11 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     line = edge.get("line")
     line_str = _fmt_line(line)
     edge_type = str(edge.get("edge_type") or "")
-    odds_source, fallback = odds_provider_label(edge.get("odds_snapshot_source"))
+    odds_source, fallback = odds_provider_label(
+        edge.get("odds_snapshot_source")
+        or edge.get("source")
+        or edge.get("execution_source")
+    )
     odds_stale = bool(edge.get("odds_stale"))
 
     sub_bits: list[str] = []
@@ -4684,7 +4688,7 @@ with tab_mlb:
             pitcher_k_diag.get("pitcher_names_matched_sportsbook", 0),
         )
         d_cols[3].metric(
-            "Pitcher names matched (BPP fallback)",
+            "Pitcher names matched (BallparkPal CSV)",
             pitcher_k_diag.get("pitcher_names_matched_ballparkpal", 0),
         )
         d_cols2 = st.columns(4)
@@ -4693,7 +4697,7 @@ with tab_mlb:
             pitcher_k_diag.get("candidates_built_from_sportsbook", 0),
         )
         d_cols2[1].metric(
-            "Candidates built (BPP fallback)",
+            "Candidates built (BallparkPal CSV)",
             pitcher_k_diag.get("candidates_built_from_ballparkpal_fallback", 0),
         )
         d_cols2[2].metric(
@@ -4734,7 +4738,7 @@ with tab_mlb:
         fb_examples = pitcher_k_diag.get("fallback_card_examples") or []
         if fb_examples:
             with st.expander(
-                f"BallparkPal fallback cards built ({len(fb_examples)})",
+                f"BallparkPal CSV cards built ({len(fb_examples)})",
                 expanded=False,
             ):
                 st.dataframe(
@@ -4817,6 +4821,29 @@ with tab_mlb:
                         "(Loose matching layers on top of this — first-initial "
                         "+ last-name still resolves J. Ryan ↔ Joe Ryan.)"
                     )
+
+        # Raw cached BPP rows — shown as JSON so we can see exactly what
+        # the validator is reading. Expanded by default when we have
+        # mass rejections so the operator (and any debugging human)
+        # don't have to dig for it.
+        sample_rows = pitcher_k_diag.get("ballparkpal_sample_rows") or []
+        if sample_rows:
+            mass_rejections = (
+                pitcher_k_diag.get("rejected_for_bad_mapping", 0) >= 5
+            )
+            with st.expander(
+                f"Raw BallparkPal cache rows ({len(sample_rows)} sample)",
+                expanded=mass_rejections,
+            ):
+                st.caption(
+                    "First 5 rows of the parsed cache verbatim. Check "
+                    "that `over_line` holds a K count (0.5–15.5) and "
+                    "`over_odds` holds american or decimal odds. If "
+                    "they're swapped or missing, the alias map didn't "
+                    "match your CSV headers — paste the column header "
+                    "row and I'll fix the alias."
+                )
+                st.json(sample_rows)
 
     st.markdown("### Score Distribution")
     if mlb_blocked_by_stale_odds:

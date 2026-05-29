@@ -233,6 +233,9 @@ class TestProviderLabel:
         assert odds_provider_label(None) == ("Odds-API.io", False)
         assert odds_provider_label("odds_api") == ("Odds-API.io", False)
 
+    def test_ballparkpal_csv_is_primary_bpp_source(self):
+        assert odds_provider_label("ballparkpal_csv") == ("BallparkPal BP odds", False)
+
 
 class TestCompactTimeAgo:
     def test_seconds(self):

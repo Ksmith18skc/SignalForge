@@ -40,6 +40,10 @@ _WEIGHTS_FOR_EDGE_TYPE = {
     "pitcher_strikeouts": PITCHER_K_WEIGHTS,
 }
 from app.services.mlb_environment import score_environment
+from app.services.mlb_external_pitcher_props import (
+    fetch_external_pitcher_k_props,
+    match_external_pitcher_k_prop,
+)
 from app.services.mlb_odds_analysis import analyze_game_totals
 from app.services.mlb_odds_matching import MatchResult
 from app.services.mlb_pitcher_k_model import pitcher_k_edges
@@ -92,14 +96,68 @@ async def run_daily_mlb_edges(
     )
     matches_by_game: dict[int, MatchResult] = {m.game_pk: m for m in match_results}
     diagnostics = _initial_diagnostics(db, games, match_results, card_date=card_date)
-    if (
+
+    # Pitcher-K diagnostics and BallparkPal rows are loaded before the
+    # odds-cache stale gate so BPP CSV cards can still run when external
+    # pitcher props are absent.
+    from app.services.ballparkpal_integration import k_projection_index
+    from app.services.mlb_pitcher_k_diagnostics import PitcherKDiagnostics
+    from app.services.mlb_pitcher_k_fallback import (
+        CSV_EXECUTION_SOURCE,
+        CSV_MARKET_TYPE,
+        CSV_SOURCE,
+        FallbackRejection,
+        build_fallback_prop_analysis,
+        is_fallback_payload,
+        validate_bpp_row,
+    )
+
+    k_diag = PitcherKDiagnostics()
+    try:
+        bpp_strikeout_rows = k_projection_index(db, slate_date=card_date) or {}
+    except Exception as exc:  # noqa: BLE001 - BPP is best-effort
+        logger.warning(
+            "BallparkPal strikeout index load failed: %s; BPP K path disabled.",
+            exc,
+        )
+        bpp_strikeout_rows = {}
+    k_diag.strikeout_projections_loaded = len(bpp_strikeout_rows)
+    k_diag.ballparkpal_pitchers_in_cache = sorted({
+        str(row.get("pitcher") or "").strip()
+        for row in bpp_strikeout_rows.values()
+        if row.get("pitcher")
+    })
+    sample_rows: list[dict[str, Any]] = []
+    for row in list(bpp_strikeout_rows.values())[:5]:
+        try:
+            sample_rows.append({
+                str(k): (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                for k, v in row.items()
+            })
+        except Exception:  # noqa: BLE001 - best-effort diagnostic
+            continue
+    k_diag.ballparkpal_sample_rows = sample_rows
+    for game in games:
+        for pitcher in _pitchers(game):
+            name = (pitcher.get("name") or "").strip()
+            if not name:
+                continue
+            k_diag.mlb_probable_pitchers_today.append({
+                "pitcher_name": name,
+                "team": pitcher.get("team"),
+                "game_pk": game.get("game_pk"),
+            })
+
+    odds_cache_blocks_totals = (
         games
         and diagnostics["fresh_odds_snapshots_found"] == 0
         and (diagnostics["markets_matched"] > 0 or not diagnostics["events_list_fresh"])
         and not force_stale
-    ):
+    )
+    if odds_cache_blocks_totals and not bpp_strikeout_rows:
         reason = "Odds cache stale; refresh required before edge scan."
         logger.warning("%s diagnostics=%s refresh=%s", reason, diagnostics, refresh.as_dict())
+        diagnostics["pitcher_k"] = k_diag.to_dict()
         return {
             "date": card_date,
             "generated_for_date": card_date,
@@ -117,8 +175,21 @@ async def run_daily_mlb_edges(
             "daily_card": latest_daily_card(db, card_date=card_date),
         }
 
-    db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
-    db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
+    if odds_cache_blocks_totals and bpp_strikeout_rows:
+        stale_total_edge_ids = (
+            select(MlbEdge.id)
+            .where(MlbEdge.generated_for_date == card_date)
+            .where(MlbEdge.edge_type == "pitcher_strikeouts")
+        )
+        db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(stale_total_edge_ids)))
+        db.execute(
+            delete(MlbEdge)
+            .where(MlbEdge.generated_for_date == card_date)
+            .where(MlbEdge.edge_type == "pitcher_strikeouts")
+        )
+    else:
+        db.execute(delete(MlbEdgeFactor).where(MlbEdgeFactor.edge_id.in_(select(MlbEdge.id).where(MlbEdge.generated_for_date == card_date))))
+        db.execute(delete(MlbEdge).where(MlbEdge.generated_for_date == card_date))
     logger.info(
         "MLB scan summary: games=%d odds_events=%d matched=%d unmatched_games=%d "
         "unmatched_events=%d refresh=%s",
@@ -149,7 +220,9 @@ async def run_daily_mlb_edges(
     from app.services.ballparkpal_integration import k_projection_index
     from app.services.mlb_pitcher_k_diagnostics import PitcherKDiagnostics
     from app.services.mlb_pitcher_k_fallback import (
-        FALLBACK_SOURCE,
+        CSV_EXECUTION_SOURCE,
+        CSV_MARKET_TYPE,
+        CSV_SOURCE,
         FallbackRejection,
         build_fallback_prop_analysis,
         is_fallback_payload,
@@ -174,6 +247,19 @@ async def run_daily_mlb_edges(
         for row in bpp_strikeout_rows.values()
         if row.get("pitcher")
     })
+    # First 5 raw rows verbatim so the dashboard can show the operator
+    # exactly what the validator is reading. JSON-safe coercion handles
+    # numpy/decimal values that might have slipped through the parser.
+    sample_rows: list[dict[str, Any]] = []
+    for row in list(bpp_strikeout_rows.values())[:5]:
+        try:
+            sample_rows.append({
+                str(k): (v if isinstance(v, (int, float, str, bool, type(None))) else str(v))
+                for k, v in row.items()
+            })
+        except Exception:  # noqa: BLE001 — best-effort diagnostic
+            continue
+    k_diag.ballparkpal_sample_rows = sample_rows
     # Today's MLB probable pitchers — what the engine actually tried to
     # match against the cache. Populated up front so even a 0-card scan
     # surfaces the comparison.
@@ -192,41 +278,53 @@ async def run_daily_mlb_edges(
     totals_count = 0
     pitcher_k_count = 0
     skipped_no_threshold = 0
+    external_pitcher_k_markets: list[dict[str, Any]] = []
+    if bpp_strikeout_rows:
+        try:
+            external_pitcher_k_markets = await fetch_external_pitcher_k_props(
+                game_date=card_date,
+            )
+        except Exception as exc:  # noqa: BLE001 - enrichment must not gate cards
+            logger.debug("External pitcher-K enrichment unavailable: %s", exc)
+            external_pitcher_k_markets = []
+    k_diag.external_pitcher_prop_markets_found = len(external_pitcher_k_markets)
     for game in games:
         _upsert_game(db, game)
         env = await _environment_for_game(db, weather, game)
         match = matches_by_game.get(int(game["game_pk"]))
+        payload: dict[str, Any] | None = None
         if match is None or not match.matched_event_id:
             diagnostics["skipped_missing_odds"] += 1
-            continue
-        state = odds_cache.event_odds_cache_state(db, match.matched_event_id)
-        if not state.get("fresh") and not force_stale:
-            diagnostics["skipped_stale_odds"] += 1
-            continue
-        payload = _resolve_cached_payload(db, match, fallback_stale=force_stale)
-        if payload is None:
-            diagnostics["skipped_missing_odds"] += 1
-            continue
-        totals_analysis = await _odds_for_game(db, game, payload)
-        if totals_analysis.get("book_count") and totals_analysis.get("is_valid", True):
-            totals_count += 1
-        if not totals_analysis.get("is_valid", True):
-            logger.warning(
-                "Skipping totals edges for game_pk=%s: %s",
-                game.get("game_pk"),
-                totals_analysis.get("validation_reason"),
-            )
         else:
-            for edge_payload in total_edges(
-                game=game,
-                odds_analysis=totals_analysis,
-                environment=env,
-                side_penalty_points=side_penalty_points,
-            ):
-                _apply_wallet_flow(db, edge_payload, game, card_date)
-                if (edge_payload.get("score") or 0) < 65:
-                    skipped_no_threshold += 1
-                created_edges.append(_persist_edge(db, edge_payload, card_date))
+            state = odds_cache.event_odds_cache_state(db, match.matched_event_id)
+            if not state.get("fresh") and not force_stale:
+                diagnostics["skipped_stale_odds"] += 1
+            else:
+                payload = _resolve_cached_payload(db, match, fallback_stale=force_stale)
+                if payload is None:
+                    diagnostics["skipped_missing_odds"] += 1
+
+        if payload is not None:
+            totals_analysis = await _odds_for_game(db, game, payload)
+            if totals_analysis.get("book_count") and totals_analysis.get("is_valid", True):
+                totals_count += 1
+            if not totals_analysis.get("is_valid", True):
+                logger.warning(
+                    "Skipping totals edges for game_pk=%s: %s",
+                    game.get("game_pk"),
+                    totals_analysis.get("validation_reason"),
+                )
+            else:
+                for edge_payload in total_edges(
+                    game=game,
+                    odds_analysis=totals_analysis,
+                    environment=env,
+                    side_penalty_points=side_penalty_points,
+                ):
+                    _apply_wallet_flow(db, edge_payload, game, card_date)
+                    if (edge_payload.get("score") or 0) < 65:
+                        skipped_no_threshold += 1
+                    created_edges.append(_persist_edge(db, edge_payload, card_date))
 
         game_pitchers = _pitchers(game)
         if game_pitchers:
@@ -261,11 +359,10 @@ async def run_daily_mlb_edges(
                         reason=(prop.get("validation_reason") or "no matching prop line"),
                     )
 
-                # BallparkPal fallback. Either the sportsbook prop didn't
-                # cover this pitcher, or the prop is unusable. Look up
-                # the pitcher in the strikeout cache and synthesize the
-                # same prop_analysis shape so pitcher_k_edges still runs.
-                if not sportsbook_usable and bpp_strikeout_rows:
+                # BallparkPal CSV is the primary Pitcher K source. The
+                # sportsbook prop cache is optional enrichment only; a
+                # missing external prop must not block a BPP K card.
+                if bpp_strikeout_rows:
                     bpp_row = _find_bpp_row_for_pitcher(
                         pitcher_name, bpp_strikeout_rows,
                     )
@@ -286,7 +383,7 @@ async def run_daily_mlb_edges(
                                 details=rej.details,
                             )
                             logger.info(
-                                "Pitcher K fallback rejected: pitcher=%s reason=%s details=%s",
+                                "Pitcher K BallparkPal CSV row rejected: pitcher=%s reason=%s details=%s",
                                 pitcher_name, rej.reason, rej.details,
                             )
                             fallback = None
@@ -295,8 +392,16 @@ async def run_daily_mlb_edges(
                                 pitcher_name=pitcher_name, bpp_row=bpp_row,
                             )
                         if fallback is not None:
+                            external_match = match_external_pitcher_k_prop(
+                                pitcher_name=pitcher_name,
+                                game_date=card_date,
+                                line=fallback.get("line"),
+                                markets=external_pitcher_k_markets,
+                            )
+                            if external_match is not None:
+                                fallback["external_pitcher_prop"] = external_match
+                                k_diag.external_pitcher_prop_markets_matched += 1
                             prop = fallback
-                            sportsbook_usable = True
                             k_diag.pitcher_names_matched_ballparkpal += 1
                             k_diag.candidates_built_from_ballparkpal_fallback += 1
                             k_diag.add_fallback_example({
@@ -304,6 +409,11 @@ async def run_daily_mlb_edges(
                                 "projected_k": fallback.get("ballparkpal_projected_k"),
                                 "line": fallback.get("line"),
                                 "over_price": fallback.get("best_over_price"),
+                                "source": fallback.get("source"),
+                                "execution_source": fallback.get("execution_source"),
+                                "external_market_url": (
+                                    external_match or {}
+                                ).get("market_url"),
                             })
                     else:
                         k_diag.pitcher_names_unmatched_ballparkpal += 1
@@ -371,8 +481,8 @@ async def run_daily_mlb_edges(
                     k_diag.candidates_built_total += 1
                     if is_fallback_payload(prop):
                         # Tag the persisted edge so the dashboard card
-                        # can render "BallparkPal fallback odds" instead
-                        # of the legacy sportsbook label.
+                        # can render "BallparkPal BP odds" instead of
+                        # the legacy sportsbook label.
                         #
                         # ``factors`` is iterated by _persist_edge as
                         # ``float(value)`` to build MlbEdgeFactor rows,
@@ -386,12 +496,23 @@ async def run_daily_mlb_edges(
                             "ballparkpal_projected_k"
                         )
                         sources = list(edge_payload.get("data_sources_used") or [])
-                        if FALLBACK_SOURCE not in sources:
-                            sources.append(FALLBACK_SOURCE)
+                        if CSV_SOURCE not in sources:
+                            sources.append(CSV_SOURCE)
                         edge_payload["data_sources_used"] = sources
-                        edge_payload["odds_source"] = FALLBACK_SOURCE
+                        edge_payload["odds_source"] = CSV_SOURCE
+                        edge_payload["odds_snapshot_source"] = CSV_SOURCE
+                        edge_payload["source"] = CSV_SOURCE
+                        edge_payload["execution_source"] = CSV_EXECUTION_SOURCE
+                        edge_payload["market_type"] = CSV_MARKET_TYPE
                         edge_payload["ballparkpal_projected_k"] = prop.get(
                             "ballparkpal_projected_k"
+                        )
+                        edge_payload["projected_strikeouts"] = prop.get(
+                            "ballparkpal_projected_k"
+                        )
+                        _attach_external_pitcher_k_enrichment(
+                            edge_payload,
+                            prop.get("external_pitcher_prop"),
                         )
                     else:
                         k_diag.candidates_built_from_sportsbook += 1
@@ -406,6 +527,11 @@ async def run_daily_mlb_edges(
                     "Pitcher K processing failed for game=%s pitcher=%s: %s",
                     game.get("game_pk"), pitcher.get("name"), exc,
                 )
+
+    k_diag.external_pitcher_prop_markets_found = (
+        k_diag.sportsbook_pitcher_k_props_loaded
+        + len(external_pitcher_k_markets)
+    )
 
     try:
         card = _build_daily_card(db, card_date, pitcher_k_diagnostics=k_diag)
@@ -748,6 +874,34 @@ def _apply_wallet_flow(
     payload["score"] = new_legacy
 
 
+def _attach_external_pitcher_k_enrichment(
+    payload: dict[str, Any],
+    external_market: dict[str, Any] | None,
+) -> None:
+    """Attach optional Kalshi/Polymarket execution data to a K edge."""
+    if not external_market:
+        return
+    external_side = str(external_market.get("side") or "").lower()
+    edge_side = str(payload.get("side") or "").lower()
+    if external_side and edge_side and external_side != edge_side:
+        return
+    wallet_context = dict(payload.get("wallet_context") or {})
+    execution = dict(wallet_context.get("execution") or {})
+    execution.update({
+        "platform": external_market.get("platform"),
+        "market_slug": external_market.get("market_slug"),
+        "market_url": external_market.get("market_url"),
+        "side_price": external_market.get("price"),
+        "implied_prob": external_market.get("implied_probability"),
+        "source": "external_pitcher_prop_market",
+    })
+    wallet_context["execution"] = execution
+    payload["wallet_context"] = wallet_context
+    payload["market_url"] = external_market.get("market_url")
+    payload["prediction_market_platform"] = external_market.get("platform")
+    payload["prediction_market_price"] = external_market.get("price")
+
+
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:
     edge = MlbEdge(
         game_pk=payload["game_pk"],
@@ -1029,9 +1183,13 @@ def _parse_dt(value: Any) -> datetime | None:
 
 def _implied_probability(price: Any) -> float | None:
     try:
-        decimal_price = float(price)
+        value = float(price)
     except (TypeError, ValueError):
         return None
-    if decimal_price <= 1:
+    if 1.0 < value < 50.0:
+        return round(1 / value, 4)
+    if abs(value) < 100:
         return None
-    return round(1 / decimal_price, 4)
+    if value > 0:
+        return round(100.0 / (value + 100.0), 4)
+    return round((-value) / ((-value) + 100.0), 4)

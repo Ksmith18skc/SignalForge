@@ -361,6 +361,8 @@ def compact_time_ago(value: Any, *, now: datetime | None = None) -> str:
 def odds_provider_label(source: Any) -> tuple[str, bool]:
     """('Odds-API.io' | 'SportsGameOdds', is_fallback). Defaults to primary."""
     raw = str(source or "").strip().lower()
+    if raw in {"ballparkpal_csv", "ballparkpal bp odds", "ballparkpal_fallback"}:
+        return ("BallparkPal BP odds", False)
     if "sports" in raw and "game" in raw:
         return ("SportsGameOdds", True)
     if raw in {"sportsgameodds", "sgo"}:
@@ -807,6 +809,13 @@ def edge_source_stack(edge: dict[str, Any]) -> list[tuple[str, str]]:
     out: list[tuple[str, str]] = []
 
     odds_edge = _to_float(factors.get("odds_edge"))
+    source_values = {str(s).lower() for s in (edge.get("data_sources_used") or [])}
+    if (
+        str(edge.get("source") or "").lower() == "ballparkpal_csv"
+        or "ballparkpal_csv" in source_values
+        or "ballparkpal_fallback" in source_values
+    ):
+        out.append(("BALLPARKPAL CSV", "cyan"))
     if odds_edge is not None and odds_edge >= _SPORTSBOOK_EDGE_MIN:
         out.append(("SPORTSBOOK EDGE", "green"))
     if "WALLET CONFIRMED" in tags:
