@@ -4254,14 +4254,17 @@ with tab_command:
         live_rows = []
         for pos in classified_live_positions:
             kind = pos.get("edge_match_kind") or "wallet_only"
-            badge = {
+            # Renamed from ``badge`` — the prior name shadowed the
+            # module-level ``badge()`` helper, which later sections
+            # (Recent Alerts, Wallet Flow tab) need to call.
+            match_status = {
                 "exact_line": "✅ Wallet Confirmed (exact line)",
                 "matchup_date": "✅ Wallet Confirmed (matchup)",
                 "sport_date": "wallet near edge",
                 "wallet_only": "wallet-only",
             }.get(kind, kind)
             live_rows.append({
-                "status": badge,
+                "status": match_status,
                 "trader": pos.get("wallet_nickname") or DASH,
                 "sport": pos.get("sport") or DASH,
                 "matchup": pos.get("market_title") or pos.get("market_slug") or DASH,
