@@ -31,5 +31,13 @@ def test_total_edges_emits_score_contributions():
     env = {"run_environment_score": 63, "under_environment_score": 60, "warnings": []}
     for edge in total_edges(game=game, odds_analysis=odds, environment=env):
         contribs = edge["score_contributions"]
+        # Contributions still cover exactly the weighted TOTAL_WEIGHTS keys
+        # - the new dual-axis scoring promotes projection / wallet /
+        # model_confidence / line_movement / clv_signal / market_quality
+        # to their own factors with zero weight in TOTAL_WEIGHTS, so they
+        # don't appear in the legacy contribution decomposition.
         assert set(contribs) == set(TOTAL_WEIGHTS)
+        # ``score`` is the unmodified legacy weighted score (penalties live
+        # on prediction_score, not the legacy axis), so the original
+        # additive invariant holds again.
         assert abs(sum(contribs.values()) - (edge["score"] - 50)) <= 0.05

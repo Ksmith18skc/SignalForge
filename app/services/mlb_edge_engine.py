@@ -30,6 +30,7 @@ from app.services.mlb_edge_scoring import (
     TOTAL_WEIGHTS,
     classify_edge,
     edge_to_dict,
+    watchlist_sort_key,
 )
 
 # Maps an edge_type to the weight map its score was built from, so persisted
@@ -129,6 +130,17 @@ async def run_daily_mlb_edges(
         refresh.reason,
     )
 
+    # Rolling per-side performance drives the side-underperformance
+    # penalty applied inside _total_edge. Looked up once per scan rather
+    # than per edge — the value is window-level, not per-game.
+    from app.services.mlb_performance import recent_side_performance
+
+    rolling_side_perf = recent_side_performance(db, today=card_date, edge_type="game_total")
+    side_penalty_points = {
+        side: float((rolling_side_perf.get("sides") or {}).get(side, {}).get("penalty_points") or 0.0)
+        for side in ("over", "under")
+    }
+
     created_edges: list[MlbEdge] = []
     totals_count = 0
     pitcher_k_count = 0
@@ -158,7 +170,12 @@ async def run_daily_mlb_edges(
                 totals_analysis.get("validation_reason"),
             )
         else:
-            for edge_payload in total_edges(game=game, odds_analysis=totals_analysis, environment=env):
+            for edge_payload in total_edges(
+                game=game,
+                odds_analysis=totals_analysis,
+                environment=env,
+                side_penalty_points=side_penalty_points,
+            ):
                 _apply_wallet_flow(db, edge_payload, game, card_date)
                 if (edge_payload.get("score") or 0) < 65:
                     skipped_no_threshold += 1
@@ -283,10 +300,11 @@ def edges_for_date(db: Session, *, card_date: str | None = None, limit: int = 10
             .where(MlbEdge.generated_for_date == target)
             .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
-            .limit(limit)
         )
     )
-    return [edge_to_dict(edge) for edge in edges]
+    payloads = [edge_to_dict(edge) for edge in edges]
+    payloads.sort(key=watchlist_sort_key, reverse=True)
+    return payloads[:limit]
 
 
 def discord_ready_summary(edge: MlbEdge) -> str:
@@ -295,12 +313,15 @@ def discord_ready_summary(edge: MlbEdge) -> str:
     reasons = "\n".join(f"- {reason}" for reason in (edge.reasons or [])[:3])
     warnings = "\n".join(f"- {warning}" for warning in (edge.warnings or [])[:3])
     warning_block = f"\nWarnings:\n{warnings}" if warnings else ""
+    prediction = edge.prediction_score if edge.prediction_score is not None else edge.score
+    execution = f"{edge.execution_score:.0f}" if edge.execution_score is not None else "N/A"
     return (
         f"MLB EDGE - {edge.edge_type.replace('_', ' ').title()}\n\n"
         f"Market: {edge.market}\n"
         f"Best line: {edge.side.title()} {edge.line if edge.line is not None else '?'} "
         f"at {edge.best_price if edge.best_price is not None else '?'} on {edge.best_book or 'N/A'}\n"
-        f"Score: {edge.score:.0f}\n"
+        f"Prediction score: {prediction:.0f}\n"
+        f"Execution score: {execution}\n"
         f"Confidence: {edge.confidence.title()}\n"
         f"Chase risk: {edge.chase_risk.title()}\n\n"
         f"Why:\n{reasons or '- Not enough supporting reasons'}{warning_block}\n\n"
@@ -490,9 +511,14 @@ def _apply_wallet_flow(
     game: dict[str, Any],
     card_date: str,
 ) -> None:
-    """Join tracked-wallet activity to a game-level edge, attach the
-    ``wallet_context`` payload, and fold its bounded ``confidence_adjustment``
-    into the score (re-deriving action/confidence so they stay consistent)."""
+    """Join tracked-wallet activity to a game-level edge.
+
+    Attaches the ``wallet_context`` payload, then recomputes
+    ``prediction_score`` with the now-known wallet_alignment factor.
+    The legacy ``score`` field still gets a bounded ``confidence_adjustment``
+    bump so the Pricing Edge tab keeps working unchanged.
+    """
+    from app.services.mlb_totals_model import recompute_with_wallet_alignment
     from app.services.wallet_flow import build_wallet_context
 
     try:
@@ -508,16 +534,22 @@ def _apply_wallet_flow(
         return
 
     payload["wallet_context"] = context
+
+    # 1) Refresh the prediction axis with the real wallet_alignment. This
+    # also re-runs penalties and re-classifies on prediction_score.
+    if payload.get("edge_type") == "game_total":
+        recompute_with_wallet_alignment(payload, wallet_context=context)
+
+    # 2) Preserve the legacy adjustment pathway so the legacy_score /
+    # Pricing Edge tab still reflect the wallet bump. The new prediction
+    # score is wallet-aware via the factor itself, not via this hack.
     adjustment = float(context.get("confidence_adjustment") or 0.0)
     if not adjustment:
         return
-
-    base_score = float(payload.get("score") or 0.0)
-    new_score = round(max(0.0, min(95.0, base_score + adjustment)), 2)
-    payload["score"] = new_score
-    cls = classify_edge(new_score, payload.get("warnings") or [])
-    payload["confidence"] = cls["confidence"]
-    payload["action"] = cls["action"]
+    base_legacy = float(payload.get("legacy_score") or payload.get("score") or 0.0)
+    new_legacy = round(max(0.0, min(95.0, base_legacy + adjustment)), 2)
+    payload["legacy_score"] = new_legacy
+    payload["score"] = new_legacy
 
 
 def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEdge:
@@ -549,6 +581,20 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
         market_scope=payload.get("market_scope"),
         is_valid=payload.get("is_valid", True),
         validation_reason=payload.get("validation_reason"),
+        # Persist the at-scan-time projection so the calibration report
+        # has a real projected-vs-actual residual to score against after
+        # grading. Pitcher-K edges don't emit a projection yet so the
+        # field stays NULL there.
+        model_projected_total=payload.get("model_projected_total"),
+        # Dual-score refactor columns. Pitcher-K edges leave the
+        # prediction/execution pair NULL until that side of the model
+        # gets its own factor set wired up.
+        prediction_score=payload.get("prediction_score"),
+        execution_score=payload.get("execution_score"),
+        legacy_score=payload.get("legacy_score") or payload.get("score"),
+        prediction_breakdown=payload.get("prediction_breakdown"),
+        execution_breakdown=payload.get("execution_breakdown"),
+        cheap_price_trap=payload.get("cheap_price_trap"),
     )
     db.add(edge)
     db.flush()
@@ -576,10 +622,37 @@ def _build_daily_card(db: Session, card_date: str) -> MlbDailyCard:
             .order_by(desc(MlbEdge.score))
         )
     )
-    totals = [edge_to_dict(e) for e in edges if e.edge_type == "game_total" and e.score >= 65][:5]
-    props = [edge_to_dict(e) for e in edges if e.edge_type == "pitcher_strikeouts" and e.score >= 65][:5]
-    near = [edge_to_dict(e) for e in edges if 55 <= e.score < 65][:5]
-    passes = [edge_to_dict(e) for e in edges if e.score < 55][:20]
+    payloads = [edge_to_dict(e) for e in edges]
+
+    def _decision_score(payload: dict[str, Any]) -> float:
+        value = payload.get("prediction_score")
+        if value is None:
+            value = payload.get("score")
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    totals_all = sorted(
+        [p for p in payloads if p.get("edge_type") == "game_total"],
+        key=watchlist_sort_key,
+        reverse=True,
+    )
+    props_all = sorted(
+        [p for p in payloads if p.get("edge_type") == "pitcher_strikeouts"],
+        key=lambda p: float(p.get("score") or 0.0),
+        reverse=True,
+    )
+    totals = [p for p in totals_all if _decision_score(p) >= 65][:5]
+    props = [p for p in props_all if _decision_score(p) >= 65][:5]
+    near = [
+        p for p in sorted(payloads, key=watchlist_sort_key, reverse=True)
+        if 55 <= _decision_score(p) < 65
+    ][:5]
+    passes = [
+        p for p in sorted(payloads, key=watchlist_sort_key, reverse=True)
+        if _decision_score(p) < 55
+    ][:20]
     summary = {
         "edge_count": len(edges),
         "high_confidence": sum(1 for e in edges if e.confidence == "high"),

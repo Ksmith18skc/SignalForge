@@ -182,6 +182,13 @@ def _ensure_mlb_edge_validation_columns() -> None:
         _add_sqlite_column_if_missing("mlb_edges", "model_projected_total", "FLOAT")
         _add_sqlite_column_if_missing("mlb_edges", "closing_snapshot_at", "DATETIME")
         _add_sqlite_column_if_missing("mlb_edges", "actual_total", "FLOAT")
+        # Dual-score refactor columns.
+        _add_sqlite_column_if_missing("mlb_edges", "prediction_score", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "execution_score", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "legacy_score", "FLOAT")
+        _add_sqlite_column_if_missing("mlb_edges", "prediction_breakdown", "JSON")
+        _add_sqlite_column_if_missing("mlb_edges", "execution_breakdown", "JSON")
+        _add_sqlite_column_if_missing("mlb_edges", "cheap_price_trap", "BOOLEAN")
         return
     if dialect.startswith("postgres"):
         statements = [
@@ -194,6 +201,13 @@ def _ensure_mlb_edge_validation_columns() -> None:
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS model_projected_total DOUBLE PRECISION",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS closing_snapshot_at TIMESTAMP",
             "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS actual_total DOUBLE PRECISION",
+            # Dual-score refactor columns.
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS prediction_score DOUBLE PRECISION",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS execution_score DOUBLE PRECISION",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS legacy_score DOUBLE PRECISION",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS prediction_breakdown JSONB",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS execution_breakdown JSONB",
+            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS cheap_price_trap BOOLEAN",
         ]
         try:
             with engine.begin() as conn:

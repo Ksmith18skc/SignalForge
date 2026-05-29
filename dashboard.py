@@ -874,6 +874,47 @@ def fmt_score(value: Any) -> str:
         return DASH
 
 
+def edge_prediction_score(edge: dict[str, Any]) -> float:
+    value = edge.get("prediction_score")
+    if value is None:
+        value = edge.get("score")
+    return _as_float(value) or 0.0
+
+
+def edge_execution_score(edge: dict[str, Any]) -> float:
+    return _as_float(edge.get("execution_score")) or 0.0
+
+
+def edge_wallet_alignment_score(edge: dict[str, Any]) -> float:
+    return _as_float((edge.get("factors") or {}).get("wallet_alignment")) or 0.0
+
+
+def edge_legacy_score(edge: dict[str, Any]) -> float:
+    value = edge.get("legacy_score")
+    if value is None:
+        value = edge.get("score")
+    return _as_float(value) or 0.0
+
+
+def edge_decision_sort_key(edge: dict[str, Any]) -> tuple[float, float, float]:
+    return (
+        edge_prediction_score(edge),
+        edge_wallet_alignment_score(edge),
+        edge_execution_score(edge),
+    )
+
+
+def edge_pricing_sort_key(edge: dict[str, Any]) -> tuple[float, float, float]:
+    factors = edge.get("factors") or {}
+    price_edge = (
+        _as_float(factors.get("sportsbook_price_edge"))
+        or _as_float(factors.get("price_edge"))
+        or _as_float(factors.get("odds_edge"))
+        or 0.0
+    )
+    return (edge_legacy_score(edge), price_edge, edge_execution_score(edge))
+
+
 def fmt_pct(value: Any, *, default: str = DASH) -> str:
     if value is None:
         return default
@@ -1755,8 +1796,25 @@ def _render_execution(edge: dict[str, Any]) -> str:
     rows = executable_edge_rows(edge)
     best = best_executable_edge(edge)
     sf_fair = _as_float(edge.get("sf_fair_probability") or edge.get("calibrated_probability"))
+    factors = edge.get("factors") or {}
+    sportsbook_edge = (
+        _as_float(factors.get("sportsbook_price_edge"))
+        or _as_float(factors.get("price_edge"))
+        or _as_float(factors.get("odds_edge"))
+    )
 
     cells: list[str] = []
+    if edge.get("execution_score") is not None:
+        cells.append(
+            "<div class='sf-price-cell'><div class='lbl'>Execution Score</div>"
+            f"<div class='val'><span class='sf-score {score_class(edge.get('execution_score'))}'>"
+            f"{fmt_score(edge.get('execution_score'))}</span></div></div>"
+        )
+    if sportsbook_edge is not None:
+        cells.append(
+            "<div class='sf-price-cell'><div class='lbl'>Sportsbook Price Edge</div>"
+            f"<div class='val'>{sportsbook_edge:.1f}</div></div>"
+        )
     have_pm = any("Polymarket" in r["venue"] or "Kalshi" in r["venue"] for r in rows)
     for r in rows:
         price = r.get("price")
@@ -1791,6 +1849,90 @@ def _render_execution(edge: dict[str, Any]) -> str:
     )
 
 
+_BREAKDOWN_LABELS = {
+    "projection_edge": "Projection edge",
+    "wallet_alignment": "Wallet alignment",
+    "pitcher_matchup": "Pitcher matchup",
+    "environment": "Environment",
+    "model_confidence": "Model confidence",
+    "sportsbook_price_edge": "Sportsbook price edge",
+    "line_movement": "Line movement",
+    "clv_signal": "CLV signal",
+    "market_quality": "Market quality",
+}
+
+
+def _render_axis_breakdown(
+    edge: dict[str, Any],
+    *,
+    axis: str,
+    title: str,
+    score_key: str,
+    breakdown_key: str,
+) -> str:
+    breakdown = edge.get(breakdown_key) or {}
+    if not isinstance(breakdown, dict) or not breakdown:
+        return ""
+    factors = edge.get("factors") or {}
+    rows: list[str] = []
+    for name, contribution in breakdown.items():
+        try:
+            pts = float(contribution)
+        except (TypeError, ValueError):
+            continue
+        raw = factors.get(name)
+        if raw is None and name == "sportsbook_price_edge":
+            raw = factors.get("price_edge") or factors.get("odds_edge")
+        raw_float = _as_float(raw)
+        raw_label = (
+            f"<span class='sf-meta'>{raw_float:.1f}</span>"
+            if raw_float is not None
+            else ""
+        )
+        kind = "pos" if pts >= 0 else "neg"
+        label = _BREAKDOWN_LABELS.get(name, name.replace("_", " ").title())
+        rows.append(
+            "<div class='sf-contrib-row'>"
+            f"<span class='lbl'>{html.escape(label)}</span>"
+            f"{raw_label}<span class='sf-contrib-pts {kind}'>{pts:+.1f}</span>"
+            "</div>"
+        )
+    if not rows:
+        return ""
+    score = edge.get(score_key)
+    score_line = (
+        f"<div class='sf-meta'>Baseline 50 + factor contributions; {axis} score {fmt_score(score)}</div>"
+        if score is not None
+        else "<div class='sf-meta'>Baseline 50 + contributions</div>"
+    )
+    return (
+        f"<div class='sf-section'><div class='sf-section-title'>{title}</div>"
+        + "".join(rows)
+        + score_line
+        + "</div>"
+    )
+
+
+def _render_prediction_breakdown(edge: dict[str, Any]) -> str:
+    return _render_axis_breakdown(
+        edge,
+        axis="prediction",
+        title="Prediction Breakdown",
+        score_key="prediction_score",
+        breakdown_key="prediction_breakdown",
+    )
+
+
+def _render_execution_breakdown(edge: dict[str, Any]) -> str:
+    return _render_axis_breakdown(
+        edge,
+        axis="execution",
+        title="Execution Breakdown",
+        score_key="execution_score",
+        breakdown_key="execution_breakdown",
+    )
+
+
 def _render_history(edge: dict[str, Any]) -> str:
     """#4 Historical regime performance — record of similar graded edges."""
     band = edge.get("score_band_performance") or {}
@@ -1820,7 +1962,8 @@ def _render_history(edge: dict[str, Any]) -> str:
 
 def _render_score_interpretation(edge: dict[str, Any]) -> str:
     """#5 Score interpretation — conviction tier + calibrated hit probability."""
-    tier_label, tier_kind = conviction_tier(edge.get("score"))
+    score = edge.get("prediction_score") if edge.get("prediction_score") is not None else edge.get("score")
+    tier_label, tier_kind = conviction_tier(score)
     calibrated = _as_float(edge.get("calibrated_probability"))
     band = edge.get("score_band_performance") or {}
     cal_str = _pct(calibrated) if calibrated is not None else "uncalibrated"
@@ -1831,7 +1974,7 @@ def _render_score_interpretation(edge: dict[str, Any]) -> str:
             f"{band.get('losses', 0)}-{band.get('pushes', 0)}</span>"
         )
     return (
-        "<div class='sf-section'><div class='sf-section-title'>Score interpretation</div>"
+        "<div class='sf-section'><div class='sf-section-title'>Prediction interpretation</div>"
         f"<div>{_pill(tier_label, tier_kind)} "
         f"<span class='sf-meta'>calibrated hit prob: {cal_str}</span>{record}</div></div>"
     )
@@ -1873,10 +2016,34 @@ def _render_score_decomposition(edge: dict[str, Any]) -> str:
     )
 
 
+_EXECUTION_FACTOR_KEYS = {
+    "odds_edge",
+    "price_edge",
+    "sportsbook_price_edge",
+    "movement",
+    "line_movement",
+    "clv_signal",
+    "market_quality",
+}
+
+
+def _non_execution_factors(edge: dict[str, Any]) -> dict[str, Any]:
+    factors = edge.get("factors") or {}
+    if edge.get("prediction_score") is None:
+        return factors
+    return {
+        key: value
+        for key, value in factors.items()
+        if key not in _EXECUTION_FACTOR_KEYS
+    }
+
+
 def render_edge_card(edge: dict[str, Any]) -> None:
     """Premium edge card. Single source of truth for the visual hierarchy
     used across Command Center, MLB Terminal, Daily Card."""
-    score = edge.get("score")
+    score = edge.get("prediction_score") if edge.get("prediction_score") is not None else edge.get("score")
+    prediction_score = edge.get("prediction_score")
+    execution_score = edge.get("execution_score")
     label, label_kind = confidence_label_fn(
         score,
         edge.get("action"),
@@ -1919,10 +2086,18 @@ def render_edge_card(edge: dict[str, Any]) -> None:
         or edge.get("signalforge_probability")
         or edge.get("estimated_probability")
     )
-    prob_row_parts: list[str] = [
-        f"<div class='sf-prob-cell'><div class='lbl'>Score</div>"
-        f"<div class='val'><span class='sf-score {score_class(score)}'>{fmt_score(score)}</span></div></div>"
-    ]
+    if prediction_score is not None or execution_score is not None:
+        prob_row_parts: list[str] = [
+            f"<div class='sf-prob-cell'><div class='lbl'>Prediction Score</div>"
+            f"<div class='val'><span class='sf-score {score_class(score)}'>{fmt_score(score)}</span></div></div>",
+            f"<div class='sf-prob-cell'><div class='lbl'>Execution Score</div>"
+            f"<div class='val'><span class='sf-score {score_class(execution_score)}'>{fmt_score(execution_score)}</span></div></div>",
+        ]
+    else:
+        prob_row_parts = [
+            f"<div class='sf-prob-cell'><div class='lbl'>Score</div>"
+            f"<div class='val'><span class='sf-score {score_class(score)}'>{fmt_score(score)}</span></div></div>"
+        ]
     if sf_prob is not None:
         prob_row_parts.append(
             "<div class='sf-prob-cell'>"
@@ -1942,7 +2117,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     factors = edge.get("factors") or {}
 
     # --- Prioritized sections (#10 visual hierarchy) ---
-    # Top-of-card status badges (Wallet Confirmed / Sportsbook Edge /
+    # Top-of-card status badges (Wallet Confirmed / Cheap Price Trap /
     # Prediction Market Listed / Stale Odds / etc.) replace the older
     # technical pill stack so the homepage reads like a trader card.
     primary_badges = _primary_badges(edge)
@@ -1956,7 +2131,8 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     history_section = _render_history(edge)            # 4
     interp_section = _render_score_interpretation(edge)  # 5
     risk_section = _render_risk_flags(edge)            # 6
-    decomp_section = _render_score_decomposition(edge)  # 7
+    prediction_breakdown = _render_prediction_breakdown(edge)
+    execution_breakdown = _render_execution_breakdown(edge)
     time_block = render_time_context(edge)             # 8
     links_html = render_link_buttons([                 # 9
         ("Market", (edge.get("wallet_context") or {}).get("execution", {}).get("market_url") if isinstance((edge.get("wallet_context") or {}).get("execution"), dict) else None),
@@ -1982,11 +2158,9 @@ def render_edge_card(edge: dict[str, Any]) -> None:
 
     # Technical factors demoted into a collapsed block (was the primary view).
     technical = (
-        render_market_price_block(edge)
-        + _render_model_vs_market(edge)
+        _render_model_vs_market(edge)
         + _render_recent_form(edge)
-        + _render_movement_clv(edge)
-        + render_factor_bars(factors)
+        + render_factor_bars(_non_execution_factors(edge))
         + ("<div class='sf-section'><div class='sf-section-title'>Why we like it</div>" + reasons_html + "</div>" if reasons_html else "")
         + "<div class='sf-section'>" + render_trust_tags(edge, odds_source=odds_source, fallback=fallback) + "</div>"
     )
@@ -2015,7 +2189,8 @@ def render_edge_card(edge: dict[str, Any]) -> None:
       {history_section}
       {interp_section}
       {risk_section}
-      {decomp_section}
+      {prediction_breakdown}
+      {execution_breakdown}
       {links_html}
       {technical_block}
     </div>
@@ -2061,8 +2236,8 @@ _PRIMARY_BADGE_STYLES: dict[str, str] = {
     # Operator-friendly labels — replaces the older technical-jargon
     # pills (SRC FALCON / WALLET CONFIRMED / etc.) on the homepage.
     "Wallet Confirmed":          "green",
-    "Sportsbook Edge":           "gold",
     "Prediction Market Listed":  "purple",
+    "Cheap Price Trap":          "red",
     "Stale Odds":                "red",
     "No Wallet Data":            "muted",
     "Needs Review":              "red",
@@ -2087,11 +2262,8 @@ def _primary_badges(signal: dict[str, Any]) -> str:
         # that's "no wallet data", not silence.
         badges.append("No Wallet Data")
 
-    if signal.get("best_price") is not None or (
-        isinstance(signal.get("execution"), dict)
-        and (signal["execution"].get("price") or signal["execution"].get("side_price"))
-    ):
-        badges.append("Sportsbook Edge")
+    if signal.get("cheap_price_trap"):
+        badges.append("Cheap Price Trap")
 
     if signal.get("market_url") and "polymarket.com" in str(signal.get("market_url")):
         badges.append("Prediction Market Listed")
@@ -2363,7 +2535,7 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             "</div>"
         )
 
-    # Top-of-card primary badges (Wallet Confirmed / Sportsbook Edge /
+    # Top-of-card primary badges (Wallet Confirmed / Cheap Price Trap /
     # Stale Odds / etc.). Same operator-friendly set the edge card uses,
     # so the homepage reads consistently across signal sources.
     primary_badges_html = _primary_badges(signal)
@@ -2427,7 +2599,13 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             )
 
 
-def render_score_distribution(edges: list[dict[str, Any]], *, threshold: float = SCORE_HIGH_CONV_MIN) -> None:
+def render_score_distribution(
+    edges: list[dict[str, Any]],
+    *,
+    threshold: float = SCORE_HIGH_CONV_MIN,
+    score_key: str = "score",
+    label: str = "Score",
+) -> None:
     """Render score-bucket bars + summary stats (top, median, std, count
     above threshold). Helps explain why few high-conviction cards appear."""
     if not edges:
@@ -2438,7 +2616,10 @@ def render_score_distribution(edges: list[dict[str, Any]], *, threshold: float =
         return
     scores = []
     for e in edges:
-        s = _as_float(e.get("score"))
+        value = e.get(score_key)
+        if value is None and score_key != "score":
+            value = e.get("score")
+        s = _as_float(value)
         if s is not None:
             scores.append(s)
     if not scores:
@@ -2474,8 +2655,8 @@ def render_score_distribution(edges: list[dict[str, Any]], *, threshold: float =
     above = sum(1 for s in scores if s >= threshold)
 
     metric_cols = st.columns(4)
-    metric_cols[0].metric("Top score today", f"{top:.1f}")
-    metric_cols[1].metric("Median score", f"{median:.1f}")
+    metric_cols[0].metric(f"Top {label.lower()} today", f"{top:.1f}")
+    metric_cols[1].metric(f"Median {label.lower()}", f"{median:.1f}")
     metric_cols[2].metric("Std deviation", f"{stdev:.1f}")
     metric_cols[3].metric(
         f"Above {int(threshold)}",
@@ -2485,7 +2666,7 @@ def render_score_distribution(edges: list[dict[str, Any]], *, threshold: float =
     )
     st.markdown(
         "<div class='sf-card'>"
-        "<div class='sf-section-title'>Score Distribution</div>"
+        f"<div class='sf-section-title'>{label} Distribution</div>"
         + "".join(rows)
         + "</div>",
         unsafe_allow_html=True,
@@ -2500,10 +2681,10 @@ def render_why_no_high_conviction(
     numbers."""
     if not edges:
         return
-    high_conv = [e for e in edges if (_as_float(e.get("score")) or 0.0) >= threshold]
+    high_conv = [e for e in edges if edge_prediction_score(e) >= threshold]
     if high_conv:
         return
-    scores = [s for s in (_as_float(e.get("score")) for e in edges) if s is not None]
+    scores = [edge_prediction_score(e) for e in edges]
     top = max(scores) if scores else 0.0
     downgraded = sum(1 for e in edges if (e.get("warnings") or []))
     missing_history = sum(
@@ -2517,7 +2698,7 @@ def render_why_no_high_conviction(
     body = (
         "<div class='sf-card'>"
         "<div class='sf-section-title'>Why no high-conviction edges?</div>"
-        f"<div class='sf-card-row'>Top score today: <b>{top:.1f}</b></div>"
+        f"<div class='sf-card-row'>Top prediction score today: <b>{top:.1f}</b></div>"
         f"<div class='sf-card-row'>Required threshold: <b>{int(threshold)}</b></div>"
         f"<div class='sf-card-row'>Edges downgraded by warnings: <b>{downgraded}</b></div>"
         f"<div class='sf-card-row'>Edges missing history: <b>{missing_history}</b></div>"
@@ -3172,6 +3353,16 @@ def fetch_mlb_performance(
         "summary": safe_get("/mlb/performance/summary", default={}, params=params or None),
         "by_market": safe_get("/mlb/performance/by-market", default=[], params=params or None),
         "by_score_band": safe_get("/mlb/performance/by-score-band", default=[], params=params or None),
+        "by_prediction_score_band": safe_get(
+            "/mlb/performance/by-score-axis",
+            default=[],
+            params={**params, "axis": "prediction"} if params else {"axis": "prediction"},
+        ),
+        "by_execution_score_band": safe_get(
+            "/mlb/performance/by-score-axis",
+            default=[],
+            params={**params, "axis": "execution"} if params else {"axis": "execution"},
+        ),
         "clv": safe_get("/mlb/performance/clv", default={}, params=params or None),
         # Research-upgrade additions. Each endpoint degrades to {} or [] when
         # absent so older backends keep rendering the dashboard.
@@ -3192,6 +3383,25 @@ def fetch_mlb_performance(
         ),
         "factor_attribution": safe_get(
             "/mlb/performance/factor-attribution", default=[], params=params or None,
+        ),
+        # Factor-distribution audit + score-attribution report drive the
+        # "is this factor dead weight?" diagnostics on the perf tab. Both
+        # degrade to empty payloads on older backends.
+        "factor_distribution": safe_get(
+            "/mlb/performance/factor-distribution",
+            default={"factors": [], "summary": {}},
+            params=params or None,
+        ),
+        "score_attribution": safe_get(
+            "/mlb/performance/score-attribution",
+            default={"factors": []},
+            params=params or None,
+        ),
+        # Rolling per-side performance is window-agnostic (the engine's
+        # 14-day lookback) so it does NOT use the current perf-tab params.
+        "recent_side_performance": safe_get(
+            "/mlb/performance/recent-side-performance",
+            default={"sides": {}},
         ),
     }
     return out
@@ -3485,7 +3695,7 @@ odds_cache_meta = odds_block.get("cache", {}) or {}
 
 # Computed metrics used both in the header strip and the Command Center.
 mlb_actionable = [e for e in mlb_edges_all if str(e.get("action") or "").lower() != "pass"]
-high_conviction = [e for e in mlb_edges_all if (e.get("score") or 0) >= 85]
+high_conviction = [e for e in mlb_edges_all if edge_prediction_score(e) >= 85]
 missing_odds_edges = [
     e for e in mlb_edges_all
     if any("odds" in str(w).lower() for w in (e.get("warnings") or []))
@@ -3895,6 +4105,7 @@ m4.metric("High Conviction", len(high_conviction))
 (
     tab_command,
     tab_mlb,
+    tab_pricing_edge,
     tab_wallet,
     tab_pnl,
     tab_perf,
@@ -3906,6 +4117,7 @@ m4.metric("High Conviction", len(high_conviction))
 ) = st.tabs([
     "Command Center",
     "MLB Terminal",
+    "Pricing Edge",
     "Wallet Flow",
     "P&L Tracker",
     "Performance / CLV",
@@ -3966,11 +4178,11 @@ with tab_command:
         top_decisions = sorted(
             [
                 e for e in mlb_edges_all
-                if (e.get("score") or 0) >= SCORE_ACTIONABLE_MIN
+                if edge_prediction_score(e) >= SCORE_ACTIONABLE_MIN
                 and str(e.get("action") or "").lower() != "pass"
                 and not e.get("odds_stale")
             ],
-            key=lambda e: e.get("score") or 0,
+            key=edge_decision_sort_key,
             reverse=True,
         )[:5]
         if top_decisions:
@@ -4007,8 +4219,8 @@ with tab_command:
 
         st.markdown("### Watchlist Candidates")
         watchlist_candidates = [
-            e for e in mlb_edges_all
-            if SCORE_ACTIONABLE_MIN <= (e.get("score") or 0) < SCORE_STRONG_MIN
+            e for e in sorted(mlb_edges_all, key=edge_decision_sort_key, reverse=True)
+            if SCORE_ACTIONABLE_MIN <= edge_prediction_score(e) < SCORE_STRONG_MIN
             and str(e.get("action") or "").lower().startswith("watch")
         ][:5]
         if watchlist_candidates:
@@ -4166,7 +4378,11 @@ with tab_mlb:
             actions=[("Refresh odds cache", action_refresh_odds_cache)],
         )
     else:
-        render_score_distribution(mlb_edges_all)
+        render_score_distribution(
+            mlb_edges_all,
+            score_key="prediction_score",
+            label="Prediction Score",
+        )
 
     st.markdown("### All Edges")
     if mlb_edges_all:
@@ -4178,6 +4394,14 @@ with tab_mlb:
             if show_pass_candidates
             else [e for e in mlb_edges_all if str(e.get("action") or "").lower() != "pass"]
         )
+        # Watchlist ranking: prediction_score → wallet_alignment →
+        # execution_score. The original legacy_score lives on the
+        # Pricing Edge tab for the sportsbook-edge-first view.
+        terminal_rows = sorted(
+            terminal_rows,
+            key=edge_decision_sort_key,
+            reverse=True,
+        )
         if not terminal_rows:
             render_empty_state(
                 "NO NON-PASS EDGES",
@@ -4186,8 +4410,15 @@ with tab_mlb:
         else:
             df_edges = pd.DataFrame([
                 {
-                    "score": e.get("score"),
-                    "label": confidence_label_fn(e.get("score"), e.get("action"), e.get("confidence"))[0],
+                    "prediction": e.get("prediction_score"),
+                    "execution": e.get("execution_score"),
+                    "trap": "⚠ trap" if e.get("cheap_price_trap") else "",
+                    "wallet_align": (e.get("factors") or {}).get("wallet_alignment"),
+                    "label": confidence_label_fn(
+                        e.get("prediction_score") if e.get("prediction_score") is not None else e.get("score"),
+                        e.get("action"),
+                        e.get("confidence"),
+                    )[0],
                     "action": e.get("action"),
                     "confidence": confidence_word(e.get("confidence"))[0],
                     "type": (e.get("edge_type") or "").replace("_", " "),
@@ -4213,11 +4444,19 @@ with tab_mlb:
                 hide_index=True,
                 height=min(420, 60 + 32 * max(len(df_edges), 1)),
                 column_config={
-                    "score": st.column_config.NumberColumn("score", format="%.1f"),
+                    "prediction": st.column_config.NumberColumn("prediction", format="%.1f"),
+                    "execution": st.column_config.NumberColumn("execution", format="%.1f"),
+                    "wallet_align": st.column_config.NumberColumn("wallet aligned", format="%.1f"),
+                    "trap": st.column_config.TextColumn("trap"),
                     "line": st.column_config.NumberColumn("line", format="%.1f"),
                     "best_price": st.column_config.TextColumn("best price (US)"),
                     "implied_prob": st.column_config.TextColumn("implied %"),
                 },
+            )
+            st.caption(
+                "Watchlist sort order: prediction_score → wallet_alignment → "
+                "execution_score. 'trap' fires when execution ≥70 but "
+                "prediction <65 (high price, weak model)."
             )
     else:
         render_empty_state(
@@ -4255,6 +4494,102 @@ with tab_mlb:
     dq_cols = st.columns(len(cards))
     for col, (label, value) in zip(dq_cols, cards):
         col.metric(label, value)
+
+
+# =============================================================================
+# Pricing Edge
+# =============================================================================
+
+with tab_pricing_edge:
+    st.markdown("### Pricing Edge View")
+    st.caption(
+        "Legacy sportsbook-edge-heavy view. Ranking here uses legacy_score, "
+        "sportsbook price edge, and execution_score. It does not drive the "
+        "main watchlist ranking."
+    )
+    pricing_rows = sorted(mlb_edges_all, key=edge_pricing_sort_key, reverse=True)
+    if not pricing_rows:
+        render_empty_state(
+            "NO PRICING EDGES",
+            (
+                "Odds cache stale; refresh odds before running the edge scan."
+                if mlb_blocked_by_stale_odds
+                else "Run the MLB edge scan to populate pricing edges."
+            ),
+            actions=[("Refresh odds cache", action_refresh_odds_cache)],
+        )
+    else:
+        df_pricing = pd.DataFrame([
+            {
+                "legacy_score": edge_legacy_score(e),
+                "sportsbook_price_edge": (
+                    _as_float((e.get("factors") or {}).get("sportsbook_price_edge"))
+                    or _as_float((e.get("factors") or {}).get("price_edge"))
+                    or _as_float((e.get("factors") or {}).get("odds_edge"))
+                ),
+                "execution": e.get("execution_score"),
+                "prediction": e.get("prediction_score"),
+                "trap": "trap" if e.get("cheap_price_trap") else "",
+                "market": e.get("market"),
+                "side": (e.get("side") or "").title(),
+                "line": e.get("line"),
+                "best_book": e.get("best_book") or DASH,
+                "best_price": american_from_price(e.get("best_price")) or DASH,
+                "line_movement": (e.get("factors") or {}).get("line_movement")
+                    or (e.get("factors") or {}).get("movement"),
+                "clv_signal": (e.get("factors") or {}).get("clv_signal"),
+                "market_quality": (e.get("factors") or {}).get("market_quality"),
+                "action": e.get("action"),
+            }
+            for e in pricing_rows
+        ]).fillna(DASH)
+        st.dataframe(
+            df_pricing,
+            use_container_width=True,
+            hide_index=True,
+            height=min(520, 60 + 32 * len(df_pricing)),
+            column_config={
+                "legacy_score": st.column_config.NumberColumn("legacy score", format="%.1f"),
+                "sportsbook_price_edge": st.column_config.NumberColumn("sportsbook edge", format="%.1f"),
+                "execution": st.column_config.NumberColumn("execution", format="%.1f"),
+                "prediction": st.column_config.NumberColumn("prediction", format="%.1f"),
+                "line": st.column_config.NumberColumn("line", format="%.1f"),
+                "best_price": st.column_config.TextColumn("best price (US)"),
+                "line_movement": st.column_config.NumberColumn("line movement", format="%.1f"),
+                "clv_signal": st.column_config.NumberColumn("CLV signal", format="%.1f"),
+                "market_quality": st.column_config.NumberColumn("market quality", format="%.1f"),
+            },
+        )
+
+        st.markdown("### Top Pricing Cards")
+        for e in pricing_rows[:5]:
+            factors = e.get("factors") or {}
+            title = html.escape(str(format_card_title(e)))
+            legacy = edge_legacy_score(e)
+            price_edge = (
+                _as_float(factors.get("sportsbook_price_edge"))
+                or _as_float(factors.get("price_edge"))
+                or _as_float(factors.get("odds_edge"))
+            )
+            trap = _pill("Cheap Price Trap", "red") if e.get("cheap_price_trap") else ""
+            body = (
+                "<div class='sf-card'>"
+                "<div class='sf-card-head'>"
+                f"<div><div class='sf-card-title'>{title}</div>"
+                f"<div class='sf-card-sub'>{html.escape(str(e.get('market') or DASH))}</div></div>"
+                "<div class='sf-prob-row' style='margin-left:auto;'>"
+                f"<div class='sf-prob-cell'><div class='lbl'>Legacy Score</div>"
+                f"<div class='val'><span class='sf-score {score_class(legacy)}'>{fmt_score(legacy)}</span></div></div>"
+                f"<div class='sf-prob-cell'><div class='lbl'>Sportsbook Edge</div>"
+                f"<div class='val'>{fmt_score(price_edge)}</div></div>"
+                "</div></div>"
+                f"<div class='sf-card-row'>{trap}</div>"
+                f"{render_market_price_block(e)}"
+                f"{_render_movement_clv(e)}"
+                f"{render_factor_bars(factors)}"
+                "</div>"
+            )
+            st.markdown(body, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -4499,6 +4834,9 @@ def build_performance_export_markdown(
             ("Backend window end", backend_end or "all available"),
             ("Arizona today", arizona_today_iso),
             ("Graded edges in window", perf_summary.get("graded_edges") or 0),
+            ("Average prediction score", perf_summary.get("average_prediction_score")),
+            ("Average execution score", perf_summary.get("average_execution_score")),
+            ("Average legacy score", perf_summary.get("average_legacy_score")),
         ])
     )
 
@@ -4595,8 +4933,8 @@ def build_performance_export_markdown(
         ])
     )
 
-    # --- Score Band Performance ------------------------------------------
-    parts.append("\n## Score Band Performance\n")
+    # --- Legacy Score Band Performance -----------------------------------
+    parts.append("\n## Legacy Score Band Performance\n")
     by_band = mlb_performance.get("by_score_band") or []
     if by_band:
         parts.append(_md_table(by_band))
@@ -4610,6 +4948,22 @@ def build_performance_export_markdown(
             )
     else:
         parts.append("_No score-band breakdown yet._\n")
+
+    parts.append("\n## Prediction Score Band Performance\n")
+    by_prediction_band = mlb_performance.get("by_prediction_score_band") or []
+    parts.append(
+        _md_table(by_prediction_band)
+        if by_prediction_band
+        else "_No prediction-score breakdown yet._\n"
+    )
+
+    parts.append("\n## Execution Score Band Performance\n")
+    by_execution_band = mlb_performance.get("by_execution_score_band") or []
+    parts.append(
+        _md_table(by_execution_band)
+        if by_execution_band
+        else "_No execution-score breakdown yet._\n"
+    )
 
     # --- Projection Calibration ------------------------------------------
     cal = mlb_performance.get("projection_calibration") or {}
@@ -4656,6 +5010,69 @@ def build_performance_export_markdown(
             )
     else:
         parts.append("_No factor attribution available._\n")
+
+    # --- Factor Distribution Audit ---------------------------------------
+    fdist = mlb_performance.get("factor_distribution") or {}
+    parts.append("\n## Factor Distribution Audit\n")
+    fdist_rows = fdist.get("factors") or []
+    fdist_summary = fdist.get("summary") or {}
+    if fdist_rows:
+        parts.append(_md_table(fdist_rows))
+        stuck = fdist_summary.get("stuck_at_neutral_factors") or []
+        no_info = fdist_summary.get("no_information_factors") or []
+        if stuck:
+            stuck_labels = ", ".join(
+                f"{r.get('factor')} ({(r.get('rate') or 0)*100:.0f}%)" for r in stuck
+            )
+            parts.append(
+                f"\n> Stuck at neutral 50 ≥95%: {stuck_labels}\n"
+            )
+        if no_info:
+            no_info_labels = ", ".join(r.get("factor") for r in no_info)
+            parts.append(
+                f"\n> No detectable information (low variance + weak CLV corr): "
+                f"{no_info_labels}\n"
+            )
+    else:
+        parts.append("_No factor-distribution data yet._\n")
+
+    # --- Score Attribution -----------------------------------------------
+    sattr = mlb_performance.get("score_attribution") or {}
+    parts.append("\n## Score Attribution\n")
+    sattr_rows = sattr.get("factors") or []
+    if sattr_rows:
+        parts.append(_md_table(sattr_rows))
+        parts.append(
+            f"\n_Total absolute contribution across all factors: "
+            f"{sattr.get('total_absolute_contribution_points') or 0:.1f} points._\n"
+        )
+    else:
+        parts.append("_No score-attribution data yet._\n")
+
+    # --- Recent Side Performance + Engine Penalty ------------------------
+    rsp = mlb_performance.get("recent_side_performance") or {}
+    rsp_sides = rsp.get("sides") or {}
+    parts.append("\n## Recent Side Performance & Engine Penalty\n")
+    if rsp_sides:
+        penalty_rows: list[dict[str, Any]] = []
+        for side_name, payload in rsp_sides.items():
+            penalty_rows.append({
+                "side": side_name,
+                "sample": payload.get("sample_size"),
+                "decided": payload.get("decided"),
+                "wins": payload.get("wins"),
+                "losses": payload.get("losses"),
+                "win_rate": payload.get("win_rate"),
+                "roi_units": payload.get("roi_units"),
+                "engine_penalty_points": payload.get("penalty_points"),
+            })
+        parts.append(_md_table(penalty_rows))
+        parts.append(
+            f"\n_Window: last {rsp.get('lookback_days')} days "
+            f"({rsp.get('window_start')} → {rsp.get('window_end')})._\n"
+        )
+    else:
+        parts.append("_No rolling side-performance data yet._\n")
 
     # --- CLV Leaders -----------------------------------------------------
     top_pos = clv_block.get("top_positive") or []
@@ -4897,6 +5314,14 @@ with tab_perf:
         h4.metric("ROI units", fmt_num(health.get("roi_units"), fmt="{:+.2f}"))
         h5.metric("Win rate", fmt_pct(health.get("win_rate")))
         h6.metric("Graded sample", health.get("graded_sample_size") or graded)
+        st.caption(
+            "Avg prediction score: "
+            f"{fmt_num(perf_summary.get('average_prediction_score'), fmt='{:.1f}')} | "
+            "Avg execution score: "
+            f"{fmt_num(perf_summary.get('average_execution_score'), fmt='{:.1f}')} | "
+            "Avg legacy score: "
+            f"{fmt_num(perf_summary.get('average_legacy_score'), fmt='{:.1f}')}"
+        )
 
         # ------------------------------------------------------------------
         # 2. Sample Size Warning — surface the confidence tier inline rather
@@ -4988,7 +5413,7 @@ with tab_perf:
         # 5. Score Band Performance — five-band segmentation with stability
         # flag. Bands with <30 graded edges render in a muted style.
         # ------------------------------------------------------------------
-        st.markdown("### Score Band Performance")
+        st.markdown("### Legacy Score Band Performance")
         by_band = mlb_performance.get("by_score_band") or []
         if rmode != "All candidates":
             by_band = [row for row in by_band if _band_in_scope(row.get("score_band") or "")]
@@ -5014,6 +5439,29 @@ with tab_perf:
         # 6. Projection Calibration — diagnoses model_proj vs market_close
         # vs actual_total. Warnings only fire on absolute miss > 0.75 runs.
         # ------------------------------------------------------------------
+        st.markdown("### Prediction vs Execution Score Performance")
+        axis_tabs = st.tabs(["Prediction Score", "Execution Score"])
+        for axis_tab, axis_key in zip(
+            axis_tabs,
+            ("by_prediction_score_band", "by_execution_score_band"),
+        ):
+            with axis_tab:
+                axis_rows = mlb_performance.get(axis_key) or []
+                if rmode != "All candidates":
+                    axis_rows = [
+                        row for row in axis_rows
+                        if _band_in_scope(row.get("score_band") or "")
+                    ]
+                if axis_rows:
+                    st.dataframe(
+                        pd.DataFrame(axis_rows).fillna(DASH),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(280, 60 + 32 * len(axis_rows)),
+                    )
+                else:
+                    st.caption("No graded rows for this score axis yet.")
+
         st.markdown("### Projection Calibration")
         cal = mlb_performance.get("projection_calibration") or {}
         for w in cal.get("warnings") or []:
@@ -5102,6 +5550,107 @@ with tab_perf:
                 )
         else:
             st.caption("No factor attribution available.")
+
+        # ------------------------------------------------------------------
+        # 10b. Factor Distribution Audit — stuck-at-50 / no-information
+        # callouts. Pre-tuning diagnostic: answers "is this factor actually
+        # carrying signal or is its producer a stub?"
+        # ------------------------------------------------------------------
+        st.markdown("### Factor Distribution Audit")
+        fdist = mlb_performance.get("factor_distribution") or {}
+        fdist_rows = fdist.get("factors") or []
+        fdist_summary = fdist.get("summary") or {}
+        if fdist_rows:
+            df_fdist = pd.DataFrame(fdist_rows).fillna(DASH)
+            st.dataframe(
+                df_fdist, use_container_width=True, hide_index=True,
+                height=min(360, 60 + 32 * len(df_fdist)),
+            )
+            stuck = fdist_summary.get("stuck_at_neutral_factors") or []
+            no_info = fdist_summary.get("no_information_factors") or []
+            if stuck:
+                stuck_labels = ", ".join(
+                    f"{r['factor']} ({(r.get('rate') or 0)*100:.0f}%)" for r in stuck
+                )
+                st.warning(
+                    f"Factors stuck at the neutral 50 sentinel ≥95% of the "
+                    f"time: {stuck_labels}. Upstream producer is likely a stub."
+                )
+            if no_info:
+                no_info_labels = ", ".join(r["factor"] for r in no_info)
+                st.warning(
+                    f"Factors with no detectable information "
+                    f"(low variance + weak CLV correlation): {no_info_labels}."
+                )
+        else:
+            st.caption("No factor-distribution data yet (need graded edges).")
+
+        # ------------------------------------------------------------------
+        # 10c. Score Attribution — share of score movement per factor.
+        # Tells the operator where the score is actually coming from
+        # (e.g. "82% of the score's swing comes from data_quality" → bad).
+        # ------------------------------------------------------------------
+        st.markdown("### Score Attribution")
+        sattr = mlb_performance.get("score_attribution") or {}
+        sattr_rows = sattr.get("factors") or []
+        if sattr_rows:
+            df_sattr = pd.DataFrame(sattr_rows).fillna(DASH)
+            st.dataframe(
+                df_sattr, use_container_width=True, hide_index=True,
+                height=min(320, 60 + 32 * len(df_sattr)),
+            )
+            st.caption(
+                f"Total |contribution| across all factors in window: "
+                f"{sattr.get('total_absolute_contribution_points') or 0:.1f} "
+                f"points · contribution_share sums to 1.0 across factors."
+            )
+        else:
+            st.caption("No score-attribution data yet (need graded edges).")
+
+        # ------------------------------------------------------------------
+        # 10d. Over/Under bias diagnostics — rolling 14d perf + the engine's
+        # per-side score penalty. Diagnoses whether the model is currently
+        # being throttled on either side.
+        # ------------------------------------------------------------------
+        st.markdown("### Recent Side Performance & Engine Penalty")
+        rsp = mlb_performance.get("recent_side_performance") or {}
+        rsp_sides = rsp.get("sides") or {}
+        if rsp_sides:
+            penalty_rows = [
+                {
+                    "side": side_name,
+                    "sample": payload.get("sample_size"),
+                    "decided": payload.get("decided"),
+                    "wins": payload.get("wins"),
+                    "losses": payload.get("losses"),
+                    "win_rate": payload.get("win_rate"),
+                    "roi_units": payload.get("roi_units"),
+                    "engine_penalty_points": payload.get("penalty_points"),
+                }
+                for side_name, payload in rsp_sides.items()
+            ]
+            st.dataframe(
+                pd.DataFrame(penalty_rows).fillna(DASH),
+                use_container_width=True, hide_index=True,
+                height=min(180, 60 + 32 * len(penalty_rows)),
+            )
+            st.caption(
+                f"Window: last {rsp.get('lookback_days')} days "
+                f"({rsp.get('window_start')} → {rsp.get('window_end')}). "
+                "Penalty points are subtracted from the candidate score at "
+                "scan time when sample ≥ floor and win rate < 0.45."
+            )
+            active_penalties = [
+                f"{side_name}: −{payload.get('penalty_points'):.1f}"
+                for side_name, payload in rsp_sides.items()
+                if (payload.get("penalty_points") or 0) > 0
+            ]
+            if active_penalties:
+                st.warning(
+                    "Active side penalties on next scan: " + ", ".join(active_penalties)
+                )
+        else:
+            st.caption("No rolling side-performance data yet.")
 
         # ------------------------------------------------------------------
         # 11. Raw Graded Edges + CLV leaders for spot-checks.

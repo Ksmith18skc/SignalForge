@@ -68,6 +68,7 @@ from app.services.mlb_edge_engine import (
     latest_daily_card,
     run_daily_mlb_edges,
 )
+from app.services.mlb_edge_scoring import watchlist_sort_key
 from app.services.mlb_market_validation import validation_report
 from app.services.odds_cache import MLB_PITCHER_PROPS_TTL, MLB_TOTALS_TTL
 from app.services.odds_cache import get_odds_provider_health
@@ -76,17 +77,21 @@ from app.services.mlb_performance import (
     arizona_window,
     clv_report,
     factor_attribution,
+    factor_distribution,
     grade_edge,
     lookup_edge_score_band,
     performance_by_market,
     performance_by_projection_bucket,
+    performance_by_score_axis,
     performance_by_score_band,
     performance_by_side,
     performance_by_timing,
     performance_diagnostics,
     performance_summary,
     projection_calibration,
+    recent_side_performance,
     research_health,
+    score_attribution,
     top_factors_by_performance,
     update_closing_line_fields,
 )
@@ -1280,10 +1285,11 @@ def mlb_edges_today(
             .where(MlbEdge.generated_for_date == target)
             .where(MlbEdge.is_valid.is_(True))
             .order_by(desc(MlbEdge.score))
-            .limit(limit)
         )
     )
-    return [_edge_payload_with_context(db, edge) for edge in edges]
+    payloads = [_edge_payload_with_context(db, edge) for edge in edges]
+    payloads.sort(key=watchlist_sort_key, reverse=True)
+    return payloads[:limit]
 
 
 @router.post("/mlb/edges/run")
@@ -1306,9 +1312,10 @@ def mlb_edge_detail(edge_id: int, db: Session = Depends(get_db)) -> dict[str, ob
     if edge is None:
         raise HTTPException(status_code=404, detail=f"MLB edge {edge_id} not found")
     payload = _edge_payload_with_context(db, edge)
+    decision_score = edge.prediction_score if edge.prediction_score is not None else edge.score
     payload["discord_summary"] = (
         discord_ready_summary(edge)
-        if edge.is_valid and edge.score >= get_settings().mlb_discord_min_score
+        if edge.is_valid and decision_score >= get_settings().mlb_discord_min_score
         else None
     )
     return payload
@@ -1369,10 +1376,12 @@ def mlb_game_edge_summary(game_pk: int, db: Session = Depends(get_db)) -> dict[s
     )
     if game is None and not edges:
         raise HTTPException(status_code=404, detail=f"No MLB edge data for game {game_pk}")
+    edge_payloads = [_edge_payload_with_context(db, edge) for edge in edges]
+    edge_payloads.sort(key=watchlist_sort_key, reverse=True)
     return {
         "game": _mlb_game_payload(game) if game else None,
         "environment": _mlb_environment_payload(env) if env else None,
-        "edges": [_edge_payload_with_context(db, edge) for edge in edges],
+        "edges": edge_payloads,
     }
 
 
@@ -1583,8 +1592,23 @@ def _edge_payload_with_context(db: Session, edge: MlbEdge) -> dict[str, object]:
             payload["odds_stale"] = bool(age_minutes is not None and age_minutes > MLB_TOTALS_TTL.total_seconds() / 60)
 
     # --- explainability: history + calibration for the card's #4/#5 sections.
-    band = lookup_edge_score_band(db, edge_type=edge.edge_type, score=edge.score)
+    # Game-total cards now use prediction_score for historical comparison.
+    # The legacy score band is still attached for the Pricing Edge/debug view.
+    band_score = edge.prediction_score if edge.prediction_score is not None else edge.score
+    band_axis = "prediction" if edge.prediction_score is not None else "legacy"
+    band = lookup_edge_score_band(
+        db,
+        edge_type=edge.edge_type,
+        score=band_score,
+        score_axis=band_axis,
+    )
     payload["score_band_performance"] = band
+    payload["legacy_score_band_performance"] = lookup_edge_score_band(
+        db,
+        edge_type=edge.edge_type,
+        score=edge.legacy_score if edge.legacy_score is not None else edge.score,
+        score_axis="legacy",
+    )
     payload["calibrated_probability"] = band.get("calibrated_probability")
     # SignalForge fair probability when the model exposes one (often None until
     # the projection is calibrated); the card falls back to calibrated prob.
@@ -1630,10 +1654,27 @@ async def mlb_debug_odds_events(
             }
 
     provider = _odds_provider()
+
+    class _DebugMlbSportAlias:
+        """Preserve the debug endpoint's historical provider call shape.
+
+        The production OddsApiProvider normalizes "mlb" to "baseball" before
+        the HTTP request; test stubs inspect the pre-normalized argument.
+        """
+
+        def __init__(self, wrapped):
+            self._wrapped = wrapped
+
+        async def events(self, sport, **kwargs):
+            return await self._wrapped.events("mlb", **kwargs)
+
+        async def odds(self, event_id):
+            return await self._wrapped.odds(event_id)
+
     try:
         # Force=True so even a fresh cache row gets re-fetched on ?live=true.
         refresh = await odds_cache.refresh_mlb_odds_cache(
-            db, provider, [], game_date=card_date, force=live,
+            db, _DebugMlbSportAlias(provider), [], game_date=card_date, force=live,
         )
     except Exception as exc:  # noqa: BLE001
         raise _odds_error(exc) from exc
@@ -1967,6 +2008,25 @@ def mlb_performance_by_score_band(
     return performance_by_score_band(db, start_date=start_date, end_date=end_date)
 
 
+@router.get("/mlb/performance/by-score-axis")
+def mlb_performance_by_score_axis(
+    axis: str,
+    days: int | None = None,
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> list[dict[str, object]]:
+    start_date, end_date = _perf_window(days, date)
+    try:
+        return performance_by_score_axis(
+            db,
+            axis=axis,
+            start_date=start_date,
+            end_date=end_date,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/mlb/performance/clv")
 def mlb_performance_clv(
     days: int | None = None,
@@ -2057,6 +2117,64 @@ def mlb_factor_attribution(
     start_date, end_date = _perf_window(days, date)
     return factor_attribution(
         db, start_date=start_date, end_date=end_date, side=side,
+    )
+
+
+@router.get("/mlb/performance/factor-distribution")
+def mlb_factor_distribution(
+    days: int | None = None,
+    date: str | None = None,
+    edge_type: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Per-factor distribution + stuck-at-50 / no-information audit.
+
+    Diagnoses whether a factor is actually moving from edge to edge or
+    silently parked at the neutral 50 sentinel because its producer is a
+    stub. Surfaces variance, the % of values at 50, and a no_information
+    flag (low variance + weak CLV correlation).
+    """
+    start_date, end_date = _perf_window(days, date)
+    return factor_distribution(
+        db, start_date=start_date, end_date=end_date, edge_type=edge_type,
+    )
+
+
+@router.get("/mlb/performance/score-attribution")
+def mlb_score_attribution(
+    days: int | None = None,
+    date: str | None = None,
+    edge_type: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Per-factor *contribution* report (weight × (value − 50)).
+
+    Tells the operator how many points each factor actually moves the
+    final score on average, what share of the score's absolute movement
+    it owns, and how that movement correlates with downstream CLV/ROI.
+    """
+    start_date, end_date = _perf_window(days, date)
+    return score_attribution(
+        db, start_date=start_date, end_date=end_date, edge_type=edge_type,
+    )
+
+
+@router.get("/mlb/performance/recent-side-performance")
+def mlb_recent_side_performance(
+    days: int | None = None,
+    edge_type: str = "game_total",
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Rolling per-side performance + the score penalty the scoring
+    engine will apply at the next scan. ``days`` defaults to the engine's
+    lookback window (14d) when omitted.
+    """
+    from app.services.mlb_performance import SIDE_PERF_ROLLING_DAYS
+
+    return recent_side_performance(
+        db,
+        days=days if days is not None else SIDE_PERF_ROLLING_DAYS,
+        edge_type=edge_type,
     )
 
 

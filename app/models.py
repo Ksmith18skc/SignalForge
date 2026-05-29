@@ -354,6 +354,22 @@ class MlbEdge(Base):
     best_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     consensus_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     score: Mapped[float] = mapped_column(Float, default=0.0, index=True)
+    # Dual-axis scoring (post-refactor). ``prediction_score`` rates the
+    # model's conviction (projection / wallets / matchup / environment /
+    # model confidence — NO sportsbook price edge); ``execution_score``
+    # rates the pricing/market (sportsbook price edge, line movement,
+    # CLV signal, market quality — NO model conviction). ``legacy_score``
+    # mirrors the original TOTAL_WEIGHTS weighted score for backwards
+    # compatibility / debug. ``score`` is kept as a legacy alias =
+    # legacy_score so older callers don't break. All three are nullable
+    # so pre-migration rows stay readable.
+    prediction_score: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    execution_score: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
+    legacy_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Additive contribution breakdowns for each new score.
+    prediction_breakdown: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
+    execution_breakdown: Mapped[dict[str, float] | None] = mapped_column(JSON, nullable=True)
+    cheap_price_trap: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     confidence: Mapped[str] = mapped_column(String(16), default="low")
     action: Mapped[str] = mapped_column(String(64), default="Pass")
     chase_risk: Mapped[str] = mapped_column(String(16), default="medium")

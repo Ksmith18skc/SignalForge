@@ -192,6 +192,11 @@ def performance_summary(
         "roi_units": round(sum(e.roi_units or 0.0 for e in edges), 4),
         "average_clv_points": _avg(e.clv_points for e in edges),
         "average_clv_percent": _avg(e.clv_percent for e in edges),
+        "average_prediction_score": _avg(e.prediction_score for e in edges),
+        "average_execution_score": _avg(e.execution_score for e in edges),
+        "average_legacy_score": _avg(
+            e.legacy_score if e.legacy_score is not None else e.score for e in edges
+        ),
     }
     if start_date or end_date:
         summary["start_date"] = start_date
@@ -245,11 +250,49 @@ def performance_by_score_band(
     return rows
 
 
+def performance_by_score_axis(
+    db: Session,
+    *,
+    axis: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Per-band rollup for one score axis.
+
+    ``axis`` may be ``legacy``, ``prediction``, or ``execution``. Legacy
+    preserves the old single-score report; prediction/execution let the
+    dashboard evaluate model correctness and price execution separately.
+    """
+    axis = _normalize_score_axis(axis)
+    edges = _graded_edges(db, start_date=start_date, end_date=end_date)
+    groups: dict[str, list[MlbEdge]] = {band: [] for band in SCORE_BANDS}
+    for edge in edges:
+        groups[score_band(_score_for_axis(edge, axis))].append(edge)
+
+    rows: list[dict[str, Any]] = []
+    for band in SCORE_BANDS:
+        items = groups[band]
+        row = {
+            "score_axis": axis,
+            "score_band": band,
+            "band_label": SCORE_BAND_LABELS[band],
+            **_summary_for_edges(items),
+            "average_axis_score": _avg(_score_for_axis(e, axis) for e in items),
+            "missing_axis_score_count": sum(
+                1 for e in items if _score_for_axis(e, axis) is None
+            ),
+        }
+        row["stable"] = row["graded_edges"] >= 30
+        rows.append(row)
+    return rows
+
+
 def lookup_edge_score_band(
     db: Session,
     *,
     edge_type: str | None,
     score: float | None,
+    score_axis: str = "legacy",
     start_date: str | None = None,
     end_date: str | None = None,
 ) -> dict[str, Any]:
@@ -262,9 +305,11 @@ def lookup_edge_score_band(
     comparable graded edges exist yet, so the card can show an honest
     "not enough graded history" state rather than a fabricated number.
     """
+    score_axis = _normalize_score_axis(score_axis)
     band = score_band(float(score)) if score is not None else None
     empty = {
         "edge_type": edge_type,
+        "score_axis": score_axis,
         "score_band": band,
         "sample_size": 0,
         "wins": 0,
@@ -280,7 +325,8 @@ def lookup_edge_score_band(
     edges = [
         e
         for e in _graded_edges(db, start_date=start_date, end_date=end_date)
-        if (edge_type is None or e.edge_type == edge_type) and score_band(e.score) == band
+        if (edge_type is None or e.edge_type == edge_type)
+        and score_band(_score_for_axis(e, score_axis)) == band
     ]
     if not edges:
         return empty
@@ -290,6 +336,7 @@ def lookup_edge_score_band(
     decided = wins + losses
     return {
         "edge_type": edge_type,
+        "score_axis": score_axis,
         "score_band": band,
         "sample_size": len(edges),
         "wins": wins,
@@ -321,6 +368,18 @@ def clv_report(
         band: _clv_breakdown([e for e in edges if score_band(e.score) == band])
         for band in SCORE_BANDS
     }
+    by_prediction_band = {
+        band: _clv_breakdown([
+            e for e in edges if score_band(e.prediction_score) == band
+        ])
+        for band in SCORE_BANDS
+    }
+    by_execution_band = {
+        band: _clv_breakdown([
+            e for e in edges if score_band(e.execution_score) == band
+        ])
+        for band in SCORE_BANDS
+    }
     by_edge_type: dict[str, dict[str, Any]] = {}
     for edge in edges:
         by_edge_type.setdefault(edge.edge_type or "unknown", []).append(edge)  # type: ignore[arg-type]
@@ -337,6 +396,8 @@ def clv_report(
         "missing_clv_count": len(edges) - len(with_clv),
         "by_side": by_side,
         "by_score_band": by_band,
+        "by_prediction_score_band": by_prediction_band,
+        "by_execution_score_band": by_execution_band,
         "by_edge_type": by_edge_type,
         "top_positive": [_edge_perf(e) for e in sorted(with_clv, key=lambda e: e.clv_points or -999, reverse=True)[:10]],
         "top_negative": [_edge_perf(e) for e in sorted(with_clv, key=lambda e: e.clv_points or 999)[:10]],
@@ -440,6 +501,9 @@ def projection_calibration(
                 "game_pk": e.game_pk,
                 "side": e.side,
                 "score": e.score,
+                "prediction_score": e.prediction_score,
+                "execution_score": e.execution_score,
+                "legacy_score": e.legacy_score if e.legacy_score is not None else e.score,
                 "model_projected_total": proj,
                 "market_entry_total": entry,
                 "closing_total": close,
@@ -629,6 +693,369 @@ def factor_attribution(
         reverse=True,
     )
     return out
+
+
+# ---------------------------------------------------------------------------
+# Factor distribution audit
+#
+# Diagnoses whether a factor actually carries signal or is silently parked
+# at the neutral 50.0 sentinel because its upstream producer is a stub.
+# Surfaces variance, the % of values stuck at 50, and a no-information flag
+# (low variance + weak CLV correlation) so the dashboard can show the
+# operator which weight slices are dead weight.
+# ---------------------------------------------------------------------------
+
+# A factor sample within ±NEUTRAL_TOLERANCE of 50.0 counts as "stuck at
+# neutral" — small numeric drift from a stub producer that *adds* a tiny
+# weather or book-count adjustment should still register as stuck.
+NEUTRAL_TOLERANCE = 0.5
+# Population stdev below this is treated as "no spread" — the producer is
+# returning effectively the same value for every edge.
+LOW_VARIANCE_STDEV = 2.5
+# Min |Pearson(value, clv)| to consider a factor informative when its
+# variance does carry some spread. Below this AND with low variance →
+# no_information.
+MIN_INFORMATIVE_CORRELATION = 0.05
+# Sample-size floor for the no_information flag — small samples can look
+# uninformative purely from variance, so we only call a factor dead weight
+# once we have enough graded edges to trust the verdict.
+MIN_NO_INFO_SAMPLE = 30
+
+
+def factor_distribution(
+    db: Session,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    edge_type: str | None = None,
+) -> dict[str, Any]:
+    """Audit per-factor distributions against graded edges in the window.
+
+    For each factor that appears in any edge's ``factors`` dict we report
+    the spread (mean / stdev / variance / min / max / p10/p50/p90), the
+    rate of samples parked at the neutral 50 sentinel, and a
+    ``no_information`` flag set when both the variance is near-zero *and*
+    the factor's value carries no detectable CLV/ROI signal. The output is
+    ordered by score impact (avg |contribution|) so dead-weight factors
+    bubble to the top of the operator's attention.
+    """
+    edges = _graded_edges(db, start_date=start_date, end_date=end_date)
+    if edge_type is not None:
+        edges = [e for e in edges if e.edge_type == edge_type]
+
+    # Gather raw values + CLV/ROI pairs per factor in a single pass.
+    aggregated: dict[str, dict[str, Any]] = {}
+    for edge in edges:
+        contributions = edge.score_contributions or {}
+        for factor, value in (edge.factors or {}).items():
+            try:
+                v = float(value)
+            except (TypeError, ValueError):
+                continue
+            bucket = aggregated.setdefault(
+                factor,
+                {
+                    "values": [],
+                    "contributions": [],
+                    "clv_pairs": [],
+                    "roi_pairs": [],
+                },
+            )
+            bucket["values"].append(v)
+            try:
+                contribution = float(contributions.get(factor, 0.0))
+            except (TypeError, ValueError):
+                contribution = 0.0
+            bucket["contributions"].append(contribution)
+            if edge.clv_points is not None:
+                bucket["clv_pairs"].append((v, float(edge.clv_points)))
+            if edge.roi_units is not None:
+                bucket["roi_pairs"].append((v, float(edge.roi_units)))
+
+    if not aggregated:
+        return {
+            "edge_type": edge_type,
+            "graded_sample_size": len(edges),
+            "factors": [],
+            "summary": {
+                "stuck_at_neutral_factors": [],
+                "no_information_factors": [],
+            },
+        }
+
+    # Compute totals so we can express each factor's mean |contribution|
+    # as a share of the score's overall absolute movement.
+    total_abs_contribution = sum(
+        abs(c) for bucket in aggregated.values() for c in bucket["contributions"]
+    )
+    rows: list[dict[str, Any]] = []
+    for factor, bucket in aggregated.items():
+        values: list[float] = bucket["values"]
+        contributions: list[float] = bucket["contributions"]
+        n = len(values)
+        mean_v = mean(values) if values else None
+        stdev_v = pstdev(values) if n > 1 else 0.0
+        stuck = sum(1 for v in values if abs(v - 50.0) <= NEUTRAL_TOLERANCE)
+        stuck_rate = round(stuck / n, 4) if n else None
+        sorted_vals = sorted(values)
+        avg_abs_contrib = mean(abs(c) for c in contributions) if contributions else 0.0
+        contribution_share = (
+            round(sum(abs(c) for c in contributions) / total_abs_contribution, 4)
+            if total_abs_contribution
+            else None
+        )
+        corr_clv = _pearson(bucket["clv_pairs"])
+        corr_roi = _pearson(bucket["roi_pairs"])
+        low_variance = stdev_v < LOW_VARIANCE_STDEV
+        uninformative_corr = (
+            corr_clv is None
+            or abs(corr_clv) < MIN_INFORMATIVE_CORRELATION
+        )
+        no_information = (
+            n >= MIN_NO_INFO_SAMPLE and low_variance and uninformative_corr
+        )
+        rows.append(
+            {
+                "factor": factor,
+                "sample_size": n,
+                "mean": round(mean_v, 4) if mean_v is not None else None,
+                "stdev": round(stdev_v, 4),
+                "variance": round(stdev_v * stdev_v, 4),
+                "min": round(min(sorted_vals), 4) if sorted_vals else None,
+                "max": round(max(sorted_vals), 4) if sorted_vals else None,
+                "p10": round(_percentile(sorted_vals, 0.10), 4) if sorted_vals else None,
+                "p50": round(_percentile(sorted_vals, 0.50), 4) if sorted_vals else None,
+                "p90": round(_percentile(sorted_vals, 0.90), 4) if sorted_vals else None,
+                "stuck_at_neutral_rate": stuck_rate,
+                "stuck_at_neutral_count": stuck,
+                "low_variance": low_variance,
+                "correlation_with_clv": corr_clv,
+                "correlation_with_roi": corr_roi,
+                "avg_abs_contribution_points": round(avg_abs_contrib, 4),
+                "contribution_share": contribution_share,
+                "no_information": no_information,
+            }
+        )
+
+    # Surface the worst offenders separately so the dashboard / export can
+    # render a one-line "these factors are dead weight" callout without
+    # forcing the operator to scan the full table.
+    stuck_offenders = sorted(
+        [r for r in rows if (r["stuck_at_neutral_rate"] or 0) >= 0.95],
+        key=lambda r: r["stuck_at_neutral_rate"] or 0.0,
+        reverse=True,
+    )
+    no_info_offenders = sorted(
+        [r for r in rows if r["no_information"]],
+        key=lambda r: r["avg_abs_contribution_points"],
+        reverse=True,
+    )
+    rows.sort(key=lambda r: r["avg_abs_contribution_points"], reverse=True)
+    return {
+        "edge_type": edge_type,
+        "graded_sample_size": len(edges),
+        "factors": rows,
+        "summary": {
+            "stuck_at_neutral_factors": [
+                {"factor": r["factor"], "rate": r["stuck_at_neutral_rate"]}
+                for r in stuck_offenders
+            ],
+            "no_information_factors": [
+                {"factor": r["factor"], "stdev": r["stdev"], "corr_clv": r["correlation_with_clv"]}
+                for r in no_info_offenders
+            ],
+        },
+    }
+
+
+def score_attribution(
+    db: Session,
+    *,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    edge_type: str | None = None,
+) -> dict[str, Any]:
+    """Per-factor score attribution: how many points each factor actually
+    moves the final score on average, and how that movement correlates
+    with downstream outcomes.
+
+    Unlike ``factor_attribution`` (which works on factor *values*), this
+    operates on the additive *contributions* — i.e. weight × (value − 50).
+    A factor with high variance but a tiny weight will show as low
+    impact here; a factor with modest variance but a fat weight will
+    show as high impact. That's what the operator needs to understand
+    "where is my score actually coming from."
+    """
+    edges = _graded_edges(db, start_date=start_date, end_date=end_date)
+    if edge_type is not None:
+        edges = [e for e in edges if e.edge_type == edge_type]
+
+    aggregated: dict[str, dict[str, list[float]]] = {}
+    for edge in edges:
+        contributions = edge.score_contributions or {}
+        for factor, contrib in contributions.items():
+            try:
+                c = float(contrib)
+            except (TypeError, ValueError):
+                continue
+            bucket = aggregated.setdefault(
+                factor,
+                {
+                    "all": [],
+                    "wins": [],
+                    "losses": [],
+                    "clv_pairs": [],
+                    "roi_pairs": [],
+                },
+            )
+            bucket["all"].append(c)
+            outcome = (edge.win_loss_push or "").lower()
+            if outcome == "win":
+                bucket["wins"].append(c)
+            elif outcome == "loss":
+                bucket["losses"].append(c)
+            if edge.clv_points is not None:
+                bucket["clv_pairs"].append((c, float(edge.clv_points)))  # type: ignore[arg-type]
+            if edge.roi_units is not None:
+                bucket["roi_pairs"].append((c, float(edge.roi_units)))  # type: ignore[arg-type]
+
+    total_abs = sum(abs(v) for bucket in aggregated.values() for v in bucket["all"])
+    rows: list[dict[str, Any]] = []
+    for factor, vals in aggregated.items():
+        all_vals: list[float] = vals["all"]
+        n = len(all_vals)
+        avg = mean(all_vals) if all_vals else 0.0
+        abs_sum = sum(abs(v) for v in all_vals)
+        avg_abs = abs_sum / n if n else 0.0
+        sd = pstdev(all_vals) if n > 1 else 0.0
+        share = round(abs_sum / total_abs, 4) if total_abs else None
+        avg_win = mean(vals["wins"]) if vals["wins"] else None
+        avg_loss = mean(vals["losses"]) if vals["losses"] else None
+        delta = (
+            round(avg_win - avg_loss, 4)
+            if avg_win is not None and avg_loss is not None
+            else None
+        )
+        rows.append(
+            {
+                "factor": factor,
+                "sample_size": n,
+                "avg_contribution_points": round(avg, 4),
+                "avg_abs_contribution_points": round(avg_abs, 4),
+                "stdev_contribution": round(sd, 4),
+                "contribution_share": share,
+                "avg_contribution_on_wins": (
+                    round(avg_win, 4) if avg_win is not None else None
+                ),
+                "avg_contribution_on_losses": (
+                    round(avg_loss, 4) if avg_loss is not None else None
+                ),
+                "delta_win_minus_loss": delta,
+                "correlation_with_clv": _pearson(vals["clv_pairs"]),  # type: ignore[arg-type]
+                "correlation_with_roi": _pearson(vals["roi_pairs"]),  # type: ignore[arg-type]
+                "unstable": n < 50,
+            }
+        )
+    rows.sort(key=lambda r: r["contribution_share"] or 0.0, reverse=True)
+    return {
+        "edge_type": edge_type,
+        "graded_sample_size": len(edges),
+        "total_absolute_contribution_points": round(total_abs, 4),
+        "factors": rows,
+    }
+
+
+# Underperforming-side rolling window: how many days back the scoring
+# engine averages over when deciding whether to penalize a side at scan
+# time. Long enough to avoid pure noise, short enough to react when the
+# model's directional bias breaks.
+SIDE_PERF_ROLLING_DAYS = 14
+# A side needs at least this many graded edges before its underperformance
+# can drive a penalty. Without this floor a 0/2 cold streak would slash
+# every over-recommendation.
+SIDE_PERF_MIN_SAMPLE = 20
+# Win-rate threshold below which a side is considered "underperforming".
+# 0.45 sits just under coin-flip — we don't want to penalize a side that
+# is merely variance-noisy around 50%.
+SIDE_PERF_LOSING_WIN_RATE = 0.45
+# Max points we'll subtract from a 0-100 score for the worst possible
+# side underperformance. Bounded so the penalty can't single-handedly
+# flip a high-conviction candidate into Pass.
+SIDE_PERF_MAX_PENALTY_POINTS = 6.0
+
+
+def recent_side_performance(
+    db: Session,
+    *,
+    today: str | None = None,
+    days: int = SIDE_PERF_ROLLING_DAYS,
+    edge_type: str = "game_total",
+) -> dict[str, Any]:
+    """Rolling per-side performance used by the scoring engine to penalize
+    edges on a recently-losing side. Pure read — no scoring side effects.
+
+    Returns the per-side ``win_rate``, ``roi_units`` and ``sample_size``
+    over the lookback window, plus a derived ``penalty_points`` that the
+    engine can subtract from the candidate's final score. ``penalty_points``
+    is ``0.0`` for any side with too small a sample or a win rate above
+    ``SIDE_PERF_LOSING_WIN_RATE``.
+    """
+    start, end = arizona_window(days, today=today)
+    edges = [
+        e
+        for e in _graded_edges(db, start_date=start, end_date=end)
+        if e.edge_type == edge_type
+    ]
+    out: dict[str, Any] = {
+        "edge_type": edge_type,
+        "lookback_days": days,
+        "window_start": start,
+        "window_end": end,
+        "sides": {},
+    }
+    for side in ("over", "under"):
+        side_edges = [e for e in edges if (e.side or "").lower() == side]
+        wins = sum(1 for e in side_edges if e.win_loss_push == "win")
+        losses = sum(1 for e in side_edges if e.win_loss_push == "loss")
+        decided = wins + losses
+        win_rate = wins / decided if decided else None
+        roi = round(sum(e.roi_units or 0.0 for e in side_edges), 4)
+        # Penalty is proportional to how far below the losing threshold
+        # the rolling win rate has fallen, scaled to the configured cap.
+        if (
+            win_rate is not None
+            and decided >= SIDE_PERF_MIN_SAMPLE
+            and win_rate < SIDE_PERF_LOSING_WIN_RATE
+        ):
+            shortfall = SIDE_PERF_LOSING_WIN_RATE - win_rate
+            penalty = min(
+                SIDE_PERF_MAX_PENALTY_POINTS,
+                shortfall * (SIDE_PERF_MAX_PENALTY_POINTS / SIDE_PERF_LOSING_WIN_RATE),
+            )
+            penalty = round(penalty, 2)
+        else:
+            penalty = 0.0
+        out["sides"][side] = {
+            "sample_size": len(side_edges),
+            "decided": decided,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round(win_rate, 4) if win_rate is not None else None,
+            "roi_units": roi,
+            "penalty_points": penalty,
+        }
+    return out
+
+
+def _percentile(sorted_vals: list[float], p: float) -> float:
+    """Linear-interpolated percentile. Caller guarantees non-empty + sorted."""
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    k = (len(sorted_vals) - 1) * p
+    lo = int(k)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = k - lo
+    return sorted_vals[lo] + (sorted_vals[hi] - sorted_vals[lo]) * frac
 
 
 def top_factors_by_performance(
@@ -850,6 +1277,26 @@ def _grouped_report(edges: list[MlbEdge], key_fn: Callable[[MlbEdge], Any], key_
     ]
 
 
+def _normalize_score_axis(axis: str | None) -> str:
+    axis_l = str(axis or "legacy").strip().lower()
+    if axis_l in {"prediction", "prediction_score"}:
+        return "prediction"
+    if axis_l in {"execution", "execution_score"}:
+        return "execution"
+    if axis_l in {"legacy", "legacy_score", "score"}:
+        return "legacy"
+    raise ValueError(f"unsupported score axis: {axis}")
+
+
+def _score_for_axis(edge: MlbEdge, axis: str) -> float | None:
+    axis = _normalize_score_axis(axis)
+    if axis == "prediction":
+        return edge.prediction_score
+    if axis == "execution":
+        return edge.execution_score
+    return edge.legacy_score if edge.legacy_score is not None else edge.score
+
+
 def _summary_for_edges(edges: list[MlbEdge]) -> dict[str, Any]:
     wins = sum(1 for e in edges if e.win_loss_push == "win")
     losses = sum(1 for e in edges if e.win_loss_push == "loss")
@@ -865,6 +1312,11 @@ def _summary_for_edges(edges: list[MlbEdge]) -> dict[str, Any]:
         "average_clv_points": _avg(e.clv_points for e in edges),
         "average_clv_percent": _avg(e.clv_percent for e in edges),
         "average_score": _avg(e.score for e in edges),
+        "average_prediction_score": _avg(e.prediction_score for e in edges),
+        "average_execution_score": _avg(e.execution_score for e in edges),
+        "average_legacy_score": _avg(
+            e.legacy_score if e.legacy_score is not None else e.score for e in edges
+        ),
         "positive_clv_rate": _positive_clv_rate(edges),
     }
 
@@ -880,6 +1332,11 @@ def _side_metrics(edges: list[MlbEdge]) -> dict[str, Any]:
         "win_rate": round(wins / decided, 4) if decided else None,
         "roi_units": round(sum(e.roi_units or 0.0 for e in edges), 4),
         "average_score": _avg(e.score for e in edges),
+        "average_prediction_score": _avg(e.prediction_score for e in edges),
+        "average_execution_score": _avg(e.execution_score for e in edges),
+        "average_legacy_score": _avg(
+            e.legacy_score if e.legacy_score is not None else e.score for e in edges
+        ),
         "average_clv_points": _avg(e.clv_points for e in edges),
         "average_clv_percent": _avg(e.clv_percent for e in edges),
         "positive_clv_rate": _positive_clv_rate(edges),
@@ -919,6 +1376,9 @@ def _edge_perf(edge: MlbEdge) -> dict[str, Any]:
         "market": edge.market,
         "side": edge.side,
         "score": edge.score,
+        "prediction_score": edge.prediction_score,
+        "execution_score": edge.execution_score,
+        "legacy_score": edge.legacy_score if edge.legacy_score is not None else edge.score,
         "win_loss_push": edge.win_loss_push,
         "clv_points": edge.clv_points,
         "clv_percent": edge.clv_percent,

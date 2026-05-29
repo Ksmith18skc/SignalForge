@@ -15,6 +15,7 @@ from app.services.mlb_performance import (
     lookup_edge_score_band,
     performance_by_market,
     performance_by_projection_bucket,
+    performance_by_score_axis,
     performance_by_score_band,
     performance_by_side,
     performance_by_timing,
@@ -38,6 +39,8 @@ def _edge(**kwargs):
         "best_book": "DraftKings",
         "best_price": 1.91,
         "score": 82,
+        "prediction_score": 78,
+        "execution_score": 60,
         "confidence": "high",
         "action": "Bettable only at price",
         "chase_risk": "low",
@@ -45,6 +48,7 @@ def _edge(**kwargs):
         "factors": {"odds_edge": 80, "environment": 70},
     }
     defaults.update(kwargs)
+    defaults["legacy_score"] = kwargs.get("legacy_score", defaults["score"])
     return MlbEdge(**defaults)
 
 
@@ -98,6 +102,43 @@ def test_performance_reports_group_by_market_and_score_band(db_session):
     assert any(row["edge_type"] == "game_total" for row in by_market)
     assert any(row["score_band"] == "85+" for row in by_band)
     assert clv["edges_with_clv"] == 2
+    assert summary["average_prediction_score"] is not None
+    assert summary["average_execution_score"] is not None
+
+
+def test_performance_reports_prediction_and_execution_score_axes(db_session):
+    e1 = _edge(
+        game_pk=10,
+        score=90,
+        legacy_score=90,
+        prediction_score=86,
+        execution_score=62,
+        best_price=2.0,
+        recommended_line=8.5,
+    )
+    e2 = _edge(
+        game_pk=11,
+        score=70,
+        legacy_score=70,
+        prediction_score=58,
+        execution_score=88,
+        best_price=2.0,
+        recommended_line=8.5,
+    )
+    grade_edge(e1, closing_line=9.0, closing_price=1.8, win_loss_push="win")
+    grade_edge(e2, closing_line=8.0, closing_price=1.8, win_loss_push="loss")
+    db_session.add_all([e1, e2])
+    db_session.commit()
+
+    by_prediction = performance_by_score_axis(db_session, axis="prediction")
+    by_execution = performance_by_score_axis(db_session, axis="execution")
+
+    pred_85 = next(r for r in by_prediction if r["score_band"] == "85+")
+    exec_85 = next(r for r in by_execution if r["score_band"] == "85+")
+    assert pred_85["graded_edges"] == 1
+    assert pred_85["wins"] == 1
+    assert exec_85["graded_edges"] == 1
+    assert exec_85["losses"] == 1
 
 
 def test_lookup_edge_score_band_aggregates_similar_graded_edges(db_session):
