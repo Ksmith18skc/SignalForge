@@ -456,6 +456,54 @@ def list_signals(
     return [_enrich_signal(s) for s in signals]
 
 
+# ---------------------------- tracked-wallet live positions ------------------
+#
+# These routes intentionally bypass the Signal pipeline. The "Tracked
+# Wallet Live Positions" panel must surface raw Trade rows even when
+# the signal engine dropped them for score-threshold or market-date
+# normalization reasons — otherwise the dashboard renders "No
+# current-card wallet flow found" while the scanner reports 5000+
+# rejected rows.
+
+
+@router.get("/tracked-wallet-positions")
+def list_tracked_wallet_positions(
+    db: Session = Depends(get_db),
+    date: str | None = None,
+) -> list[dict[str, object]]:
+    """Raw tracked-wallet trades plausibly belonging to ``date``.
+
+    No score threshold; sport-agnostic. The dashboard's Command Center
+    panel feeds off this so the operator always sees "X tracked wallet
+    positions found today" when they exist, even if no Signal row was
+    generated for them.
+    """
+    from app.services.tracked_wallet_positions import live_positions
+
+    target = date or arizona_today()
+    return live_positions(db, card_date=target)
+
+
+@router.get("/tracked-wallet-positions/debug")
+def tracked_wallet_positions_debug(
+    db: Session = Depends(get_db),
+    date: str | None = None,
+    limit: int = 50,
+) -> dict[str, object]:
+    """Per-row rejection diagnostics for the Wallet Flow debug panel.
+
+    Returns the count buckets the user requested (raw, accepted,
+    rejected, reason histogram) plus up to ``limit`` worked examples
+    with the wallet nickname, slug, parsed date, expected date, and
+    normalized key so the operator can see EXACTLY why a row was
+    dropped.
+    """
+    from app.services.tracked_wallet_positions import live_position_debug
+
+    target = date or arizona_today()
+    return live_position_debug(db, card_date=target, limit=max(0, int(limit)))
+
+
 # ---------------------------- alerts ----------------------------------------
 
 

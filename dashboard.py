@@ -3280,6 +3280,42 @@ def fetch_tracked_wallet_positions(limit: int = 500) -> list[dict[str, Any]]:
 
 
 @st.cache_data(ttl=10, show_spinner=False)
+def fetch_tracked_wallet_live_positions(
+    card_date: str = CARD_DATE,
+) -> list[dict[str, Any]]:
+    """Raw tracked-wallet Trade rows for ``card_date``.
+
+    Bypasses the Signal pipeline so positions show up even when the
+    score threshold or market-date normalizer would have dropped them
+    from the curated signal feed. The Command Center panel
+    "Tracked Wallet Live Positions" feeds off this — it's the source of
+    truth for "do my tracked wallets have any open positions today?"
+    that the dashboard NEEDS to answer truthfully.
+    """
+    return safe_get(
+        "/tracked-wallet-positions",
+        default=[],
+        params={"date": card_date},
+    )
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_tracked_wallet_debug(card_date: str = CARD_DATE) -> dict[str, Any]:
+    """Per-rejection diagnostics for the Wallet Flow debug panel."""
+    return safe_get(
+        "/tracked-wallet-positions/debug",
+        default={
+            "raw_recent_trades": 0,
+            "accepted_for_card_date": 0,
+            "rejected": 0,
+            "rejection_reasons": {},
+            "top_rejected_examples": [],
+        },
+        params={"date": card_date, "limit": 50},
+    )
+
+
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_alerts(limit: int = 200, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
     return safe_get("/alerts", default=[], params={"limit": limit, "date": card_date})
 
@@ -3670,6 +3706,15 @@ positions_all = aggregate_signals_to_positions(signals_all)
 # upcoming-slate or no-slate markets still surfaces.
 all_wallet_signals = fetch_tracked_wallet_positions(limit=500)
 all_wallet_positions = aggregate_signals_to_positions(all_wallet_signals)
+# Raw tracked-wallet trade rows. Critical: this bypasses the Signal
+# pipeline so positions appear even when the signal engine dropped them
+# for score-threshold or market-date normalization reasons. The
+# Command Center NEVER shows "no current-card wallet flow" while this
+# list is non-empty.
+tracked_wallet_live_positions = fetch_tracked_wallet_live_positions(
+    card_date=selected_card_date,
+)
+tracked_wallet_debug = fetch_tracked_wallet_debug(card_date=selected_card_date)
 alerts_all = fetch_alerts(limit=200, card_date=selected_card_date)
 historical_alerts = fetch_historical_alerts(limit=200)
 mlb_edges_all = fetch_mlb_edges(limit=100, card_date=selected_card_date)
@@ -4171,6 +4216,174 @@ with tab_command:
     )
     st.markdown(ribbon_html, unsafe_allow_html=True)
 
+    # -----------------------------------------------------------------------
+    # Tracked Wallet Live Positions — always shown when raw positions
+    # exist, regardless of whether they survived the Signal pipeline's
+    # card-date / score-threshold filters. This is the panel that
+    # guarantees the dashboard never shows "no current-card wallet flow"
+    # while the scanner is reporting active positions.
+    # -----------------------------------------------------------------------
+    from app.services.tracked_wallet_positions import (
+        classify_wallet_against_edges,
+        edges_indexed_by_key,
+    )
+
+    edge_index_for_wallets = edges_indexed_by_key(mlb_edges_all or [])
+    classified_live_positions = [
+        classify_wallet_against_edges(pos, edge_index_for_wallets)
+        for pos in (tracked_wallet_live_positions or [])
+    ]
+    live_count = len(classified_live_positions)
+    matched_count = sum(
+        1 for p in classified_live_positions
+        if p.get("edge_match_kind") in {"exact_line", "matchup_date"}
+    )
+    wallet_only_count = sum(
+        1 for p in classified_live_positions
+        if p.get("edge_match_kind") == "wallet_only"
+    )
+    st.markdown(
+        f"### Tracked Wallet Live Positions — {live_count} found today"
+    )
+    if classified_live_positions:
+        st.caption(
+            f"{matched_count} match an MLB edge · {wallet_only_count} "
+            "wallet-only (no matching edge) · sourced from raw Trade rows, "
+            "no score threshold."
+        )
+        live_rows = []
+        for pos in classified_live_positions:
+            kind = pos.get("edge_match_kind") or "wallet_only"
+            badge = {
+                "exact_line": "✅ Wallet Confirmed (exact line)",
+                "matchup_date": "✅ Wallet Confirmed (matchup)",
+                "sport_date": "wallet near edge",
+                "wallet_only": "wallet-only",
+            }.get(kind, kind)
+            live_rows.append({
+                "status": badge,
+                "trader": pos.get("wallet_nickname") or DASH,
+                "sport": pos.get("sport") or DASH,
+                "matchup": pos.get("market_title") or pos.get("market_slug") or DASH,
+                "side": pos.get("side") or DASH,
+                "outcome": pos.get("outcome") or DASH,
+                "entry_price": pos.get("entry_price"),
+                "current_yes": pos.get("current_yes_price"),
+                "size_usd": pos.get("size_usd"),
+                "opened_at": pos.get("opened_at") or DASH,
+                "event_date": pos.get("parsed_event_date") or DASH,
+                "normalized_key": pos.get("normalized_market_key") or DASH,
+                "platform": pos.get("market_platform") or DASH,
+                "market_slug": pos.get("market_slug") or DASH,
+            })
+        st.dataframe(
+            pd.DataFrame(live_rows).fillna(DASH),
+            use_container_width=True,
+            hide_index=True,
+            height=min(360, 60 + 32 * len(live_rows)),
+            column_config={
+                "entry_price": st.column_config.NumberColumn("entry", format="%.3f"),
+                "current_yes": st.column_config.NumberColumn("current yes", format="%.3f"),
+                "size_usd": st.column_config.NumberColumn("size $", format="$%.0f"),
+            },
+        )
+    else:
+        st.info(
+            "No tracked-wallet trades in the last 36h for "
+            f"{selected_card_date}. The scanner debug panel below shows "
+            "exactly why each candidate row was rejected — open it before "
+            "blaming the data."
+        )
+
+    # -----------------------------------------------------------------------
+    # Wallet-Confirmed Edge Cards — the strict join: only edges where
+    # a tracked wallet has a current position. This is what the
+    # operator looks at when they want "wallet+model agree."
+    # -----------------------------------------------------------------------
+    confirmed_edges_seen: set[int] = set()
+    confirmed_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for pos in classified_live_positions:
+        matched_edge = pos.get("matched_edge")
+        if not matched_edge:
+            continue
+        if pos.get("edge_match_kind") not in {"exact_line", "matchup_date"}:
+            continue
+        edge_id = matched_edge.get("id")
+        if edge_id is not None and edge_id in confirmed_edges_seen:
+            continue
+        if edge_id is not None:
+            confirmed_edges_seen.add(edge_id)
+        confirmed_pairs.append((pos, matched_edge))
+
+    st.markdown(
+        f"### Wallet-Confirmed Edge Cards — {len(confirmed_pairs)} match"
+        + ("" if len(confirmed_pairs) == 1 else "es")
+    )
+    if confirmed_pairs:
+        confirmed_rows = []
+        for pos, edge in confirmed_pairs:
+            confirmed_rows.append({
+                "trader": pos.get("wallet_nickname") or DASH,
+                "wallet_side": pos.get("side") or DASH,
+                "market": edge.get("market") or DASH,
+                "edge_side": (edge.get("side") or "").title(),
+                "prediction": edge.get("prediction_score"),
+                "execution": edge.get("execution_score"),
+                "size_usd": pos.get("size_usd"),
+                "match_kind": pos.get("edge_match_kind"),
+            })
+        st.dataframe(
+            pd.DataFrame(confirmed_rows).fillna(DASH),
+            use_container_width=True,
+            hide_index=True,
+            height=min(280, 60 + 32 * len(confirmed_rows)),
+            column_config={
+                "prediction": st.column_config.NumberColumn("prediction", format="%.1f"),
+                "execution": st.column_config.NumberColumn("execution", format="%.1f"),
+                "size_usd": st.column_config.NumberColumn("size $", format="$%.0f"),
+            },
+        )
+    else:
+        st.caption(
+            "No wallet-confirmed edges right now. Wallet-only positions "
+            "still appear in the panel above."
+        )
+
+    # -----------------------------------------------------------------------
+    # Wallet Flow debug panel — counts plus worked examples for every
+    # rejection so the operator can see exactly why a row was hidden.
+    # -----------------------------------------------------------------------
+    with st.expander(
+        f"Wallet Flow debug panel · "
+        f"{tracked_wallet_debug.get('raw_recent_trades') or 0} raw / "
+        f"{tracked_wallet_debug.get('accepted_for_card_date') or 0} accepted / "
+        f"{tracked_wallet_debug.get('rejected') or 0} rejected",
+        expanded=False,
+    ):
+        dbg_cols = st.columns(4)
+        dbg_cols[0].metric("Raw recent trades (36h)", tracked_wallet_debug.get("raw_recent_trades") or 0)
+        dbg_cols[1].metric("Accepted for card_date", tracked_wallet_debug.get("accepted_for_card_date") or 0)
+        dbg_cols[2].metric("Rejected", tracked_wallet_debug.get("rejected") or 0)
+        dbg_cols[3].metric("Displayed", live_count)
+        reasons = tracked_wallet_debug.get("rejection_reasons") or {}
+        if reasons:
+            st.markdown("**Rejection reason histogram**")
+            st.dataframe(
+                pd.DataFrame(
+                    [{"reason": k, "count": v} for k, v in reasons.items()]
+                ).sort_values("count", ascending=False),
+                use_container_width=True, hide_index=True,
+            )
+        examples = tracked_wallet_debug.get("top_rejected_examples") or []
+        if examples:
+            st.markdown("**Top 10 rejected examples**")
+            st.dataframe(
+                pd.DataFrame(examples[:10]).fillna(DASH),
+                use_container_width=True, hide_index=True,
+            )
+        elif (tracked_wallet_debug.get("rejected") or 0) == 0:
+            st.caption("No rejections in window.")
+
     left, right = st.columns([3, 2], gap="medium")
 
     with left:
@@ -4242,18 +4455,28 @@ with tab_command:
         if top_wallets:
             for sig in top_wallets:
                 render_wallet_card(sig)
+        elif wallet_filters_hide_current:
+            render_empty_state(
+                "Current-card wallet flow hidden by filters.",
+                f"{len(positions_all)} current-card signal(s) exist. "
+                "Lower the score filter or clear sidebar filters.",
+            )
+        elif len(classified_live_positions) > 0:
+            # Curated signal feed is empty, but raw wallet activity is
+            # not — point the operator at the panel above instead of
+            # pretending nothing is happening.
+            render_empty_state(
+                "No HIGH-conviction wallet flow — but raw activity exists.",
+                f"{len(classified_live_positions)} tracked-wallet position(s) "
+                f"are open for {selected_card_date}. None cleared the "
+                "Signal pipeline's score threshold, so they're surfaced "
+                "in 'Tracked Wallet Live Positions' above. Open the Wallet "
+                "Flow debug panel for the rejection breakdown.",
+            )
         else:
             render_empty_state(
-                (
-                    "Current-card wallet flow hidden by filters."
-                    if wallet_filters_hide_current
-                    else "No current-card wallet flow found."
-                ),
-                (
-                    f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
-                    if wallet_filters_hide_current
-                    else f"No {selected_card_date} wallet flow meets the live-card filters."
-                ),
+                "No current-card wallet flow found.",
+                f"No {selected_card_date} wallet flow meets the live-card filters.",
             )
 
     with right:
