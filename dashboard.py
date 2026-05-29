@@ -1940,6 +1940,10 @@ def render_edge_card(edge: dict[str, Any]) -> None:
     factors = edge.get("factors") or {}
 
     # --- Prioritized sections (#10 visual hierarchy) ---
+    # Top-of-card status badges (Wallet Confirmed / Sportsbook Edge /
+    # Prediction Market Listed / Stale Odds / etc.) replace the older
+    # technical pill stack so the homepage reads like a trader card.
+    primary_badges = _primary_badges(edge)
     # Structured Market/Model/Edge/Wallet trader block — sits at the top
     # so the executable line, projection, and edge-vs-line are visible
     # without expanding the technical-factors block.
@@ -2001,6 +2005,7 @@ def render_edge_card(edge: dict[str, Any]) -> None:
           {''.join(prob_row_parts)}
         </div>
       </div>
+      {primary_badges}
       {trader_debug}
       {source_stack}
       {execution_section}
@@ -2050,15 +2055,72 @@ def _trader_card_title(signal: dict[str, Any]) -> str:
     return signal.get("market_title") or signal.get("market_slug") or DASH
 
 
+_PRIMARY_BADGE_STYLES: dict[str, str] = {
+    # Operator-friendly labels — replaces the older technical-jargon
+    # pills (SRC FALCON / WALLET CONFIRMED / etc.) on the homepage.
+    "Wallet Confirmed":          "green",
+    "Sportsbook Edge":           "gold",
+    "Prediction Market Listed":  "purple",
+    "Stale Odds":                "red",
+    "No Wallet Data":            "muted",
+    "Needs Review":              "red",
+    "Line Mismatch":             "red",
+    "Chase Risk":                "red",
+}
+
+
+def _primary_badges(signal: dict[str, Any]) -> str:
+    """Top-of-card status pills that summarize the decision picture.
+
+    Replaces the dense technical badge stack on the homepage cards
+    with six labels an operator can read at a glance. Computed from
+    the same fields the score uses — never invented.
+    """
+    badges: list[str] = []
+    consensus = int(signal.get("consensus_wallets") or 0)
+    if consensus >= 1:
+        badges.append("Wallet Confirmed")
+    elif signal.get("source") or signal.get("market_slug"):
+        # We had a chance to measure wallet flow and didn't find any —
+        # that's "no wallet data", not silence.
+        badges.append("No Wallet Data")
+
+    if signal.get("best_price") is not None or (
+        isinstance(signal.get("execution"), dict)
+        and (signal["execution"].get("price") or signal["execution"].get("side_price"))
+    ):
+        badges.append("Sportsbook Edge")
+
+    if signal.get("market_url") and "polymarket.com" in str(signal.get("market_url")):
+        badges.append("Prediction Market Listed")
+
+    if signal.get("odds_stale"):
+        badges.append("Stale Odds")
+    if signal.get("warnings"):
+        badges.append("Needs Review")
+
+    if not badges:
+        return ""
+    chunks = "".join(
+        f"<span class='sf-badge sf-badge-{_PRIMARY_BADGE_STYLES.get(label, 'muted')}'>"
+        f"{html.escape(label)}</span>"
+        for label in badges
+    )
+    return f"<div class='sf-card-row' style='margin-top:2px;'>{chunks}</div>"
+
+
 def _trader_debug_block(signal: dict[str, Any]) -> str:
     """Render the structured trader-card lines requested in the spec::
 
         Market: TOR @ BAL Over 8.5
         Model: 9.77
-        Edge: +1.27 runs
+        Edge vs line: +1.27 runs
         Best executable price: <book> <price> / <implied>
         Wallet confirmation: yes/no
-        Internal key: mlb:tor-bal:2026-05-28:game_total:over:8.5
+
+    Plus a collapsed ``<details>`` "Debug details" block holding the
+    join key + low-level internals an operator only needs when
+    something looks wrong.
 
     All values are pulled from the signal/edge dict directly — no
     field is invented. A row is omitted when its value isn't available,
@@ -2082,7 +2144,8 @@ def _trader_debug_block(signal: dict[str, Any]) -> str:
     if parsed and parsed.away_abbr and parsed.home_abbr:
         matchup = f"{parsed.away_abbr.upper()} @ {parsed.home_abbr.upper()}"
 
-    rows: list[tuple[str, str]] = []
+    visible_rows: list[tuple[str, str]] = []
+    debug_rows: list[tuple[str, str]] = []
 
     # Market line — exact sportsbook value, no extra rounding so a
     # 10.0 line displays as "10.0" exactly as listed.
@@ -2091,14 +2154,14 @@ def _trader_debug_block(signal: dict[str, Any]) -> str:
         if "." not in line_disp:
             line_disp = f"{line_disp}.0"
         market_label = f"{matchup} {side} {line_disp}".strip() if matchup else f"{side} {line_disp}".strip()
-        rows.append(("Market", market_label))
+        visible_rows.append(("Market", market_label))
     elif matchup:
-        rows.append(("Market", f"{matchup} {side}".strip()))
+        visible_rows.append(("Market", f"{matchup} {side}".strip()))
 
     # Model projection — 2 decimals.
     if model_projection is not None:
         try:
-            rows.append(("Model", f"{float(model_projection):.2f}"))
+            visible_rows.append(("Model", f"{float(model_projection):.2f}"))
         except (TypeError, ValueError):
             pass
 
@@ -2108,7 +2171,7 @@ def _trader_debug_block(signal: dict[str, Any]) -> str:
             delta = float(model_projection) - float(market_line)
             sign = "+" if delta >= 0 else ""
             unit = " runs" if (parsed and parsed.market_type == "total") else ""
-            rows.append(("Edge vs line", f"{sign}{delta:.2f}{unit}"))
+            visible_rows.append(("Edge vs line", f"{sign}{delta:.2f}{unit}"))
         except (TypeError, ValueError):
             pass
 
@@ -2129,42 +2192,76 @@ def _trader_debug_block(signal: dict[str, Any]) -> str:
             )
             parts = [p for p in (book, price_part, implied_part) if p]
             if parts:
-                rows.append(("Best executable price", " · ".join(parts)))
+                visible_rows.append(("Best executable price", " · ".join(parts)))
 
     # Wallet confirmation — derived from consensus_wallets count.
     consensus = int(signal.get("consensus_wallets") or 0)
     if consensus:
-        rows.append(("Wallet confirmation", f"yes ({consensus} tracked)"))
-    else:
+        visible_rows.append(("Wallet confirmation", f"yes ({consensus} tracked)"))
+    elif exec_block or market_line is not None:
         # Only show "no" when we have a confirmed market context;
         # otherwise the row is misleading (it's not "no", we just
         # didn't measure).
-        if exec_block or market_line is not None:
-            rows.append(("Wallet confirmation", "no"))
+        visible_rows.append(("Wallet confirmation", "no"))
 
     # Prediction-market match status.
     pm_status = signal.get("prediction_market_status")
     if pm_status == "not_listed" or (
         signal.get("source") and not signal.get("market_url") and slug == ""
     ):
-        rows.append(("Prediction market", "not listed"))
+        visible_rows.append(("Prediction market", "not listed"))
 
+    # ----- Debug-only fields (collapsed by default) ----------------------
     # Internal join key — colon-separated, never appears in a URL.
     if parsed:
         side_for_key = (signal.get("side") or signal.get("outcome") or "").strip().lower()
         key = wmr.internal_market_key(parsed, side=side_for_key)
         if key:
-            rows.append(("Internal key", key))
+            debug_rows.append(("Internal key", key))
+    if slug:
+        debug_rows.append(("Market slug", slug))
+    if signal.get("market_id"):
+        debug_rows.append(("Market ID", str(signal.get("market_id"))))
+    candidate_count = signal.get("candidate_markets_count") or signal.get("candidate_count")
+    if candidate_count is not None:
+        debug_rows.append(("Candidate markets", str(candidate_count)))
+    matched_slug = signal.get("matched_market_slug")
+    if matched_slug:
+        debug_rows.append(("Matched market slug", str(matched_slug)))
+    line_tol = signal.get("line_tolerance")
+    if line_tol is not None:
+        debug_rows.append(("Line tolerance", str(line_tol)))
+    sb_event = signal.get("sportsbook_event") or signal.get("source_url")
+    if sb_event:
+        debug_rows.append(("Sportsbook event", str(sb_event)))
+    wallet_join = signal.get("wallet_join_debug")
+    if wallet_join:
+        debug_rows.append(("Wallet join debug", str(wallet_join)))
 
-    if not rows:
+    if not visible_rows and not debug_rows:
         return ""
 
-    body = "".join(
+    visible_body = "".join(
         f"<div class='sf-card-row sf-meta'><span class='k'>{k}:</span> "
         f"{html.escape(str(v))}</div>"
-        for k, v in rows
+        for k, v in visible_rows
     )
-    return f"<div class='sf-section'>{body}</div>"
+    debug_body = ""
+    if debug_rows:
+        inner = "".join(
+            f"<div class='sf-card-row sf-meta'><span class='k'>{k}:</span> "
+            f"{html.escape(str(v))}</div>"
+            for k, v in debug_rows
+        )
+        # Native <details> — collapsed by default so the homepage card
+        # stays clean while the join debug remains one click away.
+        debug_body = (
+            "<details class='sf-card-debug' style='margin-top:4px;'>"
+            "<summary class='sf-meta' style='cursor:pointer;'>Debug details</summary>"
+            f"<div style='margin-top:4px;'>{inner}</div>"
+            "</details>"
+        )
+    return f"<div class='sf-section'>{visible_body}{debug_body}</div>"
 
 
 def render_wallet_card(signal: dict[str, Any]) -> None:
@@ -2264,6 +2361,10 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
             "</div>"
         )
 
+    # Top-of-card primary badges (Wallet Confirmed / Sportsbook Edge /
+    # Stale Odds / etc.). Same operator-friendly set the edge card uses,
+    # so the homepage reads consistently across signal sources.
+    primary_badges_html = _primary_badges(signal)
     # Structured trader-card details block — sits below the headline
     # market label and surfaces Market vs Model vs Edge vs Wallet
     # confirmation without ever conflating the executable line with the
@@ -2293,6 +2394,7 @@ def render_wallet_card(signal: dict[str, Any]) -> None:
           </div>
         </div>
       </div>
+      {primary_badges_html}
       <div style="margin-bottom:4px;">{pills_html}</div>
       {trader_block}
       {sharp_block}
@@ -3502,48 +3604,57 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-action_cols = st.columns([1, 1, 1, 1, 6])
-# Each button is disabled while its own dashboard-side job is in flight so a
-# double-click can't spawn a duplicate scan. The wallet-scan button also
-# respects the backend's own scan-status flag — the worker tracks long-running
-# scans across reloads, and we don't want to launch a second one on top.
+# Controls live in a compact expander so the homepage stays
+# decision-focused. Each button is disabled while its own dashboard-side
+# job is in flight so a double-click can't spawn a duplicate scan. The
+# wallet-scan button also respects the backend's own scan-status flag —
+# the worker tracks long-running scans across reloads, and we don't want
+# to launch a second one on top.
 wallet_scan_active = is_job_running("wallet_scan") or scan_status_payload.get("state") == "running"
 mlb_edge_active = is_job_running("mlb_edge_scan")
 odds_cache_active = is_job_running("odds_cache_refresh")
 backend_test_active = is_job_running("backend_test")
 
-with action_cols[0]:
-    scan_label = "Wallet scan running…" if wallet_scan_active else "Run wallet scan"
-    if st.button(
-        scan_label, use_container_width=True, type="primary",
-        disabled=wallet_scan_active, key="cc_btn_wallet_scan",
-    ):
-        _job_log("button_click", name="run_wallet_scan")
-        action_run_wallet_scan()
-with action_cols[1]:
-    mlb_label = "MLB edge scan running…" if mlb_edge_active else "Run MLB edge scan"
-    if st.button(
-        mlb_label, use_container_width=True, type="primary",
-        disabled=mlb_edge_active, key="cc_btn_mlb_edge_scan",
-    ):
-        _job_log("button_click", name="run_mlb_edge_scan")
-        action_run_mlb_edge_scan()
-with action_cols[2]:
-    odds_label = "Refreshing odds…" if odds_cache_active else "Refresh odds cache"
-    if st.button(
-        odds_label, use_container_width=True,
-        disabled=odds_cache_active, key="cc_btn_refresh_odds_cache",
-    ):
-        _job_log("button_click", name="refresh_odds_cache")
-        action_refresh_odds_cache()
-with action_cols[3]:
-    test_label = "Testing backend…" if backend_test_active else "Test backend"
-    if st.button(
-        test_label, use_container_width=True,
-        disabled=backend_test_active, key="cc_btn_test_backend",
-    ):
-        _job_log("button_click", name="test_backend")
-        action_test_backend()
+# Auto-expand only when a job is in flight — the operator wants to see
+# the control bar while something is running, but otherwise the
+# collapsed bar keeps the focus on top signals.
+any_job_active = wallet_scan_active or mlb_edge_active or odds_cache_active or backend_test_active
+with st.expander(
+    "Controls", expanded=any_job_active,
+):
+    action_cols = st.columns([1, 1, 1, 1, 6])
+    with action_cols[0]:
+        scan_label = "Wallet scan running…" if wallet_scan_active else "Run wallet scan"
+        if st.button(
+            scan_label, use_container_width=True, type="primary",
+            disabled=wallet_scan_active, key="cc_btn_wallet_scan",
+        ):
+            _job_log("button_click", name="run_wallet_scan")
+            action_run_wallet_scan()
+    with action_cols[1]:
+        mlb_label = "MLB edge scan running…" if mlb_edge_active else "Run MLB edge scan"
+        if st.button(
+            mlb_label, use_container_width=True, type="primary",
+            disabled=mlb_edge_active, key="cc_btn_mlb_edge_scan",
+        ):
+            _job_log("button_click", name="run_mlb_edge_scan")
+            action_run_mlb_edge_scan()
+    with action_cols[2]:
+        odds_label = "Refreshing odds…" if odds_cache_active else "Refresh odds cache"
+        if st.button(
+            odds_label, use_container_width=True,
+            disabled=odds_cache_active, key="cc_btn_refresh_odds_cache",
+        ):
+            _job_log("button_click", name="refresh_odds_cache")
+            action_refresh_odds_cache()
+    with action_cols[3]:
+        test_label = "Testing backend…" if backend_test_active else "Test backend"
+        if st.button(
+            test_label, use_container_width=True,
+            disabled=backend_test_active, key="cc_btn_test_backend",
+        ):
+            _job_log("button_click", name="test_backend")
+            action_test_backend()
 
 # Single scoped status line — replaces every page-wide `st.spinner` overlay
 # the dashboard used to throw up during background work.
@@ -3714,11 +3825,15 @@ with scan_ctl_cols[1]:
 
 stale_positions_hidden = int(dashboard_debug_payload.get("stale_wallet_positions_hidden") or 0)
 stale_alerts_hidden = int(dashboard_debug_payload.get("stale_alerts_hidden") or 0)
-if stale_positions_hidden or stale_alerts_hidden:
-    st.info(
-        "Historical / stale, not today's card: "
-        f"{stale_positions_hidden} wallet position signal(s) and "
-        f"{stale_alerts_hidden} alert(s) are hidden from the live {selected_card_date} card."
+archived_total = stale_positions_hidden + stale_alerts_hidden
+if archived_total:
+    # Neutral note — the previous wording made historical retention sound
+    # like an outage. Operators just need to know how many records the
+    # date filter is currently scoping out.
+    st.caption(
+        f"Showing today's opportunities only. "
+        f"{archived_total:,} historical records archived "
+        f"(scoped out by card date {selected_card_date})."
     )
 
 if not mlb_edges_all and odds_cache_status in {"stale", "empty"}:
@@ -3726,29 +3841,25 @@ if not mlb_edges_all and odds_cache_status in {"stale", "empty"}:
 mlb_blocked_by_stale_odds = not mlb_edges_all and odds_cache_status in {"stale", "empty"}
 
 
-# Header metric strip — the 7 numbers an operator wants in one glance.
-m1, m2, m3, m4, m5, m6, m7 = st.columns(7)
-m1.metric("Active positions", len(positions_all))
-m2.metric("MLB edges today", len(mlb_edges_all))
-m3.metric("High conviction", len(high_conviction))
-m4.metric("Avg CLV", fmt_pct(clv_block.get("average_clv_percent")))
-m5.metric("Graded edges", perf_summary.get("graded_edges") or 0)
-m6.metric(
-    "Odds cache",
-    odds_cache_status.upper(),
-    delta=f"{odds_cache_payload.get('fresh', 0)} fresh",
-    delta_color="normal",
-)
-falcon_calls = int(falcon_info.get("last_scan_calls") or falcon_info.get("calls") or 0)
-falcon_ok = int(falcon_info.get("last_scan_successes") or falcon_info.get("successes") or 0)
-m7.metric(
-    "Falcon",
-    f"{falcon_ok}/{falcon_calls}" if falcon_calls else "—",
-    delta=("healthy" if falcon_info.get("healthy") else "offline"),
-    delta_color="normal" if falcon_info.get("healthy") else "inverse",
-)
-
-render_pnl_summary_cards(pnl_payload, fmt_money=fmt_money, fmt_num=fmt_num)
+# Decision-focused KPI strip — only the four numbers the operator
+# needs to answer "what should I bet right now?".
+#   Games Today      — slate size, the universe we're picking from
+#   Edges Found      — total MLB edges in today's scan
+#   Wallet Signals   — tracked-wallet activity for today's card
+#   High Conviction  — edges above the strong-signal threshold
+#
+# The previous seven-column strip carried P&L, CLV, Falcon health, odds
+# cache — useful, but operator-facing detail that belongs in the
+# dedicated P&L Tracker / Performance / Odds Cache / Health tabs. P&L
+# summary cards moved into `tab_pnl` (see below) so the homepage stays
+# focused on opportunities, not portfolio state.
+games_today_count = int((mlb_sources.get("row_counts") or {}).get("mlb_games", 0))
+wallet_signals_count = len(positions_all)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Games Today", games_today_count)
+m2.metric("Edges Found", len(mlb_edges_all))
+m3.metric("Wallet Signals", wallet_signals_count)
+m4.metric("High Conviction", len(high_conviction))
 
 
 # =============================================================================
@@ -3825,7 +3936,7 @@ with tab_command:
     left, right = st.columns([3, 2], gap="medium")
 
     with left:
-        st.markdown("### TOP ACTIONABLE OPPORTUNITIES")
+        st.markdown("### Top Signals Today")
         top_decisions = sorted(
             [
                 e for e in mlb_edges_all
@@ -3840,18 +3951,30 @@ with tab_command:
             for edge in top_decisions:
                 render_edge_card(edge)
         else:
-            render_empty_state(
-                "NO ACTIONABLE OPPORTUNITIES",
-                (
-                    "Odds cache stale; refresh odds before running the edge scan."
-                    if mlb_blocked_by_stale_odds
-                    else "System is monitoring. Check MLB Terminal for watchlist candidates."
-                ),
-                actions=[
-                    ("Run MLB edge scan", action_run_mlb_edge_scan),
-                    ("Refresh odds cache", action_refresh_odds_cache),
-                ],
-            )
+            # Per spec: distinct empty-state for the high-conviction
+            # section vs. the lower-priority watchlist section below.
+            if mlb_blocked_by_stale_odds:
+                render_empty_state(
+                    "No actionable signals",
+                    "Odds cache is stale — refresh odds before running the edge scan.",
+                    actions=[
+                        ("Refresh odds cache", action_refresh_odds_cache),
+                        ("Run MLB edge scan", action_run_mlb_edge_scan),
+                    ],
+                )
+            elif not mlb_edges_all:
+                render_empty_state(
+                    "No actionable signals",
+                    "No edges have been generated for today. Run the MLB edge scan or refresh the odds cache.",
+                    actions=[
+                        ("Run MLB edge scan", action_run_mlb_edge_scan),
+                        ("Refresh odds cache", action_refresh_odds_cache),
+                    ],
+                )
+            else:
+                st.info(
+                    "No high-conviction signals yet. Showing watchlist candidates below."
+                )
         # If nothing crossed the high-conviction bar, explain why using
         # only real counts derived from the returned edges.
         render_why_no_high_conviction(mlb_edges_all)
@@ -3897,26 +4020,33 @@ with tab_command:
 
     with right:
         st.markdown("### Market Pulse")
-        rc = (mlb_sources.get("row_counts") or {})
+        # Slimmed to four operator-facing numbers — raw counts (odds
+        # snaps, prop snaps, source health) live in Odds Cache / Health.
         edges_with_warnings = sum(1 for e in mlb_edges_all if e.get("warnings"))
+        last_refresh_label = (
+            compact_time_ago(prev_refresh, now=now_utc) if prev_refresh else "just now"
+        )
 
-        def _chip(label: str, value: Any, kind: str = "") -> str:
+        def _pulse_row(label: str, value: Any, kind: str = "") -> str:
+            kind_cls = f" {kind}" if kind else ""
             return (
-                f"<div class='sf-chip {kind}'><span class='lbl'>{label}</span>"
-                f"<span class='val'>{value}</span></div>"
+                "<div class='sf-card-row sf-meta'>"
+                f"<span class='k'>{label}:</span> "
+                f"<span class='val{kind_cls}'>{value}</span>"
+                "</div>"
             )
 
-        chip_kind_for_count = lambda n, ok_min=1: ("ok" if n >= ok_min else "")  # noqa: E731
-        chips = "".join([
-            _chip("Games", rc.get("mlb_games", 0), chip_kind_for_count(rc.get("mlb_games", 0))),
-            _chip("Edges", len(mlb_edges_all), chip_kind_for_count(len(mlb_edges_all))),
-            _chip("High Conv", len(high_conviction), "ok" if high_conviction else ""),
-            _chip("Odds Snaps", rc.get("odds_snapshots", 0), "info"),
-            _chip("Prop Snaps", rc.get("pitcher_prop_snapshots", 0), "info"),
-            _chip("Warnings", edges_with_warnings, "warn" if edges_with_warnings else ""),
-            _chip("Missing Odds", len(missing_odds_edges), "warn" if missing_odds_edges else ""),
-        ])
-        st.markdown(f"<div class='sf-chips'>{chips}</div>", unsafe_allow_html=True)
+        review_kind = "warn" if edges_with_warnings else ""
+        missing_kind = "warn" if missing_odds_edges else ""
+        pulse_html = (
+            "<div class='sf-card'>"
+            + _pulse_row("Edges found", len(mlb_edges_all))
+            + _pulse_row("Need review", edges_with_warnings, review_kind)
+            + _pulse_row("Missing odds", len(missing_odds_edges), missing_kind)
+            + _pulse_row("Last refreshed", last_refresh_label)
+            + "</div>"
+        )
+        st.markdown(pulse_html, unsafe_allow_html=True)
 
         st.markdown("### Recent Alerts")
         recent_sent = [a for a in alerts_all if a.get("status") == "sent"][:5]
@@ -4182,6 +4312,10 @@ with tab_wallet:
 # =============================================================================
 
 with tab_pnl:
+    # Summary cards moved off the homepage so the first screen stays
+    # focused on opportunities, not portfolio state — but they remain
+    # the natural lead-in for the dedicated P&L tab.
+    render_pnl_summary_cards(pnl_payload, fmt_money=fmt_money, fmt_num=fmt_num)
     render_pnl_tracker(
         pnl_payload,
         sync_action=action_sync_pnl_wallets,
