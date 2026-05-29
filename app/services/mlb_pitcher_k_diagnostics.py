@@ -65,43 +65,69 @@ class PitcherKDiagnostics:
     unmatched_pitcher_examples: list[dict[str, Any]] = field(default_factory=list)
     fallback_card_examples: list[dict[str, Any]] = field(default_factory=list)
 
+    # Roster diagnostics — the dashboard renders these side-by-side so
+    # the operator can SEE why a name didn't match without scrolling
+    # through individual logs. Both are populated unconditionally each
+    # scan.
+    mlb_probable_pitchers_today: list[dict[str, Any]] = field(default_factory=list)
+    ballparkpal_pitchers_in_cache: list[str] = field(default_factory=list)
+
     def empty_state_message(self) -> str:
         """Choose the most specific message for the current counter state.
 
-        The choices match the spec the user gave: surface the FIRST
-        funnel collapse, so the operator can fix it and re-run rather
-        than playing whack-a-mole on the downstream stages.
+        Branches are ordered from MOST specific to most generic — the
+        first one whose precondition fires wins. That way a "30 BPP rows
+        loaded but 0 matched today's pitchers" outcome reports the real
+        cause instead of being swallowed by the generic "no fallback
+        odds" branch (which was the bug behind the user-visible message
+        ``30 projections loaded, 0 pitcher K odds found ... no
+        BallparkPal fallback odds available either`` while name matching
+        was actually the problem).
         """
         if self.strikeout_projections_loaded == 0:
             return (
                 "Pitcher K scan did not run: 0 strikeout projections "
                 "loaded. Upload a BallparkPal Strikeout CSV first."
             )
+        # Bad-mapping first — when this fires the cache itself is the
+        # problem and re-running won't help. Operator needs to re-upload.
+        if (
+            self.rejected_for_bad_mapping > 0
+            and self.candidates_built_from_ballparkpal_fallback == 0
+        ):
+            return (
+                f"{self.rejected_for_bad_mapping} BallparkPal row(s) "
+                "matched today's pitchers but were rejected by sanity "
+                "checks (line looked like american odds, or "
+                "projected_k / over_line out of range). The cache may "
+                "have been parsed before the explicit over_line / "
+                "over_odds aliases shipped — re-upload the CSV."
+            )
+        # Name mismatch is the next most specific failure. 30 rows
+        # loaded but none of today's MLB probable pitchers found a row.
+        if (
+            self.strikeout_projections_loaded > 0
+            and self.pitcher_names_matched_ballparkpal == 0
+            and self.pitcher_names_matched_sportsbook == 0
+            and self.rejected_for_bad_mapping == 0
+        ):
+            mlb_count = len(self.mlb_probable_pitchers_today)
+            return (
+                f"{self.strikeout_projections_loaded} BallparkPal "
+                f"projections loaded, {mlb_count} MLB probable pitchers "
+                "for today — but 0 names matched. Check the "
+                "'Pitchers MLB expects today' vs 'BallparkPal cache' "
+                "panel below to see the name drift."
+            )
         if (
             self.sportsbook_pitcher_k_props_loaded == 0
             and self.candidates_built_from_ballparkpal_fallback == 0
+            and self.strikeout_projections_loaded == 0
         ):
             return (
                 f"{self.strikeout_projections_loaded} strikeout projections "
                 "loaded, 0 pitcher K odds found in the sportsbook cache "
                 "and no BallparkPal fallback odds available either."
-            )
-        if (
-            self.pitcher_names_matched_sportsbook == 0
-            and self.pitcher_names_matched_ballparkpal == 0
-        ):
-            return (
-                f"{self.strikeout_projections_loaded} projections loaded, "
-                f"{self.sportsbook_pitcher_k_props_loaded} odds rows seen, "
-                "but 0 pitcher names matched. Open the Pitcher K "
-                "diagnostics panel to see the unmatched examples."
-            )
-        if self.rejected_for_bad_mapping > 0 and self.cards_rendered == 0:
-            return (
-                f"{self.rejected_for_bad_mapping} BallparkPal row(s) "
-                "rejected for bad column mapping (line looked like "
-                "odds, or projected_k / over_line out of range). "
-                "Check the Bad Mapping table for worked examples."
             )
         if (
             self.candidates_built_total > 0
@@ -118,7 +144,8 @@ class PitcherKDiagnostics:
         if self.candidates_built_total == 0:
             return (
                 "Pipeline reached the edge builder but produced 0 "
-                "candidates. Open the Pitcher K diagnostics panel."
+                "candidates. Open the Pitcher K diagnostics panel "
+                "below — see the name match + rejection tables."
             )
         return (
             "No qualifying pitcher K edges in this band — open the "

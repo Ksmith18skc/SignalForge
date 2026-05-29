@@ -4761,6 +4761,63 @@ with tab_mlb:
                     use_container_width=True, hide_index=True,
                 )
 
+        # Side-by-side name reconciliation. When 0 pitcher names match,
+        # this is the panel the operator needs. Always rendered (not
+        # gated on a counter) so the operator can confirm the lists
+        # agree on a successful scan, too.
+        mlb_probables = pitcher_k_diag.get("mlb_probable_pitchers_today") or []
+        bpp_pitchers = pitcher_k_diag.get("ballparkpal_pitchers_in_cache") or []
+        if mlb_probables or bpp_pitchers:
+            roster_expand = (
+                pitcher_k_diag.get("pitcher_names_matched_ballparkpal", 0) == 0
+                and pitcher_k_diag.get("pitcher_names_matched_sportsbook", 0) == 0
+            )
+            with st.expander(
+                f"Pitcher name reconciliation · MLB expects "
+                f"{len(mlb_probables)} · BPP cache has {len(bpp_pitchers)}",
+                expanded=roster_expand,
+            ):
+                roster_cols = st.columns(2)
+                with roster_cols[0]:
+                    st.markdown("**Pitchers MLB expects today**")
+                    if mlb_probables:
+                        st.dataframe(
+                            pd.DataFrame(mlb_probables).fillna(DASH),
+                            use_container_width=True, hide_index=True,
+                            height=min(360, 60 + 32 * len(mlb_probables)),
+                        )
+                    else:
+                        st.caption("No probable pitchers returned by MLB StatsAPI.")
+                with roster_cols[1]:
+                    st.markdown("**Pitchers in BallparkPal cache**")
+                    if bpp_pitchers:
+                        st.dataframe(
+                            pd.DataFrame(
+                                [{"pitcher_name": n} for n in bpp_pitchers]
+                            ),
+                            use_container_width=True, hide_index=True,
+                            height=min(360, 60 + 32 * len(bpp_pitchers)),
+                        )
+                    else:
+                        st.caption("BallparkPal cache has no Strikeout Center rows.")
+                if mlb_probables and bpp_pitchers:
+                    # Compute the obvious-overlap on the same alnum key
+                    # the engine uses, so the operator can spot the
+                    # name-drift gap without squinting.
+                    def _key(name: str) -> str:
+                        return "".join(c for c in str(name).lower() if c.isalnum())
+                    mlb_keys = {_key(p.get("pitcher_name")) for p in mlb_probables}
+                    bpp_keys = {_key(n) for n in bpp_pitchers}
+                    overlap = mlb_keys & bpp_keys
+                    only_mlb = mlb_keys - bpp_keys
+                    only_bpp = bpp_keys - mlb_keys
+                    st.caption(
+                        f"Exact-key overlap: {len(overlap)} · "
+                        f"MLB-only: {len(only_mlb)} · BPP-only: {len(only_bpp)}. "
+                        "(Loose matching layers on top of this — first-initial "
+                        "+ last-name still resolves J. Ryan ↔ Joe Ryan.)"
+                    )
+
     st.markdown("### Score Distribution")
     if mlb_blocked_by_stale_odds:
         render_empty_state(

@@ -166,6 +166,27 @@ async def run_daily_mlb_edges(
         )
         bpp_strikeout_rows = {}
     k_diag.strikeout_projections_loaded = len(bpp_strikeout_rows)
+    # Cache pitcher names — what BPP has on file. The dashboard renders
+    # this next to today's MLB probable pitchers so the operator can
+    # spot a name-drift mismatch at a glance.
+    k_diag.ballparkpal_pitchers_in_cache = sorted({
+        str(row.get("pitcher") or "").strip()
+        for row in bpp_strikeout_rows.values()
+        if row.get("pitcher")
+    })
+    # Today's MLB probable pitchers — what the engine actually tried to
+    # match against the cache. Populated up front so even a 0-card scan
+    # surfaces the comparison.
+    for game in games:
+        for pitcher in _pitchers(game):
+            name = (pitcher.get("name") or "").strip()
+            if not name:
+                continue
+            k_diag.mlb_probable_pitchers_today.append({
+                "pitcher_name": name,
+                "team": pitcher.get("team"),
+                "game_pk": game.get("game_pk"),
+            })
 
     created_edges: list[MlbEdge] = []
     totals_count = 0

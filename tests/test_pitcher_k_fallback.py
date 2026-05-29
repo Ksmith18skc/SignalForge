@@ -130,25 +130,70 @@ def test_empty_state_says_no_projections_when_cache_blank():
 
 
 def test_empty_state_says_no_odds_when_no_fallback_either():
+    """The truly empty case: 0 projections loaded → the generic
+    'no fallback odds available either' branch is intentionally
+    quiet about the 30-loaded-but-rejected case (covered by other
+    tests below)."""
     diag = PitcherKDiagnostics(
-        strikeout_projections_loaded=30,
+        strikeout_projections_loaded=0,
         sportsbook_pitcher_k_props_loaded=0,
         candidates_built_from_ballparkpal_fallback=0,
     )
     msg = diag.empty_state_message()
-    assert "30 strikeout projections" in msg
-    assert "0 pitcher K odds" in msg
+    assert "Pitcher K scan did not run" in msg or "0 strikeout projections" in msg
 
 
-def test_empty_state_says_no_names_matched():
+def test_empty_state_says_no_names_matched_when_30_loaded_but_zero_matches():
+    """The real bug behind 'No qualifying edges': 30 BPP rows loaded,
+    but 0 of today's MLB probable pitchers matched any of them. The
+    message must say so explicitly so the operator opens the name
+    reconciliation panel."""
     diag = PitcherKDiagnostics(
         strikeout_projections_loaded=30,
         sportsbook_pitcher_k_props_loaded=18,
         pitcher_names_matched_sportsbook=0,
         pitcher_names_matched_ballparkpal=0,
+        mlb_probable_pitchers_today=[
+            {"pitcher_name": "Joe Ryan", "team": "MIN", "game_pk": 1},
+            {"pitcher_name": "Max Meyer", "team": "MIA", "game_pk": 2},
+        ],
     )
     msg = diag.empty_state_message()
-    assert "0 pitcher names matched" in msg
+    assert "0 names matched" in msg
+    assert "30 BallparkPal projections" in msg
+    assert "2 MLB probable pitchers" in msg
+    assert "name drift" in msg.lower() or "name reconciliation" in msg.lower() or "name_drift" in msg.lower() or "reconciliation" in msg.lower() or "name drift" in msg.lower()
+
+
+def test_empty_state_says_bad_mapping_when_all_matches_rejected():
+    """30 rows loaded, names DID match (rejections happened because
+    sanity validator killed them all). The message must point at the
+    cache parse, not at name matching."""
+    diag = PitcherKDiagnostics(
+        strikeout_projections_loaded=30,
+        rejected_for_bad_mapping=5,
+        candidates_built_from_ballparkpal_fallback=0,
+    )
+    msg = diag.empty_state_message()
+    assert "rejected by sanity checks" in msg
+    assert "re-upload the CSV" in msg
+
+
+def test_empty_state_bad_mapping_takes_priority_over_no_fallback_branch():
+    """Regression test for the user-visible bug: when 30 rows are
+    loaded but ALL were rejected by sanity validation, the message
+    used to say 'no BallparkPal fallback odds available either',
+    which falsely implied the cache was empty. It must instead say
+    rows were REJECTED."""
+    diag = PitcherKDiagnostics(
+        strikeout_projections_loaded=30,
+        sportsbook_pitcher_k_props_loaded=0,
+        rejected_for_bad_mapping=8,
+        candidates_built_from_ballparkpal_fallback=0,
+    )
+    msg = diag.empty_state_message()
+    assert "BallparkPal fallback odds available" not in msg
+    assert "rejected by sanity checks" in msg
 
 
 def test_empty_state_says_threshold_when_candidates_rejected():
