@@ -141,6 +141,23 @@ async def run_daily_mlb_edges(
         for side in ("over", "under")
     }
 
+    # Pitcher-K diagnostics — populated as the engine walks each game so
+    # the dashboard can show stage-by-stage funnel collapse instead of
+    # "No qualifying edges."
+    from app.services.ballparkpal_integration import k_projection_index
+    from app.services.mlb_pitcher_k_diagnostics import PitcherKDiagnostics
+    from app.services.mlb_pitcher_k_fallback import (
+        FALLBACK_SOURCE,
+        build_fallback_prop_analysis,
+        is_fallback_payload,
+        name_matches_loose,
+        normalize_pitcher_name,
+    )
+
+    k_diag = PitcherKDiagnostics()
+    bpp_strikeout_rows = k_projection_index(db, slate_date=card_date) or {}
+    k_diag.strikeout_projections_loaded = len(bpp_strikeout_rows)
+
     created_edges: list[MlbEdge] = []
     totals_count = 0
     pitcher_k_count = 0
@@ -181,26 +198,85 @@ async def run_daily_mlb_edges(
                     skipped_no_threshold += 1
                 created_edges.append(_persist_edge(db, edge_payload, card_date))
 
-        for pitcher in _pitchers(game):
+        game_pitchers = _pitchers(game)
+        if game_pitchers:
+            k_diag.games_with_pitchers += 1
+        for pitcher in game_pitchers:
+            pitcher_name = pitcher.get("name") or ""
             prop = await _pitcher_prop_for_game(db, game, pitcher, payload)
+            sportsbook_rows = prop.get("rows") if prop else []
+            # The sportsbook side of the funnel — counted whether or not
+            # the prop ended up usable. We need to see "we saw 12 K-prop
+            # rows but matched 0 to our pitcher" as distinct from "the
+            # cache was empty in the first place."
+            k_diag.sportsbook_pitcher_k_props_loaded += len(sportsbook_rows or [])
+
+            sportsbook_usable = (
+                prop.get("is_valid", True)
+                and prop.get("line") is not None
+                and bool(sportsbook_rows)
+            )
+            if sportsbook_usable:
+                k_diag.pitcher_names_matched_sportsbook += 1
+            elif sportsbook_rows is not None:
+                k_diag.pitcher_names_unmatched_sportsbook += 1
+                k_diag.add_unmatched_example(
+                    pitcher_name=pitcher_name, source="sportsbook",
+                    reason=(prop.get("validation_reason") or "no matching prop line"),
+                )
+
+            # BallparkPal fallback. Either the sportsbook prop didn't
+            # cover this pitcher, or the prop is unusable. Look up the
+            # pitcher in the strikeout cache and synthesize the same
+            # prop_analysis shape so pitcher_k_edges still runs.
+            if not sportsbook_usable and bpp_strikeout_rows:
+                bpp_row = _find_bpp_row_for_pitcher(
+                    pitcher_name, bpp_strikeout_rows,
+                )
+                if bpp_row is not None:
+                    fallback = build_fallback_prop_analysis(
+                        pitcher_name=pitcher_name, bpp_row=bpp_row,
+                    )
+                    if fallback is not None:
+                        prop = fallback
+                        sportsbook_usable = True
+                        k_diag.pitcher_names_matched_ballparkpal += 1
+                        k_diag.candidates_built_from_ballparkpal_fallback += 1
+                        k_diag.add_fallback_example({
+                            "pitcher_name": pitcher_name,
+                            "projected_k": fallback.get("ballparkpal_projected_k"),
+                            "line": fallback.get("line"),
+                            "over_price": fallback.get("best_over_price"),
+                        })
+                else:
+                    k_diag.pitcher_names_unmatched_ballparkpal += 1
+                    k_diag.add_unmatched_example(
+                        pitcher_name=pitcher_name, source="ballparkpal",
+                        reason="pitcher not in Strikeout Center cache",
+                    )
+
             if prop.get("book_count") and prop.get("is_valid", True):
                 pitcher_k_count += 1
             if not prop.get("is_valid", True):
                 logger.info(
                     "Skipping pitcher K edge due to invalid market: game=%s pitcher=%s reason=%s",
                     game.get("game_pk"),
-                    pitcher.get("name"),
+                    pitcher_name,
                     prop.get("validation_reason"),
                 )
+                k_diag.candidates_rejected_missing_odds += 1
                 continue
             if prop.get("line") is None or not prop.get("rows"):
                 logger.info(
                     "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
                     game.get("game_pk"),
-                    pitcher.get("name"),
+                    pitcher_name,
                     prop.get("warnings"),
                 )
+                k_diag.candidates_rejected_missing_odds += 1
                 continue
+
+            k_diag.lines_matched_against_props += 1
             statcast = statcast_context(
                 db,
                 player_id=pitcher.get("id") or 0,
@@ -215,14 +291,33 @@ async def run_daily_mlb_edges(
                 statcast_context=statcast,
                 environment=env,
             ):
+                k_diag.candidates_built_total += 1
+                if is_fallback_payload(prop):
+                    # Tag the persisted edge so the dashboard card can
+                    # render "BallparkPal fallback odds" instead of the
+                    # legacy sportsbook label. Stored inside ``factors``
+                    # because that field already round-trips JSON-safely
+                    # through ``edge_to_dict`` — no schema migration.
+                    factors_payload = edge_payload.setdefault("factors", {})
+                    factors_payload["odds_source"] = FALLBACK_SOURCE
+                    factors_payload["ballparkpal_projected_k"] = prop.get(
+                        "ballparkpal_projected_k"
+                    )
+                    edge_payload["odds_source"] = FALLBACK_SOURCE
+                    edge_payload["ballparkpal_projected_k"] = prop.get(
+                        "ballparkpal_projected_k"
+                    )
+                else:
+                    k_diag.candidates_built_from_sportsbook += 1
                 if (edge_payload.get("score") or 0) < 65:
                     skipped_no_threshold += 1
                 created_edges.append(_persist_edge(db, edge_payload, card_date))
 
-    card = _build_daily_card(db, card_date)
+    card = _build_daily_card(db, card_date, pitcher_k_diagnostics=k_diag)
     diagnostics["prop_snapshots_found"] = pitcher_k_count
     diagnostics["edges_generated"] = len(created_edges)
     diagnostics["skipped_no_threshold"] = skipped_no_threshold
+    diagnostics["pitcher_k"] = k_diag.to_dict()
     db.commit()
     logger.info(
         "MLB edge run: date=%s games=%d odds_events=%d events_with_totals=%d "
@@ -613,7 +708,18 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
     return edge
 
 
-def _build_daily_card(db: Session, card_date: str) -> MlbDailyCard:
+def _build_daily_card(
+    db: Session,
+    card_date: str,
+    *,
+    pitcher_k_diagnostics: Any | None = None,
+) -> MlbDailyCard:
+    from app.services.mlb_pitcher_k_diagnostics import (
+        K_EDGE_WATCHLIST_FLOOR,
+        classify_k_edge_magnitude,
+    )
+    from app.services.mlb_pitcher_k_fallback import k_edge_from_fallback
+
     edges = list(
         db.scalars(
             select(MlbEdge)
@@ -633,18 +739,47 @@ def _build_daily_card(db: Session, card_date: str) -> MlbDailyCard:
         except (TypeError, ValueError):
             return 0.0
 
+    def _pitcher_k_edge_magnitude(payload: dict[str, Any]) -> float:
+        # Read projected_k either from the top-level marker (during the
+        # same scan) or from the persisted ``factors`` dict (when the
+        # daily card is regenerated from edges already in the DB).
+        factors_payload = payload.get("factors") or {}
+        projected = (
+            payload.get("ballparkpal_projected_k")
+            or factors_payload.get("ballparkpal_projected_k")
+            or factors_payload.get("projected_k")
+        )
+        line = payload.get("line")
+        if projected is None or line is None:
+            return 0.0
+        try:
+            return abs(float(projected) - float(line))
+        except (TypeError, ValueError):
+            return 0.0
+
     totals_all = sorted(
         [p for p in payloads if p.get("edge_type") == "game_total"],
         key=watchlist_sort_key,
         reverse=True,
     )
+    # Pitcher-K edges use K-edge magnitude (|projected_k − line|) for
+    # banding, NOT the composite score threshold. K markets move in
+    # tighter ranges than game totals, so a 0.5-K edge is meaningful
+    # even when the score sits below 65. Composite score is preserved
+    # as the SECOND sort key so high-conviction cards still float up.
     props_all = sorted(
         [p for p in payloads if p.get("edge_type") == "pitcher_strikeouts"],
-        key=lambda p: float(p.get("score") or 0.0),
+        key=lambda p: (
+            _pitcher_k_edge_magnitude(p),
+            float(p.get("score") or 0.0),
+        ),
         reverse=True,
     )
     totals = [p for p in totals_all if _decision_score(p) >= 65][:5]
-    props = [p for p in props_all if _decision_score(p) >= 65][:5]
+    props = [
+        p for p in props_all
+        if _pitcher_k_edge_magnitude(p) >= K_EDGE_WATCHLIST_FLOOR
+    ][:5]
     near = [
         p for p in sorted(payloads, key=watchlist_sort_key, reverse=True)
         if 55 <= _decision_score(p) < 65
@@ -659,6 +794,30 @@ def _build_daily_card(db: Session, card_date: str) -> MlbDailyCard:
         "with_warnings": sum(1 for e in edges if e.warnings),
         "missing_odds": sum(1 for e in edges if any("odds" in w.lower() for w in (e.warnings or []))),
     }
+    if pitcher_k_diagnostics is not None:
+        # Tally final placements (cards / watchlist) AFTER selection so
+        # the operator sees the real funnel — not what would have been
+        # promoted if the band were wider.
+        for payload in props_all:
+            band = classify_k_edge_magnitude(
+                _pitcher_k_edge_magnitude(payload)
+                * (1 if payload.get("side") == "over" else -1)
+            )
+            if band == "strong":
+                pitcher_k_diagnostics.candidates_promoted_strong += 1
+            elif band == "candidate":
+                pitcher_k_diagnostics.candidates_promoted_candidate += 1
+            elif band == "watchlist":
+                pitcher_k_diagnostics.candidates_promoted_watchlist += 1
+            else:
+                pitcher_k_diagnostics.candidates_rejected_by_threshold += 1
+        pitcher_k_diagnostics.cards_rendered = len(props)
+        # Persist counters on the card so the dashboard can render them
+        # without re-running the engine.
+        summary["pitcher_k"] = pitcher_k_diagnostics.to_dict()
+        summary["pitcher_k_empty_state_message"] = (
+            pitcher_k_diagnostics.empty_state_message()
+        )
     card = db.scalar(select(MlbDailyCard).where(MlbDailyCard.card_date == card_date))
     values = {
         "top_game_totals": totals,
@@ -684,6 +843,39 @@ def _upsert_game(db: Session, game: dict[str, Any]) -> None:
         return
     for key, value in game.items():
         setattr(existing, key, value)
+
+
+def _find_bpp_row_for_pitcher(
+    pitcher_name: str | None,
+    bpp_index: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Loose-match a pitcher to a BallparkPal Strikeout Center row.
+
+    The BPP cache index is keyed by ``"".join(c for c in name.lower() if
+    c.isalnum())``, which already drops spaces / punctuation. We probe
+    that exact form first, then fall back to the looser
+    ``name_matches_loose`` matcher (first-initial + last name) so
+    ``"J. Ryan"`` finds ``"Joe Ryan"`` without us re-indexing.
+    """
+    from app.services.mlb_pitcher_k_fallback import (
+        name_matches_loose,
+        normalize_pitcher_name,
+    )
+
+    if not pitcher_name or not bpp_index:
+        return None
+    direct_key = "".join(
+        ch for ch in str(pitcher_name).lower() if ch.isalnum()
+    )
+    if direct_key and direct_key in bpp_index:
+        return bpp_index[direct_key]
+    # Fallback: walk the index and use loose matching. Cheap — the BPP
+    # strikeout cache is at most ~60 rows on a full slate.
+    for indexed_name, row in bpp_index.items():
+        candidate = row.get("pitcher") or indexed_name
+        if name_matches_loose(candidate, pitcher_name):
+            return row
+    return None
 
 
 def _card_to_dict(card: MlbDailyCard | None) -> dict[str, Any] | None:

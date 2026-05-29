@@ -4570,20 +4570,34 @@ with tab_mlb:
             ("Top Pitcher Ks", mlb_daily_card.get("top_pitcher_strikeouts") or []),
             ("Near Misses", mlb_daily_card.get("near_misses") or []),
         ]
+        # Pitcher K stage-by-stage diagnostics — used both for a stage-
+        # specific empty-state message and for the diagnostics panel
+        # rendered below the hero strip.
+        _dq_summary = (mlb_daily_card or {}).get("data_quality_summary") or {}
+        pitcher_k_diag = _dq_summary.get("pitcher_k") or {}
+        pitcher_k_empty_msg = (
+            _dq_summary.get("pitcher_k_empty_state_message")
+            or "No qualifying edges in this band for today's slate."
+        )
         for col, (title, rows) in zip(hero_cols, sections):
             with col:
                 stale_suffix = " (stale)" if is_stale_card else ""
                 st.markdown(f"<h3>{title}{stale_suffix}</h3>", unsafe_allow_html=True)
                 if not rows:
-                    body = (
-                        "Odds cache stale; refresh odds before running the edge scan."
-                        if mlb_blocked_by_stale_odds
-                        else (
-                        f"No saved edges for {requested_date_label}. Run the scan to populate."
-                        if is_stale_card
-                        else "No qualifying edges in this band for today's slate."
+                    if mlb_blocked_by_stale_odds:
+                        body = "Odds cache stale; refresh odds before running the edge scan."
+                    elif is_stale_card:
+                        body = (
+                            f"No saved edges for {requested_date_label}. "
+                            "Run the scan to populate."
                         )
-                    )
+                    elif title == "Top Pitcher Ks":
+                        # Stage-specific message tells the operator
+                        # which funnel stage collapsed (no projections /
+                        # no odds / no matches / no edge / etc).
+                        body = pitcher_k_empty_msg
+                    else:
+                        body = "No qualifying edges in this band for today's slate."
                     render_empty_state("NO QUALIFYING EDGES", body)
                 else:
                     for row in rows[:3]:
@@ -4595,6 +4609,85 @@ with tab_mlb:
             f"materialize {arizona_today_iso}'s card.",
             actions=[("Run MLB edge scan", action_run_mlb_edge_scan)],
         )
+
+    # ----------------------------------------------------------------------
+    # Pitcher K scan diagnostics — exposed inline (NOT in an expander
+    # buried at the bottom) so the operator can see funnel collapse
+    # in the same place they're seeing "no cards."
+    # ----------------------------------------------------------------------
+    if pitcher_k_diag:
+        st.markdown("### Pitcher K Scan Diagnostics")
+        d_cols = st.columns(4)
+        d_cols[0].metric(
+            "Strikeout projections loaded",
+            pitcher_k_diag.get("strikeout_projections_loaded", 0),
+        )
+        d_cols[1].metric(
+            "Sportsbook K props loaded",
+            pitcher_k_diag.get("sportsbook_pitcher_k_props_loaded", 0),
+        )
+        d_cols[2].metric(
+            "Pitcher names matched (sportsbook)",
+            pitcher_k_diag.get("pitcher_names_matched_sportsbook", 0),
+        )
+        d_cols[3].metric(
+            "Pitcher names matched (BPP fallback)",
+            pitcher_k_diag.get("pitcher_names_matched_ballparkpal", 0),
+        )
+        d_cols2 = st.columns(4)
+        d_cols2[0].metric(
+            "Candidates built (sportsbook)",
+            pitcher_k_diag.get("candidates_built_from_sportsbook", 0),
+        )
+        d_cols2[1].metric(
+            "Candidates built (BPP fallback)",
+            pitcher_k_diag.get("candidates_built_from_ballparkpal_fallback", 0),
+        )
+        d_cols2[2].metric(
+            "Rejected: missing odds",
+            pitcher_k_diag.get("candidates_rejected_missing_odds", 0),
+        )
+        d_cols2[3].metric(
+            "Rejected: K-edge < 0.15",
+            pitcher_k_diag.get("candidates_rejected_by_threshold", 0),
+        )
+        d_cols3 = st.columns(4)
+        d_cols3[0].metric(
+            "Promoted: watchlist (≥0.15)",
+            pitcher_k_diag.get("candidates_promoted_watchlist", 0),
+        )
+        d_cols3[1].metric(
+            "Promoted: candidate (≥0.35)",
+            pitcher_k_diag.get("candidates_promoted_candidate", 0),
+        )
+        d_cols3[2].metric(
+            "Promoted: strong (≥0.65)",
+            pitcher_k_diag.get("candidates_promoted_strong", 0),
+        )
+        d_cols3[3].metric(
+            "Cards rendered",
+            pitcher_k_diag.get("cards_rendered", 0),
+        )
+        unmatched = pitcher_k_diag.get("unmatched_pitcher_examples") or []
+        if unmatched:
+            with st.expander(
+                f"Unmatched pitcher examples ({len(unmatched)})",
+                expanded=False,
+            ):
+                st.dataframe(
+                    pd.DataFrame(unmatched).fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                )
+        fb_examples = pitcher_k_diag.get("fallback_card_examples") or []
+        if fb_examples:
+            with st.expander(
+                f"BallparkPal fallback cards built ({len(fb_examples)})",
+                expanded=False,
+            ):
+                st.dataframe(
+                    pd.DataFrame(fb_examples).fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                )
 
     st.markdown("### Score Distribution")
     if mlb_blocked_by_stale_odds:
