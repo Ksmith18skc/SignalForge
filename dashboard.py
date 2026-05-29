@@ -2960,26 +2960,48 @@ def action_run_wallet_scan() -> None:
     st.rerun()
 
 
-def action_run_mlb_edge_scan() -> None:
+def action_run_mlb_edge_scan(*, force_stale: bool = False) -> None:
     if not start_job("mlb_edge_scan", "MLB edge scan", status="Posting /mlb/edges/run..."):
         st.toast("MLB edge scan is already running.")
         return
+    params: dict[str, Any] = {"game_date": selected_card_date}
+    if force_stale:
+        # Operator override: skip the freshness gate so the engine runs
+        # off whatever's in the odds cache. Used when the Render proxy
+        # ate a previous refresh or when only BPP-fallback K cards are
+        # needed and game-total freshness doesn't matter.
+        params["force_stale"] = True
     result: dict[str, Any] = {}
     with st.status("MLB edge scan: running engine…", expanded=False, state="running") as status_box:
-        _job_log("backend_request_start", job="mlb_edge_scan", path="/mlb/edges/run", date=selected_card_date)
+        _job_log("backend_request_start", job="mlb_edge_scan", path="/mlb/edges/run", date=selected_card_date, force_stale=force_stale)
         try:
-            result = api_post("/mlb/edges/run", timeout=MLB_RUN_TIMEOUT, params={"game_date": selected_card_date})
+            result = api_post("/mlb/edges/run", timeout=MLB_RUN_TIMEOUT, params=params)
         except ApiError as exc:
             _job_log("backend_request_end", job="mlb_edge_scan", ok=False, error=str(exc))
-            finish_job(success=False, result_message=f"MLB edge scan failed: {exc}")
+            # Surface the actual backend exception detail (truncated) in
+            # the activity panel so future 502s aren't opaque. The full
+            # body still goes through render_api_error.
+            short_detail = exc.short_body() or str(exc)
+            finish_job(
+                success=False,
+                result_message=f"MLB edge scan failed: {short_detail[:240]}",
+            )
             status_box.update(label="MLB edge scan failed", state="error")
             render_api_error(exc, prefix="MLB edge scan failed")
             return
         _job_log("backend_request_end", job="mlb_edge_scan", ok=True)
     if str(result.get("status") or "").lower() == "blocked":
         reason = result.get("reason") or "Odds cache stale; refresh required before edge scan."
+        # Pair the warning with the escape hatch so the operator can
+        # rerun in one click when they've already refreshed and know
+        # the cache is intentionally stale (e.g. pre-game scan only).
         finish_job(success=False, result_message=f"Blocked: {reason}")
         st.warning(reason)
+        st.caption(
+            "Click **Run scan anyway (use stale odds)** in the MLB "
+            "Terminal control bar to bypass this gate — pitcher-K "
+            "fallback cards will still build from BallparkPal."
+        )
         st.cache_data.clear()
         _job_log("rerun_trigger", source="action_run_mlb_edge_scan.blocked")
         st.rerun()
@@ -3920,6 +3942,23 @@ with st.expander(
         ):
             _job_log("button_click", name="run_mlb_edge_scan")
             action_run_mlb_edge_scan()
+        # Escape hatch: bypass the stale-odds gate. Pitcher-K cards
+        # built from BallparkPal fallback don't need fresh sportsbook
+        # odds at all, so blocking the entire scan on stale game-total
+        # odds buries actionable K signal.
+        if st.button(
+            "Run scan anyway (use stale odds)",
+            use_container_width=True,
+            disabled=mlb_edge_active,
+            key="cc_btn_mlb_edge_scan_force",
+            help=(
+                "Bypass the stale-odds gate. Game-total edges may price "
+                "off cached odds; pitcher-K cards still build from "
+                "BallparkPal fallback regardless of sportsbook freshness."
+            ),
+        ):
+            _job_log("button_click", name="run_mlb_edge_scan_force")
+            action_run_mlb_edge_scan(force_stale=True)
     with action_cols[2]:
         odds_label = "Refreshing odds…" if odds_cache_active else "Refresh odds cache"
         if st.button(

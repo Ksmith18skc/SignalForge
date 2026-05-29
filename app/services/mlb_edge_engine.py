@@ -143,19 +143,26 @@ async def run_daily_mlb_edges(
 
     # Pitcher-K diagnostics — populated as the engine walks each game so
     # the dashboard can show stage-by-stage funnel collapse instead of
-    # "No qualifying edges."
+    # "No qualifying edges." Every diagnostic mutation is wrapped in a
+    # try/except so a malformed BPP row, a stale snapshot, or a serializer
+    # bug never crashes the whole engine and loses the game-totals work.
     from app.services.ballparkpal_integration import k_projection_index
     from app.services.mlb_pitcher_k_diagnostics import PitcherKDiagnostics
     from app.services.mlb_pitcher_k_fallback import (
         FALLBACK_SOURCE,
         build_fallback_prop_analysis,
         is_fallback_payload,
-        name_matches_loose,
-        normalize_pitcher_name,
     )
 
     k_diag = PitcherKDiagnostics()
-    bpp_strikeout_rows = k_projection_index(db, slate_date=card_date) or {}
+    try:
+        bpp_strikeout_rows = k_projection_index(db, slate_date=card_date) or {}
+    except Exception as exc:  # noqa: BLE001 — fallback is best-effort
+        logger.warning(
+            "BallparkPal strikeout index load failed: %s; fallback path disabled.",
+            exc,
+        )
+        bpp_strikeout_rows = {}
     k_diag.strikeout_projections_loaded = len(bpp_strikeout_rows)
 
     created_edges: list[MlbEdge] = []
@@ -202,118 +209,140 @@ async def run_daily_mlb_edges(
         if game_pitchers:
             k_diag.games_with_pitchers += 1
         for pitcher in game_pitchers:
-            pitcher_name = pitcher.get("name") or ""
-            prop = await _pitcher_prop_for_game(db, game, pitcher, payload)
-            sportsbook_rows = prop.get("rows") if prop else []
-            # The sportsbook side of the funnel — counted whether or not
-            # the prop ended up usable. We need to see "we saw 12 K-prop
-            # rows but matched 0 to our pitcher" as distinct from "the
-            # cache was empty in the first place."
-            k_diag.sportsbook_pitcher_k_props_loaded += len(sportsbook_rows or [])
+            # Wrap the entire per-pitcher body so a bad BPP row, a
+            # statcast-cache lookup failure, or any other surprise
+            # doesn't crash the engine and lose all the game-totals
+            # work we've already done for this scan. Counters live in
+            # the diagnostics dataclass so partial progress survives.
+            try:
+                pitcher_name = pitcher.get("name") or ""
+                prop = await _pitcher_prop_for_game(db, game, pitcher, payload)
+                sportsbook_rows = prop.get("rows") if prop else []
+                # The sportsbook side of the funnel — counted whether or
+                # not the prop ended up usable. We need to see "we saw 12
+                # K-prop rows but matched 0 to our pitcher" as distinct
+                # from "the cache was empty in the first place."
+                k_diag.sportsbook_pitcher_k_props_loaded += len(sportsbook_rows or [])
 
-            sportsbook_usable = (
-                prop.get("is_valid", True)
-                and prop.get("line") is not None
-                and bool(sportsbook_rows)
-            )
-            if sportsbook_usable:
-                k_diag.pitcher_names_matched_sportsbook += 1
-            elif sportsbook_rows is not None:
-                k_diag.pitcher_names_unmatched_sportsbook += 1
-                k_diag.add_unmatched_example(
-                    pitcher_name=pitcher_name, source="sportsbook",
-                    reason=(prop.get("validation_reason") or "no matching prop line"),
+                sportsbook_usable = (
+                    prop.get("is_valid", True)
+                    and prop.get("line") is not None
+                    and bool(sportsbook_rows)
                 )
-
-            # BallparkPal fallback. Either the sportsbook prop didn't
-            # cover this pitcher, or the prop is unusable. Look up the
-            # pitcher in the strikeout cache and synthesize the same
-            # prop_analysis shape so pitcher_k_edges still runs.
-            if not sportsbook_usable and bpp_strikeout_rows:
-                bpp_row = _find_bpp_row_for_pitcher(
-                    pitcher_name, bpp_strikeout_rows,
-                )
-                if bpp_row is not None:
-                    fallback = build_fallback_prop_analysis(
-                        pitcher_name=pitcher_name, bpp_row=bpp_row,
-                    )
-                    if fallback is not None:
-                        prop = fallback
-                        sportsbook_usable = True
-                        k_diag.pitcher_names_matched_ballparkpal += 1
-                        k_diag.candidates_built_from_ballparkpal_fallback += 1
-                        k_diag.add_fallback_example({
-                            "pitcher_name": pitcher_name,
-                            "projected_k": fallback.get("ballparkpal_projected_k"),
-                            "line": fallback.get("line"),
-                            "over_price": fallback.get("best_over_price"),
-                        })
-                else:
-                    k_diag.pitcher_names_unmatched_ballparkpal += 1
+                if sportsbook_usable:
+                    k_diag.pitcher_names_matched_sportsbook += 1
+                elif sportsbook_rows is not None:
+                    k_diag.pitcher_names_unmatched_sportsbook += 1
                     k_diag.add_unmatched_example(
-                        pitcher_name=pitcher_name, source="ballparkpal",
-                        reason="pitcher not in Strikeout Center cache",
+                        pitcher_name=pitcher_name, source="sportsbook",
+                        reason=(prop.get("validation_reason") or "no matching prop line"),
                     )
 
-            if prop.get("book_count") and prop.get("is_valid", True):
-                pitcher_k_count += 1
-            if not prop.get("is_valid", True):
-                logger.info(
-                    "Skipping pitcher K edge due to invalid market: game=%s pitcher=%s reason=%s",
-                    game.get("game_pk"),
-                    pitcher_name,
-                    prop.get("validation_reason"),
+                # BallparkPal fallback. Either the sportsbook prop didn't
+                # cover this pitcher, or the prop is unusable. Look up
+                # the pitcher in the strikeout cache and synthesize the
+                # same prop_analysis shape so pitcher_k_edges still runs.
+                if not sportsbook_usable and bpp_strikeout_rows:
+                    bpp_row = _find_bpp_row_for_pitcher(
+                        pitcher_name, bpp_strikeout_rows,
+                    )
+                    if bpp_row is not None:
+                        fallback = build_fallback_prop_analysis(
+                            pitcher_name=pitcher_name, bpp_row=bpp_row,
+                        )
+                        if fallback is not None:
+                            prop = fallback
+                            sportsbook_usable = True
+                            k_diag.pitcher_names_matched_ballparkpal += 1
+                            k_diag.candidates_built_from_ballparkpal_fallback += 1
+                            k_diag.add_fallback_example({
+                                "pitcher_name": pitcher_name,
+                                "projected_k": fallback.get("ballparkpal_projected_k"),
+                                "line": fallback.get("line"),
+                                "over_price": fallback.get("best_over_price"),
+                            })
+                    else:
+                        k_diag.pitcher_names_unmatched_ballparkpal += 1
+                        k_diag.add_unmatched_example(
+                            pitcher_name=pitcher_name, source="ballparkpal",
+                            reason="pitcher not in Strikeout Center cache",
+                        )
+
+                if prop.get("book_count") and prop.get("is_valid", True):
+                    pitcher_k_count += 1
+                if not prop.get("is_valid", True):
+                    logger.info(
+                        "Skipping pitcher K edge due to invalid market: game=%s pitcher=%s reason=%s",
+                        game.get("game_pk"),
+                        pitcher_name,
+                        prop.get("validation_reason"),
+                    )
+                    k_diag.candidates_rejected_missing_odds += 1
+                    continue
+                if prop.get("line") is None or not prop.get("rows"):
+                    logger.info(
+                        "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
+                        game.get("game_pk"),
+                        pitcher_name,
+                        prop.get("warnings"),
+                    )
+                    k_diag.candidates_rejected_missing_odds += 1
+                    continue
+
+                k_diag.lines_matched_against_props += 1
+                statcast = statcast_context(
+                    db,
+                    player_id=pitcher.get("id") or 0,
+                    player_type="pitcher",
+                    season=int(card_date[:4]),
+                    last_n_days=settings.statcast_cache_last_n_days,
                 )
-                k_diag.candidates_rejected_missing_odds += 1
-                continue
-            if prop.get("line") is None or not prop.get("rows"):
-                logger.info(
-                    "Skipping pitcher K edge without valid prop line: game=%s pitcher=%s warnings=%s",
-                    game.get("game_pk"),
-                    pitcher_name,
-                    prop.get("warnings"),
+                for edge_payload in pitcher_k_edges(
+                    game=game,
+                    pitcher=pitcher,
+                    prop_analysis=prop,
+                    statcast_context=statcast,
+                    environment=env,
+                ):
+                    k_diag.candidates_built_total += 1
+                    if is_fallback_payload(prop):
+                        # Tag the persisted edge so the dashboard card
+                        # can render "BallparkPal fallback odds" instead
+                        # of the legacy sportsbook label. Stored inside
+                        # ``factors`` because that field already
+                        # round-trips JSON-safely through
+                        # ``edge_to_dict`` — no schema migration.
+                        factors_payload = edge_payload.setdefault("factors", {})
+                        factors_payload["odds_source"] = FALLBACK_SOURCE
+                        factors_payload["ballparkpal_projected_k"] = prop.get(
+                            "ballparkpal_projected_k"
+                        )
+                        edge_payload["odds_source"] = FALLBACK_SOURCE
+                        edge_payload["ballparkpal_projected_k"] = prop.get(
+                            "ballparkpal_projected_k"
+                        )
+                    else:
+                        k_diag.candidates_built_from_sportsbook += 1
+                    if (edge_payload.get("score") or 0) < 65:
+                        skipped_no_threshold += 1
+                    created_edges.append(_persist_edge(db, edge_payload, card_date))
+            except Exception as exc:  # noqa: BLE001
+                # Crash-isolate this pitcher so the rest of the slate
+                # still gets edges. The diagnostics dataclass keeps the
+                # partial counters for the rows that DID succeed.
+                logger.exception(
+                    "Pitcher K processing failed for game=%s pitcher=%s: %s",
+                    game.get("game_pk"), pitcher.get("name"), exc,
                 )
-                k_diag.candidates_rejected_missing_odds += 1
-                continue
 
-            k_diag.lines_matched_against_props += 1
-            statcast = statcast_context(
-                db,
-                player_id=pitcher.get("id") or 0,
-                player_type="pitcher",
-                season=int(card_date[:4]),
-                last_n_days=settings.statcast_cache_last_n_days,
-            )
-            for edge_payload in pitcher_k_edges(
-                game=game,
-                pitcher=pitcher,
-                prop_analysis=prop,
-                statcast_context=statcast,
-                environment=env,
-            ):
-                k_diag.candidates_built_total += 1
-                if is_fallback_payload(prop):
-                    # Tag the persisted edge so the dashboard card can
-                    # render "BallparkPal fallback odds" instead of the
-                    # legacy sportsbook label. Stored inside ``factors``
-                    # because that field already round-trips JSON-safely
-                    # through ``edge_to_dict`` — no schema migration.
-                    factors_payload = edge_payload.setdefault("factors", {})
-                    factors_payload["odds_source"] = FALLBACK_SOURCE
-                    factors_payload["ballparkpal_projected_k"] = prop.get(
-                        "ballparkpal_projected_k"
-                    )
-                    edge_payload["odds_source"] = FALLBACK_SOURCE
-                    edge_payload["ballparkpal_projected_k"] = prop.get(
-                        "ballparkpal_projected_k"
-                    )
-                else:
-                    k_diag.candidates_built_from_sportsbook += 1
-                if (edge_payload.get("score") or 0) < 65:
-                    skipped_no_threshold += 1
-                created_edges.append(_persist_edge(db, edge_payload, card_date))
-
-    card = _build_daily_card(db, card_date, pitcher_k_diagnostics=k_diag)
+    try:
+        card = _build_daily_card(db, card_date, pitcher_k_diagnostics=k_diag)
+    except Exception as exc:  # noqa: BLE001
+        # _build_daily_card is non-essential to persisting edges; if it
+        # fails (e.g. JSON-serialization issue on diagnostics), surface
+        # the error in logs but still return the edges we wrote.
+        logger.exception("Daily-card build failed: %s", exc)
+        card = None
     diagnostics["prop_snapshots_found"] = pitcher_k_count
     diagnostics["edges_generated"] = len(created_edges)
     diagnostics["skipped_no_threshold"] = skipped_no_threshold
