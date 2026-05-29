@@ -959,3 +959,71 @@ def consensus_wallets_chips_html(wallets: list[dict[str, Any]], *, limit: int | 
             f"<span class='sf-badge sf-badge-muted'>{name} · {size}{fill_label}</span>"
         )
     return f"<div class='sf-chips'>{''.join(chips)}</div>"
+
+
+def _as_float_safe(value: Any) -> float | None:
+    """Lenient float coercion used by the consensus aggregator."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def wallet_consensus_groups(
+    positions: list[dict[str, Any]],
+    *,
+    min_wallets: int = 2,
+) -> list[dict[str, Any]]:
+    """Detect markets where >= ``min_wallets`` tracked wallets are on
+    the same side.
+
+    Groups by ``(market_id, side, outcome)`` and returns one row per
+    group with the participating wallets, total size, mean score, and
+    a representative card payload (the highest-score signal in the
+    group, with the original trader_nickname / market_url / market_slug
+    intact so ``render_wallet_card`` can still render it).
+
+    Pure: no Streamlit dependency, no DB. Tested directly via
+    ``tests/test_wallet_consensus.py``.
+    """
+    groups: dict[tuple[Any, str, str], list[dict[str, Any]]] = {}
+    for pos in positions:
+        market_id = pos.get("market_id")
+        if not market_id:
+            continue
+        market_key = (
+            market_id,
+            (pos.get("side") or "").strip().upper(),
+            (pos.get("outcome") or "").strip(),
+        )
+        groups.setdefault(market_key, []).append(pos)
+
+    consensus: list[dict[str, Any]] = []
+    for _key, members in groups.items():
+        distinct_wallets = {
+            (m.get("wallet") or m.get("trader_nickname") or "")
+            for m in members
+        }
+        distinct_wallets.discard("")
+        if len(distinct_wallets) < min_wallets:
+            continue
+        members_sorted = sorted(
+            members, key=lambda m: (m.get("score") or 0.0), reverse=True,
+        )
+        rep = dict(members_sorted[0])
+        scores = [m.get("score") or 0.0 for m in members]
+        sizes = [_as_float_safe(m.get("size_usd")) or 0.0 for m in members]
+        rep["consensus_wallets"] = len(distinct_wallets)
+        rep["consensus_total_size"] = sum(sizes)
+        rep["consensus_mean_score"] = sum(scores) / len(scores) if scores else 0.0
+        rep["consensus_members"] = members
+        consensus.append(rep)
+    consensus.sort(
+        key=lambda r: (
+            r.get("consensus_wallets") or 0,
+            r.get("consensus_total_size") or 0.0,
+            r.get("consensus_mean_score") or 0.0,
+        ),
+        reverse=True,
+    )
+    return consensus

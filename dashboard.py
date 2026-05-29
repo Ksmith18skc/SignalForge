@@ -76,6 +76,7 @@ from app.utils.dashboard_format import (
     score_tier_kind,
     team_short,
     wallet_alignment_percent,
+    wallet_consensus_groups,
 )
 
 API_BASE = os.environ.get("SIGNALFORGE_API_URL", "http://localhost:8000").rstrip("/")
@@ -3078,6 +3079,25 @@ def fetch_signals(limit: int = 500, card_date: str = CARD_DATE) -> list[dict[str
 
 
 @st.cache_data(ttl=10, show_spinner=False)
+def fetch_tracked_wallet_positions(limit: int = 500) -> list[dict[str, Any]]:
+    """All tracked-wallet positions across **every** date.
+
+    The dashboard's ``fetch_signals`` is scoped to today's card date,
+    which is what the Top Signals view needs — but the Wallet Flow tab
+    has historically come up empty for operators whose tracked wallets
+    are active on future games or in markets without a recognized
+    date. This fetcher uses ``history=True`` to bypass the card-date
+    scope so the Wallet Flow tab can show every tracked-wallet
+    position the backend has, regardless of which slate it's on.
+    """
+    return safe_get(
+        "/signals",
+        default=[],
+        params={"limit": limit, "history": True},
+    )
+
+
+@st.cache_data(ttl=10, show_spinner=False)
 def fetch_alerts(limit: int = 200, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
     return safe_get("/alerts", default=[], params={"limit": limit, "date": card_date})
 
@@ -3434,6 +3454,11 @@ scan_status_payload = fetch_scan_status() or {}
 traders = fetch_traders()
 signals_all = fetch_signals(limit=500, card_date=selected_card_date)
 positions_all = aggregate_signals_to_positions(signals_all)
+# All-time tracked wallet positions (no card-date scope). The Wallet
+# Flow tab consumes these so a tracked wallet that's only active on
+# upcoming-slate or no-slate markets still surfaces.
+all_wallet_signals = fetch_tracked_wallet_positions(limit=500)
+all_wallet_positions = aggregate_signals_to_positions(all_wallet_signals)
 alerts_all = fetch_alerts(limit=200, card_date=selected_card_date)
 historical_alerts = fetch_historical_alerts(limit=200)
 mlb_edges_all = fetch_mlb_edges(limit=100, card_date=selected_card_date)
@@ -4235,49 +4260,127 @@ with tab_mlb:
 # Wallet Flow
 # =============================================================================
 
+def _positions_dataframe(positions: list[dict[str, Any]]) -> "pd.DataFrame":
+    """Standard sortable table for tracked wallet positions."""
+    rows = []
+    for s in positions:
+        wallet_disp = s.get("wallet") if show_full_wallet else shorten_wallet(s.get("wallet"))
+        tier = tier_for_score(s.get("score"))[0]
+        rows.append({
+            "score": _as_float(s.get("score")) or 0.0,
+            "tier": tier,
+            "trader": s.get("trader_nickname") or DASH,
+            "wallet": wallet_disp or DASH,
+            "league": s.get("league") or DASH,
+            "matchup": s.get("matchup") or _market_label(s),
+            "contract": s.get("contract") or DASH,
+            "side": s.get("side") or DASH,
+            "outcome": s.get("outcome") or DASH,
+            "avg_entry": _as_float(s.get("entry_price")),
+            "size_usd": _as_float(s.get("size_usd")),
+            "events": s.get("signal_count") or 1,
+            "event_date": s.get("event_date") or DASH,
+            "source": s.get("source") or DASH,
+            "market": s.get("market_url"),
+        })
+    return pd.DataFrame(rows).fillna(DASH)
+
+
 with tab_wallet:
+    # --- Source toggle: current card vs all dates -----------------------
+    # ``filtered_positions`` is card-date-scoped, which is what the rest
+    # of the dashboard wants. Wallet Flow defaults to *all-date* tracked
+    # positions because operators who tracked a wallet specifically to
+    # watch upcoming-slate plays would otherwise see an empty tab.
+    scope_cols = st.columns([2, 1, 1])
+    with scope_cols[0]:
+        position_scope = st.radio(
+            "Position scope",
+            options=["All tracked dates", f"Today's card ({selected_card_date})"],
+            horizontal=True,
+            key="wallet_flow_scope",
+            help=(
+                "Default: every tracked-wallet position across every date "
+                "the backend has. Switch to today's card to see only "
+                "positions on the current slate."
+            ),
+        )
+    using_all_dates = position_scope.startswith("All")
+    source_positions = all_wallet_positions if using_all_dates else positions_all
+    scoped_positions = sorted(
+        [p for p in source_positions if (p.get("score") or 0.0) >= score_min],
+        key=lambda p: (p.get("score") or 0.0, p.get("consensus_total_size") or 0.0),
+        reverse=True,
+    )
+
+    # --- Diagnostic banner explaining "where did my positions go?" -----
+    n_tracked_wallets = len({
+        (s.get("wallet") or s.get("trader_nickname"))
+        for s in all_wallet_signals
+    } - {None, ""})
+    diag_cols = st.columns(4)
+    diag_cols[0].metric("Tracked wallets w/ positions", n_tracked_wallets)
+    diag_cols[1].metric("All-date positions", len(all_wallet_positions))
+    diag_cols[2].metric(f"Today ({selected_card_date})", len(positions_all))
+    diag_cols[3].metric("Showing", len(scoped_positions))
+    if not scoped_positions:
+        if not all_wallet_positions:
+            st.warning(
+                "No tracked-wallet positions in the database. Run **Wallet scan** "
+                "from the Controls bar to ingest fresh trades — if a scan just ran "
+                "and this is still empty, the backend returned zero positions."
+            )
+        elif not using_all_dates and not positions_all:
+            st.info(
+                f"You have **{len(all_wallet_positions)}** tracked-wallet position(s) "
+                f"across all dates, but none on the **{selected_card_date}** card. "
+                "Switch the scope toggle to **All tracked dates** to see them."
+            )
+        elif scoped_positions == [] and wallet_filters_hide_current:
+            st.info(
+                "Sidebar filters are hiding every position. Lower the score "
+                "filter or pick `(all)` for trader / league / source / contract."
+            )
+
+    # --- Tracked-Wallet Consensus (>=2 wallets aligned) ----------------
+    st.markdown("### Tracked-Wallet Consensus")
+    st.caption(
+        "Markets where two or more tracked wallets are on the same side. "
+        "Sorted by wallet count → total size → mean score."
+    )
+    consensus_positions = wallet_consensus_groups(scoped_positions, min_wallets=2)
+    if consensus_positions:
+        for pos in consensus_positions[:10]:
+            render_wallet_card(pos)
+    else:
+        st.caption(
+            "No consensus yet — every tracked-wallet position above is held "
+            "by a single wallet. Cards still appear in the sections below."
+        )
+
+    # --- Highest Conviction (single-wallet, ranked by score) ------------
     st.markdown("### Highest Conviction Positions")
-    top_positions = filtered_positions[:5]
+    st.caption(
+        "Top tracked-wallet positions by score. Includes single-wallet "
+        "plays so a one-wallet conviction signal doesn't get hidden by "
+        "the consensus filter above."
+    )
+    top_positions = scoped_positions[:10]
     if top_positions:
         for pos in top_positions:
             render_wallet_card(pos)
     else:
-        render_empty_state(
-            (
-                "Current-card wallet flow hidden by filters."
-                if wallet_filters_hide_current
-                else "No current-card wallet flow found."
-            ),
-            (
-                f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
-                if wallet_filters_hide_current
-                else f"No {selected_card_date} positions match your live-card filters."
-            ),
-        )
+        # Diagnostic banner above already explains why; no need to repeat.
+        pass
 
-    st.markdown(f"### All Positions ({len(filtered_positions)})")
-    if filtered_positions:
-        rows = []
-        for s in filtered_positions:
-            wallet_disp = s.get("wallet") if show_full_wallet else shorten_wallet(s.get("wallet"))
-            tier = tier_for_score(s.get("score"))[0]
-            rows.append({
-                "score": s.get("score") or 0.0,
-                "tier": tier,
-                "trader": s.get("trader_nickname") or DASH,
-                "wallet": wallet_disp or DASH,
-                "league": s.get("league") or DASH,
-                "matchup": s.get("matchup") or _market_label(s),
-                "contract": s.get("contract") or DASH,
-                "side": s.get("side") or DASH,
-                "outcome": s.get("outcome") or DASH,
-                "avg_entry": s.get("entry_price"),
-                "size_usd": s.get("size_usd"),
-                "events": s.get("signal_count") or 1,
-                "source": s.get("source") or DASH,
-                "market": s.get("market_url"),
-            })
-        df_pos = pd.DataFrame(rows).fillna(DASH)
+    # --- All Tracked Positions (sortable, no card limit) ----------------
+    st.markdown(f"### All Tracked Positions ({len(scoped_positions)})")
+    st.caption(
+        "Click the score column header to sort. Dataframe view of every "
+        "tracked-wallet position in the current scope."
+    )
+    if scoped_positions:
+        df_pos = _positions_dataframe(scoped_positions)
         st.dataframe(
             df_pos,
             use_container_width=True,
@@ -4285,25 +4388,12 @@ with tab_wallet:
             height=min(560, 60 + 32 * len(df_pos)),
             column_config={
                 "score": st.column_config.ProgressColumn(
-                    "score", min_value=0, max_value=100, format="%.1f"
+                    "score", min_value=0, max_value=100, format="%.1f",
                 ),
                 "avg_entry": st.column_config.NumberColumn("avg entry", format="%.3f"),
                 "size_usd": st.column_config.NumberColumn("size USD", format="$%.0f"),
                 "market": st.column_config.LinkColumn("market", display_text="open"),
             },
-        )
-    else:
-        render_empty_state(
-            (
-                "Current-card wallet flow hidden by filters."
-                if wallet_filters_hide_current
-                else "No current-card wallet flow found."
-            ),
-            (
-                f"{len(positions_all)} current-card signal(s) exist. Lower the score filter or clear sidebar filters."
-                if wallet_filters_hide_current
-                else "Run a wallet scan after today's markets are available."
-            ),
         )
 
 
