@@ -62,15 +62,6 @@ async def run_async(
     ingestion: dict[str, Any] | None = None
     reason: str | None = None
     try:
-        if date and not skip_ingestion:
-            try:
-                ingestion = await ingest_final_scores_for_date(db, mlb, date=date)
-            except Exception as exc:  # noqa: BLE001
-                # Ingestion failure is non-fatal — we can still grade from
-                # persisted rows captured by an earlier run.
-                logger.warning("Pre-grade ingestion failed for %s: %s", date, exc)
-                ingestion = {"date": date, "error": str(exc)}
-
         query = (
             select(MlbEdge, MlbGame)
             .join(MlbGame, MlbGame.game_pk == MlbEdge.game_pk)
@@ -80,6 +71,48 @@ async def run_async(
             query = query.where(MlbGame.game_date == date)
         rows = list(db.execute(query).all())
         candidate_count = len(rows)
+
+        if not skip_ingestion:
+            # Always ingest the schedule(s) covering the candidate edges so
+            # `mlb_final_scores` is populated before grading runs. Without
+            # this, multi-day windows (date=None from the dashboard) would
+            # skip ingestion entirely and force every edge down the live
+            # fallback path — where `_is_final` can't reliably tell that
+            # the game is over (game.game_status is stale, the linescore
+            # endpoint carries no terminal status).
+            if date:
+                dates_to_ingest = [date]
+            else:
+                dates_to_ingest = sorted({
+                    g.game_date for _, g in rows if g.game_date
+                })
+            summaries: list[dict[str, Any]] = []
+            total_upserted = 0
+            for ingest_date in dates_to_ingest:
+                try:
+                    summary = await ingest_final_scores_for_date(
+                        db, mlb, date=ingest_date,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Ingestion failure is non-fatal — we can still grade
+                    # from persisted rows captured by an earlier run.
+                    logger.warning(
+                        "Pre-grade ingestion failed for %s: %s", ingest_date, exc,
+                    )
+                    summary = {"date": ingest_date, "error": str(exc)}
+                summaries.append(summary)
+                try:
+                    total_upserted += int(summary.get("upserted") or 0)
+                except (TypeError, ValueError):
+                    pass
+            if date and summaries:
+                ingestion = summaries[0]
+            elif summaries:
+                ingestion = {
+                    "dates": [s.get("date") for s in summaries],
+                    "upserted": total_upserted,
+                    "summaries": summaries,
+                }
 
         if candidate_count == 0:
             reason = (
@@ -153,10 +186,15 @@ async def _grade_one(
             outcome = _grade_total_from_persisted(edge, stored)
             return (outcome, "persisted" if outcome else "no_outcome")
 
-    # 2) Fall back to live API.
-    linescore = await mlb.linescore(game.game_pk)
-    if not _is_final(linescore, game):
+    # 2) Fall back to live API. Use the persisted final-score table as the
+    #    source of truth for "is this game over": ingestion only writes a
+    #    row when the schedule reports a Final status, so a row's presence
+    #    is the most reliable terminal-state signal we have. The
+    #    `game.game_status` column is a snapshot from edge-generation time
+    #    and is typically stale ("Scheduled").
+    if not _is_final(db, game):
         return (None, "not_final")
+    linescore = await mlb.linescore(game.game_pk)
     if edge.edge_type == "game_total":
         outcome = _grade_total(edge, linescore)
     elif edge.edge_type == "pitcher_strikeouts":
@@ -219,12 +257,15 @@ async def main_async(argv: list[str] | None = None) -> int:
     return 0 if result.get("ok") else 1
 
 
-def _is_final(linescore: dict[str, Any], game: MlbGame) -> bool:
+def _is_final(db: Session, game: MlbGame) -> bool:
     state = (game.game_status or "").lower()
     if "final" in state:
         return True
-    current_inning_state = str(linescore.get("currentInningOrdinal") or "").lower()
-    return "final" in current_inning_state
+    # The linescore endpoint does not carry game status — `currentInningOrdinal`
+    # is "1st"/"9th"/etc, never "Final". Use the persisted final-score row
+    # (written by ingestion when the schedule reports Final) as the canonical
+    # terminal-state check instead.
+    return get_final_score(db, int(game.game_pk)) is not None
 
 
 def _grade_total(edge: MlbEdge, linescore: dict[str, Any]) -> tuple[str, str] | None:
