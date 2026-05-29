@@ -187,3 +187,95 @@ def test_accents_and_suffix_stripped():
 def test_exact_full_name_match():
     assert name_matches_loose("Carlos Rodon", "Carlos Rodon")
     assert name_matches_loose("Carlos Rodón", "Carlos Rodon")  # accent
+
+
+# ---------------------------------------------------------------------------
+# Regression: factors dict must hold ONLY numeric values
+# ---------------------------------------------------------------------------
+#
+# _persist_edge iterates ``edge.factors.items()`` and calls
+# ``float(value)`` on each entry to build MlbEdgeFactor rows. If a
+# pipeline stage ever stuffs a string into factors (e.g. an "odds_source"
+# tag), the entire scan 502s. These tests pin both invariants: the
+# fallback path must NOT leak a string into factors, AND a malformed
+# factors dict must not crash the persist helper.
+
+def test_fallback_factors_dict_holds_only_numeric_values(db_session):
+    """End-to-end: run a single edge through total_edges → _persist_edge
+    with a factors dict that includes the BPP-fallback fields. None of
+    those should be strings."""
+    from app.models import MlbEdge, MlbEdgeFactor
+    from app.services.mlb_pitcher_k_model import pitcher_k_edges
+
+    game = {"game_pk": 9001, "home_team": "MIA", "away_team": "PHI"}
+    pitcher = {"id": 42, "name": "Max Meyer"}
+    bpp_row = {
+        "pitcher": "Max Meyer", "team": "MIA", "opp": "PHI",
+        "projected_k": 5.76, "over_line": 5.5, "over_odds": 1.85,
+    }
+    prop = build_fallback_prop_analysis(pitcher_name="Max Meyer", bpp_row=bpp_row)
+    statcast = {"summary": {}, "warnings": []}
+    environment = {"k_environment_score": 50.0, "warnings": []}
+
+    edges = pitcher_k_edges(
+        game=game, pitcher=pitcher, prop_analysis=prop,
+        statcast_context=statcast, environment=environment,
+    )
+    assert edges
+    for edge in edges:
+        factors = edge.get("factors") or {}
+        # Every value in the factors dict must be coercible to float.
+        # Catching a string here means a future caller is about to crash
+        # _persist_edge with a ValueError.
+        for name, value in factors.items():
+            try:
+                float(value)
+            except (TypeError, ValueError):
+                raise AssertionError(
+                    f"factors[{name!r}] = {value!r} is not numeric — "
+                    "this would 502 the entire scan in _persist_edge."
+                )
+
+
+def test_persist_edge_skips_non_numeric_factors_without_crashing(db_session):
+    """Even if a future regression sneaks a non-numeric value into
+    factors, the persist path must skip it with a debug log instead of
+    raising ValueError and aborting the scan."""
+    from app.models import MlbEdge, MlbEdgeFactor
+    from app.services.mlb_edge_engine import _persist_edge
+
+    payload = {
+        "game_pk": 7777,
+        "edge_type": "pitcher_strikeouts",
+        "market": "Max Meyer Over 5.5 Ks",
+        "side": "over",
+        "line": 5.5,
+        "best_book": "ballparkpal_fallback",
+        "best_price": 1.85,
+        "consensus_price": 1.85,
+        "score": 60.0,
+        "confidence": "low",
+        "action": "Watch",
+        "chase_risk": "low",
+        "reasons": [],
+        "warnings": [],
+        "data_sources_used": ["ballparkpal_fallback"],
+        "factors": {
+            # Stray non-numeric — the bug that caused the production 502.
+            "odds_source": "ballparkpal_fallback",
+            # And a real numeric factor that should survive.
+            "sportsbook_price_edge": 50.0,
+            "ballparkpal_projected_k": 5.76,
+        },
+        "is_valid": True,
+    }
+    edge = _persist_edge(db_session, payload, card_date="2026-05-29")
+    db_session.flush()
+    # Edge persisted successfully.
+    assert edge.id is not None
+    # And the non-numeric factor was silently skipped, while numeric
+    # factors made it through.
+    persisted_names = {f.name for f in db_session.query(MlbEdgeFactor).all()}
+    assert "odds_source" not in persisted_names
+    assert "sportsbook_price_edge" in persisted_names
+    assert "ballparkpal_projected_k" in persisted_names

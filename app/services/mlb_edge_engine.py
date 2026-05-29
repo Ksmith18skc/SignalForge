@@ -308,15 +308,23 @@ async def run_daily_mlb_edges(
                     if is_fallback_payload(prop):
                         # Tag the persisted edge so the dashboard card
                         # can render "BallparkPal fallback odds" instead
-                        # of the legacy sportsbook label. Stored inside
-                        # ``factors`` because that field already
-                        # round-trips JSON-safely through
-                        # ``edge_to_dict`` — no schema migration.
+                        # of the legacy sportsbook label.
+                        #
+                        # ``factors`` is iterated by _persist_edge as
+                        # ``float(value)`` to build MlbEdgeFactor rows,
+                        # so it must ONLY hold numeric values. The
+                        # source label rides on ``data_sources_used``
+                        # (a JSON list column) instead, and the numeric
+                        # projected_k stays in factors where the daily-
+                        # card builder reads it.
                         factors_payload = edge_payload.setdefault("factors", {})
-                        factors_payload["odds_source"] = FALLBACK_SOURCE
                         factors_payload["ballparkpal_projected_k"] = prop.get(
                             "ballparkpal_projected_k"
                         )
+                        sources = list(edge_payload.get("data_sources_used") or [])
+                        if FALLBACK_SOURCE not in sources:
+                            sources.append(FALLBACK_SOURCE)
+                        edge_payload["data_sources_used"] = sources
                         edge_payload["odds_source"] = FALLBACK_SOURCE
                         edge_payload["ballparkpal_projected_k"] = prop.get(
                             "ballparkpal_projected_k"
@@ -725,13 +733,29 @@ def _persist_edge(db: Session, payload: dict[str, Any], card_date: str) -> MlbEd
     contributions = payload.get("score_contributions") or {}
     weights = _WEIGHTS_FOR_EDGE_TYPE.get(payload["edge_type"], {})
     for name, value in (edge.factors or {}).items():
+        # MlbEdgeFactor.value is a Float column. Skip any non-numeric
+        # entries (e.g. source tags / projection metadata stuffed into
+        # ``factors`` for round-trip convenience) instead of crashing
+        # the entire scan on ``float(string)``.
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            logger.debug(
+                "Skipping non-numeric factor on edge=%s name=%s value=%r",
+                edge.id, name, value,
+            )
+            continue
+        try:
+            note = f"{contributions[name]:+.2f} pts" if name in contributions else None
+        except (TypeError, ValueError):
+            note = None
         db.add(
             MlbEdgeFactor(
                 edge_id=edge.id,
                 name=name,
-                value=float(value),
+                value=numeric_value,
                 weight=float(weights.get(name, 0.0)),
-                note=(f"{contributions[name]:+.2f} pts" if name in contributions else None),
+                note=note,
             )
         )
     return edge
