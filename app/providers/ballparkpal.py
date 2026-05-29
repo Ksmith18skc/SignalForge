@@ -418,7 +418,21 @@ def parse_home_run_zone(html: str) -> dict[str, Any]:
                         "fair_odds": _to_float(_pick(raw, "fair_odds", "odds")),
                     }
                 )
-    result.rows = totals  # canonical default
+        elif "prob" in keys and "bp" in keys:
+            # BPP "Home Run Zone — Hitters" CSV export: per-batter rows
+            # carrying HR probability + sportsbook odds. Scraper tools
+            # vary in how they shift the team-logo cells, so any
+            # attempt to synthesize "player" / "hr_probability" from a
+            # fixed column would be wrong half the time. Preserve the
+            # raw row verbatim — the dashboard's Hitters dataframe then
+            # renders every column the operator uploaded, and they can
+            # read the actual semantics from the columns themselves.
+            for raw in table:
+                hitters.append(dict(raw))
+    # Canonical default: fall through to whichever subtable carries
+    # data so an export with only hitters (not totals) doesn't end up
+    # with row_count=0 on the cache overview.
+    result.rows = totals or hitters or by_team or by_game
     result.meta.update(
         {
             "totals": totals,

@@ -190,6 +190,56 @@ def test_generic_fallback_when_strict_parser_drops_everything() -> None:
     )
 
 
+def test_real_hr_zone_csv_populates_meta_hitters() -> None:
+    """The exact failure mode the operator reported: a real BPP
+    Home Run Zone export uploaded as ``hr_zone`` left the dashboard's
+    HR Zone tab empty because the strict parser had no branch for the
+    ``prob`` + ``bp`` + sportsbook-odds column pattern, and the
+    generic fallback only populated ``rows`` while the HR Zone tab
+    reads from ``meta.hitters``.
+
+    Both halves of the fix are checked here:
+      * The strict parser now matches the ``prob``+``bp`` pattern, so
+        we end up with ``used_generic_fallback=False``.
+      * ``meta.hitters`` is populated, so the HR Zone tab renders.
+    """
+    blob = _load_fixture("ballparkpal_hr_zone_real.csv")
+
+    result = parse_uploaded_csv(
+        page="hr_zone",
+        csv_bytes=blob,
+        filename="hr-zone.csv",
+        slate_date="2026-05-28",
+    )
+
+    # Real BPP header on row 2 (row 0 is the table-scraper noise, row 1
+    # is the on-page "Actual / Expected / Meatballs" sub-banner).
+    assert result["detected_header_row_index"] == 2
+    assert result["header_detection_score"] >= 2
+
+    # 14 hitter rows in the fixture, all parsed.
+    assert result["raw_row_count"] == 14
+    assert result["parsed_row_count"] == 14
+    # Strict parser matched the new prob+bp branch — no fallback.
+    assert result["used_generic_fallback"] is False
+
+    # The HR Zone dashboard tab reads meta.hitters; this is where the
+    # data actually has to land for the tab to render.
+    hitters = (result["parsed"]["meta"] or {}).get("hitters") or []
+    assert len(hitters) == 14
+
+    # Raw cells are preserved verbatim. We intentionally don't
+    # synthesize player/hr_probability from a fixed column because
+    # scraper tools shift cells differently — operators read the
+    # truth from the raw columns.
+    first = hitters[0]
+    assert first.get("batter") == "CHW"
+    assert first.get("park") == "C. Montgomery"
+    assert first.get("pitcher") == "22.0%"
+    assert first.get("prob") == "+355"
+    assert first.get("bp") == "+350"
+
+
 def test_alias_map_rewrites_csv_headers_into_canonical_form() -> None:
     """A CSV that uses long labels ("Projected K", "IP", "Kalshi")
     must end up with canonical keys (k, inn, ka) after aliasing — the

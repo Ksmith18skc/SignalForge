@@ -152,6 +152,15 @@ CSV_HEADER_ALIASES: dict[str, dict[str, str]] = {
         "hrs": "projected_hrs",
         "p_hr": "hr_probability",
         "probability": "hr_probability",
+        # BPP HR Zone "Hitters" CSV uses short column codes — keep the
+        # short forms as-is so the parser's branch detector (which
+        # looks for ``prob`` + ``bp``) still triggers, but expose them
+        # in the parsed rows under canonical names. The aliasing here
+        # is intentionally light: the operator-facing semantics of the
+        # scraper-tool export don't perfectly line up with the BPP UI
+        # column order, so we keep raw codes available for inspection.
+        "ballparkpal_odds": "bp",
+        "kalshi_odds": "ka",
     },
     "hits": {
         "name": "player",
@@ -581,6 +590,17 @@ def parse_uploaded_csv(
     else:
         out_rows = parsed_rows
         out_meta = dict(parsed.get("meta") or {})
+
+    # Page-specific subtable mirrors. Some dashboard tabs read from
+    # ``meta.<subkey>`` rather than ``rows`` (Home Run Zone in
+    # particular splits into totals / by_game / by_team / hitters). If
+    # the strict parser didn't populate the subkey the page tab needs,
+    # mirror our rows into it so the upload is actually visible. This
+    # was the missing piece for the BPP HR Zone CSV export: header
+    # detection + generic fallback both succeeded, but the HR Zone tab
+    # only reads ``meta.hitters`` and there were no hitters.
+    if page == "hr_zone" and not out_meta.get("hitters"):
+        out_meta["hitters"] = out_rows
 
     out_meta.update(
         {
