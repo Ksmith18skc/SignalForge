@@ -150,8 +150,10 @@ async def run_daily_mlb_edges(
     from app.services.mlb_pitcher_k_diagnostics import PitcherKDiagnostics
     from app.services.mlb_pitcher_k_fallback import (
         FALLBACK_SOURCE,
+        FallbackRejection,
         build_fallback_prop_analysis,
         is_fallback_payload,
+        validate_bpp_row,
     )
 
     k_diag = PitcherKDiagnostics()
@@ -247,9 +249,30 @@ async def run_daily_mlb_edges(
                         pitcher_name, bpp_strikeout_rows,
                     )
                     if bpp_row is not None:
-                        fallback = build_fallback_prop_analysis(
-                            pitcher_name=pitcher_name, bpp_row=bpp_row,
-                        )
+                        # Run the sanity validator first so a bad row
+                        # (e.g. over_line carrying american odds because
+                        # the cache parser swapped columns) gets a
+                        # named rejection reason in the diagnostics
+                        # table — NOT a "Over 174 Ks" card.
+                        try:
+                            validate_bpp_row(
+                                pitcher_name=pitcher_name, bpp_row=bpp_row,
+                            )
+                        except FallbackRejection as rej:
+                            k_diag.add_bad_mapping_example(
+                                pitcher_name=pitcher_name,
+                                reason=rej.reason,
+                                details=rej.details,
+                            )
+                            logger.info(
+                                "Pitcher K fallback rejected: pitcher=%s reason=%s details=%s",
+                                pitcher_name, rej.reason, rej.details,
+                            )
+                            fallback = None
+                        else:
+                            fallback = build_fallback_prop_analysis(
+                                pitcher_name=pitcher_name, bpp_row=bpp_row,
+                            )
                         if fallback is not None:
                             prop = fallback
                             sportsbook_usable = True
@@ -304,6 +327,26 @@ async def run_daily_mlb_edges(
                     statcast_context=statcast,
                     environment=env,
                 ):
+                    # Final guard: even if a path slips a bad line
+                    # through, the K card must never publish a line
+                    # outside the K-prop band. This is the load-bearing
+                    # invariant that keeps "Over 174 Ks" off the screen.
+                    edge_line = edge_payload.get("line")
+                    if edge_line is None or not (0.5 <= float(edge_line) <= 15.5):
+                        k_diag.add_bad_mapping_example(
+                            pitcher_name=pitcher_name,
+                            reason="edge_line_out_of_k_range",
+                            details={
+                                "edge_line": edge_line,
+                                "side": edge_payload.get("side"),
+                                "source": prop.get("source"),
+                            },
+                        )
+                        logger.warning(
+                            "Pitcher K edge rejected at final guard: pitcher=%s line=%s",
+                            pitcher_name, edge_line,
+                        )
+                        continue
                     k_diag.candidates_built_total += 1
                     if is_fallback_payload(prop):
                         # Tag the persisted edge so the dashboard card

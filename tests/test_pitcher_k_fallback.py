@@ -30,11 +30,13 @@ from app.services.mlb_pitcher_k_diagnostics import (
 )
 from app.services.mlb_pitcher_k_fallback import (
     FALLBACK_SOURCE,
+    FallbackRejection,
     build_fallback_prop_analysis,
     is_fallback_payload,
     k_edge_from_fallback,
     name_matches_loose,
     normalize_pitcher_name,
+    validate_bpp_row,
 )
 
 
@@ -235,6 +237,118 @@ def test_fallback_factors_dict_holds_only_numeric_values(db_session):
                     f"factors[{name!r}] = {value!r} is not numeric — "
                     "this would 502 the entire scan in _persist_edge."
                 )
+
+
+# ---------------------------------------------------------------------------
+# Field-mapping invariants — the "Over 174 Ks" bug regression suite
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+def test_bradley_field_mapping_uses_correct_columns():
+    """Pinned to the user-provided example. projected_k must come from
+    projected_k, line from over_line, odds from over_odds — and the
+    edge must equal projected_k - over_line, NEVER projected_k - odds."""
+    row = {
+        "pitcher": "Taj Bradley", "team": "TB", "opp": "BAL",
+        "projected_k": 6.38, "over_line": 6.5, "over_odds": 116,
+        "projected_innings": 6.0, "batters_faced": 26.1,
+    }
+    prop = build_fallback_prop_analysis(pitcher_name="Taj Bradley", bpp_row=row)
+    assert prop is not None
+    assert prop["line"] == 6.5  # NOT 116
+    assert prop["best_over_price"] == 116  # the odds
+    assert prop["ballparkpal_projected_k"] == 6.38
+    assert k_edge_from_fallback(prop) == pytest.approx(-0.12, abs=1e-6)
+
+
+def test_meyer_field_mapping_produces_correct_over_edge():
+    row = {
+        "pitcher": "Max Meyer", "team": "MIA", "opp": "PHI",
+        "projected_k": 5.76, "over_line": 5.5, "over_odds": -110,
+    }
+    prop = build_fallback_prop_analysis(pitcher_name="Max Meyer", bpp_row=row)
+    assert prop is not None
+    assert prop["line"] == 5.5
+    assert prop["best_over_price"] == -110
+    assert k_edge_from_fallback(prop) == pytest.approx(0.26, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Sanity rejections — the bug that produced "Over 174 Ks"
+# ---------------------------------------------------------------------------
+
+def test_line_value_that_looks_like_american_odds_is_rejected():
+    """The Paxton Schultz failure mode: over_line carried american
+    odds (174) because the cache parser swapped columns. The sanity
+    validator must reject the row with a NAMED reason instead of
+    publishing a "Over 174 Ks" card."""
+    row = {
+        "pitcher": "Paxton Schultz", "team": "?", "opp": "?",
+        "projected_k": 5.0, "over_line": 174, "over_odds": 6.5,
+    }
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="Paxton Schultz", bpp_row=row)
+    assert info.value.reason == "line_looks_like_american_odds"
+    # And build_fallback_prop_analysis returns None — no card built.
+    assert build_fallback_prop_analysis(
+        pitcher_name="Paxton Schultz", bpp_row=row,
+    ) is None
+
+
+def test_negative_line_value_rejected():
+    """The Tyler Samaniego case — -164 as a "K line" is clearly
+    american odds for the under, not a strikeout count."""
+    row = {
+        "pitcher": "Tyler Samaniego",
+        "projected_k": 4.0, "over_line": -164, "over_odds": 6.5,
+    }
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="Tyler Samaniego", bpp_row=row)
+    assert info.value.reason == "line_looks_like_american_odds"
+
+
+def test_projected_k_out_of_range_rejected():
+    row = {"pitcher": "X", "projected_k": 99.0, "over_line": 6.5}
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="X", bpp_row=row)
+    assert info.value.reason == "projected_k_out_of_range"
+
+
+def test_missing_line_rejected_with_named_reason():
+    row = {"pitcher": "X", "projected_k": 5.0}
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="X", bpp_row=row)
+    assert info.value.reason == "over_line_missing"
+
+
+def test_missing_projected_k_rejected_with_named_reason():
+    row = {"pitcher": "X", "over_line": 6.5}
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="X", bpp_row=row)
+    assert info.value.reason == "projected_k_missing"
+
+
+def test_over_odds_outside_american_range_rejected():
+    row = {
+        "pitcher": "X", "projected_k": 5.0, "over_line": 5.5,
+        "over_odds": 5000,  # not plausible american or decimal odds
+    }
+    with pytest.raises(FallbackRejection) as info:
+        validate_bpp_row(pitcher_name="X", bpp_row=row)
+    assert info.value.reason == "over_odds_out_of_range"
+
+
+def test_valid_row_returns_validated_values():
+    row = {
+        "pitcher": "Carlos Rodon",
+        "projected_k": 5.76, "over_line": 5.5, "over_odds": -118,
+    }
+    out = validate_bpp_row(pitcher_name="Carlos Rodon", bpp_row=row)
+    assert out["projected_k"] == 5.76
+    assert out["line"] == 5.5
+    assert out["over_price"] == -118
 
 
 def test_persist_edge_skips_non_numeric_factors_without_crashing(db_session):

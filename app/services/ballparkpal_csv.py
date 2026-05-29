@@ -113,24 +113,49 @@ RAW_HEADER_HINTS: dict[str, set[str]] = {
 # expects.
 CSV_HEADER_ALIASES: dict[str, dict[str, str]] = {
     "strikeouts": {
+        # ---- projected_k aliases ----
         "projected_k": "k",
         "projectedk": "k",
         "proj_k": "k",
         "strikeouts": "k",
+        "projected_strikeouts": "k",
         "k_proj": "k",
         "ks": "k",
+        # ---- opponent / innings / batters faced ----
         "opponent": "opp",
         "innings": "inn",
         "ip": "inn",
+        "projected_innings": "inn",
         "batters_faced": "bf",
         "batters": "bf",
+        # ---- K line aliases ----
+        # The literal BPP CSV header is "over_line"; older shorthand
+        # exports use just "over" or "line". All must collapse to the
+        # single canonical "over" key the HTML parser's _pick reads.
+        # Without the explicit "over_line" alias, the cache silently
+        # left over_line=None and the fallback fell through to "over",
+        # which on some scraper exports holds american odds — that's
+        # how cards ended up titled "Over 174 Ks".
+        "over_line": "over",
+        "strikeout_line": "over",
         "k_line": "over",
         "line": "over",
+        # ---- Over-side odds aliases ----
+        # CSV often labels these "over_odds" or "BP" / "BallparkPal Odds".
+        # Without "over_odds" explicitly aliased, BP odds and over odds
+        # could land in different columns depending on export source.
+        "over_odds": "bp",
+        "sportsbook_odds": "bp",
         "ballparkpal": "bp",
         "ballparkpal_odds": "bp",
+        "bp_odds": "bp",
+        # ---- Kalshi K-advantage column ----
         "kalshi": "ka",
         "kalshi_odds": "ka",
         "k_advantage": "ka",
+        # ---- Probability ----
+        "probability_over": "p_over",
+        "prob_over": "p_over",
     },
     "positive_ev": {
         "team": "tm",

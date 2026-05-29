@@ -4656,6 +4656,20 @@ with tab_mlb:
     # ----------------------------------------------------------------------
     if pitcher_k_diag:
         st.markdown("### Pitcher K Scan Diagnostics")
+        # Single-line summary the user explicitly asked for, rendered
+        # above the metric grid so it's the first thing the operator
+        # sees when cards look wrong.
+        rejected_mapping = pitcher_k_diag.get("rejected_for_bad_mapping", 0)
+        valid_built = (
+            pitcher_k_diag.get("candidates_built_from_sportsbook", 0)
+            + pitcher_k_diag.get("candidates_built_from_ballparkpal_fallback", 0)
+        )
+        st.caption(
+            f"Strikeout rows loaded: {pitcher_k_diag.get('strikeout_projections_loaded', 0)} · "
+            f"Valid K rows: {valid_built} · "
+            f"Rejected bad mapping: {rejected_mapping} · "
+            f"Cards generated: {pitcher_k_diag.get('cards_rendered', 0)}"
+        )
         d_cols = st.columns(4)
         d_cols[0].metric(
             "Strikeout projections loaded",
@@ -4725,6 +4739,25 @@ with tab_mlb:
             ):
                 st.dataframe(
                     pd.DataFrame(fb_examples).fillna(DASH),
+                    use_container_width=True, hide_index=True,
+                )
+        bad_mapping = pitcher_k_diag.get("bad_mapping_examples") or []
+        if bad_mapping:
+            # Expanded by default — when this fires, the cache parser
+            # mis-mapped a column (e.g. swapped over_line ↔ over_odds)
+            # and the operator needs to see it immediately, not buried.
+            with st.expander(
+                f"⚠ Bad mapping rejections ({len(bad_mapping)})",
+                expanded=True,
+            ):
+                st.caption(
+                    "Rows rejected because the K-line / odds columns "
+                    "didn't look like a K market. Common causes: the "
+                    "CSV swapped over_line ↔ over_odds, or a value "
+                    "outside the [0.5, 15.5] K-prop range."
+                )
+                st.dataframe(
+                    pd.DataFrame(bad_mapping).fillna(DASH),
                     use_container_width=True, hide_index=True,
                 )
 

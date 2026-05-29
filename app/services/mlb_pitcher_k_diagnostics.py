@@ -54,6 +54,13 @@ class PitcherKDiagnostics:
     # Output
     cards_rendered: int = 0
 
+    # Sanity-rejected BPP rows. A non-empty list here is the loud
+    # operator-facing signal that the cache parser mis-mapped a column
+    # (e.g. the K-line cell carried american odds because over_line /
+    # over_odds got swapped).
+    rejected_for_bad_mapping: int = 0
+    bad_mapping_examples: list[dict[str, Any]] = field(default_factory=list)
+
     # Worked examples (kept tiny — the dashboard renders these inline).
     unmatched_pitcher_examples: list[dict[str, Any]] = field(default_factory=list)
     fallback_card_examples: list[dict[str, Any]] = field(default_factory=list)
@@ -88,6 +95,13 @@ class PitcherKDiagnostics:
                 f"{self.sportsbook_pitcher_k_props_loaded} odds rows seen, "
                 "but 0 pitcher names matched. Open the Pitcher K "
                 "diagnostics panel to see the unmatched examples."
+            )
+        if self.rejected_for_bad_mapping > 0 and self.cards_rendered == 0:
+            return (
+                f"{self.rejected_for_bad_mapping} BallparkPal row(s) "
+                "rejected for bad column mapping (line looked like "
+                "odds, or projected_k / over_line out of range). "
+                "Check the Bad Mapping table for worked examples."
             )
         if (
             self.candidates_built_total > 0
@@ -128,6 +142,27 @@ class PitcherKDiagnostics:
         if len(self.fallback_card_examples) >= 10:
             return
         self.fallback_card_examples.append(payload)
+
+    def add_bad_mapping_example(
+        self,
+        *,
+        pitcher_name: str | None,
+        reason: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        """Record a row that failed sanity validation. The dashboard
+        renders these as a table with pitcher / projected_k / over_line
+        / over_odds / rejection_reason so the operator can pinpoint the
+        upstream parse bug rather than seeing aggregated counts."""
+        self.rejected_for_bad_mapping += 1
+        if len(self.bad_mapping_examples) >= 10:
+            return
+        entry = {
+            "pitcher_name": pitcher_name,
+            "rejection_reason": reason,
+        }
+        entry.update(details or {})
+        self.bad_mapping_examples.append(entry)
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-safe dict for the daily-card / scan-result payload."""
