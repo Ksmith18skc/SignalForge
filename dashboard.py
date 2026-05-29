@@ -12,6 +12,7 @@ Launch: `streamlit run dashboard.py`.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import re
@@ -4419,6 +4420,263 @@ with tab_pnl:
 # Performance / CLV
 # =============================================================================
 
+
+def _md_table(rows: list[dict[str, Any]], columns: list[str] | None = None) -> str:
+    """Render a list of dicts as a GitHub-flavored markdown table.
+
+    LLM-friendly: numeric values keep their precision, missing cells are
+    rendered as '—' so the model can see they were absent rather than zero.
+    """
+    if not rows:
+        return "_(no rows)_\n"
+    if columns is None:
+        seen: dict[str, None] = {}
+        for row in rows:
+            for k in row.keys():
+                seen.setdefault(k, None)
+        columns = list(seen.keys())
+    header = "| " + " | ".join(columns) + " |"
+    sep = "| " + " | ".join("---" for _ in columns) + " |"
+    body_lines: list[str] = []
+    for row in rows:
+        cells: list[str] = []
+        for col in columns:
+            value = row.get(col)
+            if value is None or value == "":
+                cells.append("—")
+            elif isinstance(value, float):
+                cells.append(f"{value:.4f}".rstrip("0").rstrip("."))
+            elif isinstance(value, (list, dict)):
+                cells.append(json.dumps(value, default=str))
+            else:
+                cells.append(str(value))
+        body_lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join([header, sep, *body_lines]) + "\n"
+
+
+def _md_kv(items: list[tuple[str, Any]]) -> str:
+    """Render key/value pairs as a markdown bullet list."""
+    lines: list[str] = []
+    for key, value in items:
+        if isinstance(value, float):
+            shown = f"{value:.6f}".rstrip("0").rstrip(".")
+        elif value is None:
+            shown = "—"
+        else:
+            shown = str(value)
+        lines.append(f"- **{key}**: {shown}")
+    return "\n".join(lines) + "\n"
+
+
+def build_performance_export_markdown(
+    *,
+    mlb_performance: dict[str, Any],
+    perf_summary: dict[str, Any],
+    clv_block: dict[str, Any],
+    diagnostics: dict[str, Any],
+    window_label: str,
+    perf_date: str | None,
+    backend_start: str | None,
+    backend_end: str | None,
+    arizona_today_iso: str,
+) -> str:
+    """Serialize the Performance tab into a single markdown document.
+
+    Designed for paste-into-LLM workflows: every section that the tab
+    renders visually has a corresponding markdown block here, with the
+    raw `mlb_performance` JSON appended as a final appendix so the model
+    can fall back to structured data when a summary is ambiguous.
+    """
+    generated_at = datetime.now(timezone.utc).isoformat()
+    parts: list[str] = []
+    parts.append("# SignalForge — MLB Performance Export\n")
+    parts.append(
+        _md_kv([
+            ("Generated at (UTC)", generated_at),
+            ("Window selection", window_label),
+            ("Selected date (Arizona)", perf_date or "n/a (multi-day window)"),
+            ("Backend window start", backend_start or "all available"),
+            ("Backend window end", backend_end or "all available"),
+            ("Arizona today", arizona_today_iso),
+            ("Graded edges in window", perf_summary.get("graded_edges") or 0),
+        ])
+    )
+
+    # --- Diagnostics ------------------------------------------------------
+    parts.append("\n## Diagnostics\n")
+    parts.append(
+        _md_kv([
+            ("Candidate edge snapshots", diagnostics.get("snapshot_count", 0)),
+            ("Closing lines", diagnostics.get("closing_line_count", 0)),
+            ("Graded edges", diagnostics.get("graded_edge_count", 0)),
+            ("Persisted final scores", diagnostics.get("persisted_final_score_count", 0)),
+            ("Live finals found", diagnostics.get("live_final_count", 0)),
+            ("Final score count (max of sources)", diagnostics.get("final_score_count", 0)),
+            ("Last graded at", diagnostics.get("last_graded_at") or "—"),
+            ("Reason (if blocked)", diagnostics.get("reason") or "—"),
+        ])
+    )
+
+    # --- Research Health -------------------------------------------------
+    health = mlb_performance.get("research_health") or {}
+    parts.append("\n## Research Health\n")
+    parts.append(
+        _md_kv([
+            ("Positive CLV rate", health.get("positive_clv_rate")),
+            ("Avg CLV points", health.get("average_clv_points")),
+            ("Avg CLV %", health.get("average_clv_percent")),
+            ("ROI units", health.get("roi_units")),
+            ("Win rate", health.get("win_rate")),
+            ("Graded sample size", health.get("graded_sample_size")),
+            ("Sample size tier", health.get("sample_size_tier")),
+            ("Sample size label", health.get("sample_size_label")),
+        ])
+    )
+
+    # --- CLV Overview ----------------------------------------------------
+    parts.append("\n## CLV Overview\n")
+    parts.append(
+        _md_kv([
+            ("Avg CLV points", clv_block.get("average_clv_points")),
+            ("Avg CLV %", clv_block.get("average_clv_percent")),
+            ("Positive CLV rate", clv_block.get("positive_clv_rate")),
+            ("Edges with CLV", clv_block.get("edges_with_clv") or 0),
+            ("Missing CLV count", clv_block.get("missing_clv_count") or 0),
+        ])
+    )
+    by_side_clv = clv_block.get("by_side") or {}
+    by_edge_type_clv = clv_block.get("by_edge_type") or {}
+    clv_rows: list[dict[str, Any]] = []
+    for side_name, payload in by_side_clv.items():
+        clv_rows.append({
+            "scope": f"side: {side_name}",
+            "count": payload.get("count"),
+            "avg_clv_points": payload.get("average_clv_points"),
+            "avg_clv_percent": payload.get("average_clv_percent"),
+            "positive_clv_rate": payload.get("positive_clv_rate"),
+        })
+    for etype, payload in by_edge_type_clv.items():
+        clv_rows.append({
+            "scope": f"edge: {etype}",
+            "count": payload.get("count"),
+            "avg_clv_points": payload.get("average_clv_points"),
+            "avg_clv_percent": payload.get("average_clv_percent"),
+            "positive_clv_rate": payload.get("positive_clv_rate"),
+        })
+    if clv_rows:
+        parts.append("\n### CLV by Scope\n")
+        parts.append(_md_table(clv_rows))
+
+    # --- Over vs Under ---------------------------------------------------
+    side_block = mlb_performance.get("by_side") or {}
+    over_stats = side_block.get("over") or {}
+    under_stats = side_block.get("under") or {}
+    parts.append("\n## Over vs Under Split (game_total)\n")
+    if side_block.get("directional_bias_warning"):
+        parts.append(f"> Directional bias warning: {side_block['directional_bias_warning']}\n")
+    parts.append(
+        _md_table([
+            {
+                "side": "over",
+                "count": over_stats.get("count") or 0,
+                "win_rate": over_stats.get("win_rate"),
+                "roi_units": over_stats.get("roi_units"),
+                "avg_score": over_stats.get("average_score"),
+                "avg_clv_points": over_stats.get("average_clv_points"),
+            },
+            {
+                "side": "under",
+                "count": under_stats.get("count") or 0,
+                "win_rate": under_stats.get("win_rate"),
+                "roi_units": under_stats.get("roi_units"),
+                "avg_score": under_stats.get("average_score"),
+                "avg_clv_points": under_stats.get("average_clv_points"),
+            },
+        ])
+    )
+
+    # --- Score Band Performance ------------------------------------------
+    parts.append("\n## Score Band Performance\n")
+    by_band = mlb_performance.get("by_score_band") or []
+    if by_band:
+        parts.append(_md_table(by_band))
+        unstable_bands = [
+            row.get("score_band") for row in by_band
+            if not row.get("stable", True) and (row.get("graded_edges") or 0) > 0
+        ]
+        if unstable_bands:
+            parts.append(
+                f"\n> Unstable bands (<30 graded): {', '.join(map(str, unstable_bands))}\n"
+            )
+    else:
+        parts.append("_No score-band breakdown yet._\n")
+
+    # --- Projection Calibration ------------------------------------------
+    cal = mlb_performance.get("projection_calibration") or {}
+    parts.append("\n## Projection Calibration\n")
+    for w in cal.get("warnings") or []:
+        parts.append(f"> Warning: {w}\n")
+    parts.append(
+        _md_kv([
+            ("Avg model projected total", cal.get("avg_model_projected_total")),
+            ("Avg market entry total", cal.get("avg_market_entry_total")),
+            ("Avg closing total", cal.get("avg_closing_total")),
+            ("Avg actual total", cal.get("avg_actual_total")),
+            ("Avg projection error (signed)", cal.get("avg_projection_error")),
+            ("Avg |projection error|", cal.get("avg_absolute_projection_error")),
+            ("Rows with projection", cal.get("rows_with_projection") or 0),
+            ("Graded game_totals", cal.get("graded_game_totals") or 0),
+        ])
+    )
+
+    # --- Projection Buckets ----------------------------------------------
+    bucket_rows = mlb_performance.get("by_projection_bucket") or []
+    parts.append("\n## Projection Buckets\n")
+    parts.append(_md_table(bucket_rows) if bucket_rows else "_No projection-bucket data yet._\n")
+
+    # --- Timing Analytics ------------------------------------------------
+    timing_rows = mlb_performance.get("by_timing") or []
+    parts.append("\n## Timing Analytics\n")
+    parts.append(_md_table(timing_rows) if timing_rows else "_No timing data yet._\n")
+
+    # --- ROI by Edge Type ------------------------------------------------
+    by_market = mlb_performance.get("by_market") or []
+    parts.append("\n## ROI by Edge Type\n")
+    parts.append(_md_table(by_market) if by_market else "_No edge-type breakdown yet._\n")
+
+    # --- Factor Attribution ----------------------------------------------
+    factor_rows = mlb_performance.get("factor_attribution") or []
+    parts.append("\n## Factor Attribution\n")
+    if factor_rows:
+        parts.append(_md_table(factor_rows))
+        unstable_factors = [r.get("factor") for r in factor_rows if r.get("unstable")]
+        if unstable_factors:
+            parts.append(
+                f"\n> Unstable factors (sample <50): {', '.join(map(str, unstable_factors))}\n"
+            )
+    else:
+        parts.append("_No factor attribution available._\n")
+
+    # --- CLV Leaders -----------------------------------------------------
+    top_pos = clv_block.get("top_positive") or []
+    top_neg = clv_block.get("top_negative") or []
+    parts.append("\n## Raw Graded Edges — CLV Leaders\n")
+    parts.append("\n### Top positive CLV\n")
+    parts.append(_md_table(top_pos) if top_pos else "_None._\n")
+    parts.append("\n### Top negative CLV\n")
+    parts.append(_md_table(top_neg) if top_neg else "_None._\n")
+
+    # --- Raw payload appendix --------------------------------------------
+    # Keep the full JSON so the LLM can recompute any aggregate the
+    # human-readable summary lossily renders (e.g. small floats, missing
+    # nested counts). Marked as a separate section so a human can skip it.
+    parts.append("\n## Appendix — Raw mlb_performance JSON\n")
+    parts.append("```json\n")
+    parts.append(json.dumps(mlb_performance, indent=2, default=str, sort_keys=True))
+    parts.append("\n```\n")
+    return "".join(parts)
+
+
 with tab_perf:
     st.markdown("### Performance Window")
     window_options = ["Last 7 days", "Today", "Yesterday", "Last 30 days", "All time"]
@@ -4439,7 +4697,7 @@ with tab_perf:
     )
     st.caption(f"Arizona today: **{arizona_today_iso}** · backend window: **{range_label}**")
 
-    perf_actions = st.columns([1, 1, 6])
+    perf_actions = st.columns([1, 1, 1.2, 4.8])
     action_date = perf_date  # only pass to backend when a single day is selected
     with perf_actions[0]:
         if st.button("Update closing lines", use_container_width=True):
@@ -4447,6 +4705,33 @@ with tab_perf:
     with perf_actions[1]:
         if st.button("Grade MLB results", use_container_width=True):
             action_grade_mlb_results(date=action_date)
+    with perf_actions[2]:
+        export_markdown = build_performance_export_markdown(
+            mlb_performance=mlb_performance,
+            perf_summary=perf_summary,
+            clv_block=clv_block,
+            diagnostics=diagnostics,
+            window_label=window,
+            perf_date=perf_date,
+            backend_start=backend_start,
+            backend_end=backend_end,
+            arizona_today_iso=arizona_today_iso,
+        )
+        export_label_date = perf_date or arizona_today_iso
+        export_window_slug = re.sub(r"[^a-z0-9]+", "_", window.lower()).strip("_")
+        st.download_button(
+            "Download summary",
+            data=export_markdown.encode("utf-8"),
+            file_name=(
+                f"signalforge_mlb_performance_{export_label_date}_{export_window_slug}.md"
+            ),
+            mime="text/markdown",
+            use_container_width=True,
+            help=(
+                "Markdown export of every analytics section on this tab — "
+                "paste into ChatGPT/Claude for tuning + model training."
+            ),
+        )
 
     # --- Debug visibility panel so the user can tell WHY the tab is empty ----
     with st.expander("Performance debug panel", expanded=not (perf_summary.get("graded_edges") or 0)):
