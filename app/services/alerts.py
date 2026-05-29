@@ -112,7 +112,14 @@ def market_expiration_reason(
     now = now or datetime.utcnow()
     if market.is_active is False:
         return "market is no longer active"
-    if market.end_date is not None and market.end_date + timedelta(hours=grace_hours) < now:
+    # Defensive: ingestion now normalizes end_date to naive UTC, but a
+    # Postgres ``TIMESTAMP WITH TIME ZONE`` column can still hand back
+    # an aware datetime. Strip the tz here so the comparison can't blow
+    # up the scan with "can't compare offset-naive and offset-aware".
+    end_date_naive = market.end_date
+    if end_date_naive is not None and end_date_naive.tzinfo is not None:
+        end_date_naive = end_date_naive.astimezone(timezone.utc).replace(tzinfo=None)
+    if end_date_naive is not None and end_date_naive + timedelta(hours=grace_hours) < now:
         return f"market end_date {market.end_date.isoformat()} already passed"
     event_date = event_date_from_slug(market.slug)
     arizona_today = now.replace(tzinfo=timezone.utc).astimezone(TZ_ARIZONA).date()

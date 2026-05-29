@@ -10,7 +10,7 @@ Order of precedence per the spec:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
@@ -33,6 +33,34 @@ logger = logging.getLogger(__name__)
 # storage constraint.
 _EXTERNAL_ID_MAX_LEN = 2048
 _EXTERNAL_ID_WARN_LEN = 1000
+
+
+def _to_naive_utc(value: Any) -> datetime | None:
+    """Coerce a datetime / ISO string into a *naive UTC* datetime.
+
+    The rest of the codebase (signal_engine, alerts, scanner) compares
+    against ``datetime.utcnow()`` which is naive. Providers, on the
+    other hand, often return ISO strings with ``+00:00`` or ``Z``
+    offsets — ``datetime.fromisoformat`` parses those as **aware**,
+    which then explodes the moment we mix them with utcnow:
+
+        ``TypeError: can't compare offset-naive and offset-aware datetimes``
+
+    Funnel every provider-supplied datetime through this helper so the
+    aware/naive split never crosses the ingestion boundary.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
 
 
 def _sanitize_external_id(raw: Any) -> str | None:
@@ -221,10 +249,11 @@ def _ingest_one_trade(
 
         market = upsert_market_from_dict(db, entry)
 
-        ts = entry.get("timestamp")
-        ts_parsed = (
-            datetime.fromisoformat(ts) if isinstance(ts, str) else (ts or datetime.utcnow())
-        )
+        # Providers commonly return ISO timestamps with a ``+00:00``
+        # offset; coerce to naive UTC so later comparisons against
+        # ``datetime.utcnow()`` (used everywhere downstream) don't
+        # explode with "can't compare offset-naive and offset-aware".
+        ts_parsed = _to_naive_utc(entry.get("timestamp")) or datetime.utcnow()
 
         trade = Trade(
             trader_id=trader.id,
@@ -268,12 +297,13 @@ def upsert_market_from_dict(db: Session, data: dict[str, Any]) -> Market:
         if data.get(f) is not None:
             setattr(market, f, data[f])
 
-    end_date = data.get("end_date")
-    if isinstance(end_date, str):
-        try:
-            market.end_date = datetime.fromisoformat(end_date)
-        except ValueError:
-            pass
+    # Polymarket / Falcon serve ``end_date`` as ISO with a ``+00:00``
+    # tz offset. ``_to_naive_utc`` strips the tz so the downstream
+    # alert decision (which compares against a naive utcnow) doesn't
+    # raise "can't compare offset-naive and offset-aware datetimes".
+    end_date_norm = _to_naive_utc(data.get("end_date"))
+    if end_date_norm is not None:
+        market.end_date = end_date_norm
 
     market.updated_at = datetime.utcnow()
     db.flush()
