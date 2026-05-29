@@ -27,7 +27,7 @@ from app.utils.dashboard_format import (
 logger = logging.getLogger(__name__)
 
 AlertTier = Literal["ignore", "log_only", "discord_alert", "high_conviction", "possible_entry"]
-DISCORD_TIERS: set[AlertTier] = {"high_conviction", "possible_entry"}
+DISCORD_TIERS: set[AlertTier] = {"discord_alert", "high_conviction", "possible_entry"}
 TIER_RANK: dict[AlertTier, int] = {
     "ignore": 0,
     "log_only": 1,

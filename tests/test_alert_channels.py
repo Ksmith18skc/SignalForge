@@ -364,6 +364,43 @@ def _dispatcher_with_fake_discord():
     return dispatcher, fake
 
 
+def test_dispatcher_sends_base_discord_alert(db_session):
+    now = datetime.utcnow()
+    market = Market(
+        slug="base-discord-alert",
+        title="Base Discord Alert",
+        yes_price=0.51,
+        volume_24h_usd=500,
+        liquidity_usd=500,
+    )
+    trader = Trader(nickname="sharp", wallet_address="0xbase", trust_score=70)
+    db_session.add_all([market, trader])
+    db_session.flush()
+    signal = Signal(
+        market_id=market.id,
+        trader_id=trader.id,
+        signal_type="trusted_wallet_entry",
+        side="BUY",
+        outcome="Yes",
+        entry_price=0.50,
+        size_usd=2_000,
+        score=75,
+        source="Falcon",
+        reason="base alert candidate",
+        created_at=now,
+    )
+    signal.market = market
+    signal.trader = trader
+    db_session.add(signal)
+    db_session.flush()
+    dispatcher, fake = _dispatcher_with_fake_discord()
+
+    alerts = dispatcher.dispatch(db_session, signal)
+
+    assert fake.sent == 1
+    assert alerts[0].status == "sent"
+
+
 def test_dispatcher_skips_discord_when_action_is_avoid_chasing(db_session):
     signal = _make_high_conviction_signal(db_session)
     decision = evaluate_alert_decision(db_session, signal, Settings())

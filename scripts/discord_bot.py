@@ -33,7 +33,8 @@ from app.utils.logging import configure_logging
 
 logger = logging.getLogger(__name__)
 
-REQUEST_TIMEOUT = 45.0
+REQUEST_TIMEOUT = 20.0
+CONNECT_TIMEOUT = 5.0
 
 
 @contextmanager
@@ -66,7 +67,7 @@ def _api_base() -> str:
 
 async def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     last_exc: httpx.HTTPError | None = None
-    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=15.0)
+    timeout = httpx.Timeout(REQUEST_TIMEOUT, connect=CONNECT_TIMEOUT)
     async with httpx.AsyncClient(timeout=timeout) as client:
         for _ in range(2):
             try:
@@ -78,6 +79,67 @@ async def _get_json(path: str, params: dict[str, Any] | None = None) -> dict[str
             except httpx.HTTPError:
                 raise
     raise last_exc or httpx.ReadTimeout("SignalForge API request timed out")
+
+
+async def _defer(interaction: discord.Interaction, *, ephemeral: bool = False) -> bool:
+    """Acknowledge the slash command immediately.
+
+    Discord shows "The application did not respond" if the first
+    interaction response is missed. All command handlers call this as
+    their first awaited operation and then use ``_send`` for every
+    message so errors still get a visible response.
+    """
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+        return True
+    except discord.NotFound:
+        logger.warning("Discord interaction expired before defer: command=%s", interaction.command)
+    except discord.HTTPException as exc:
+        logger.exception("Discord defer failed for command=%s: %s", interaction.command, exc)
+    return False
+
+
+async def _send(
+    interaction: discord.Interaction,
+    content: str | None = None,
+    *,
+    embed: discord.Embed | None = None,
+    embeds: list[discord.Embed] | None = None,
+    ephemeral: bool = False,
+) -> None:
+    """Send a command response whether or not defer succeeded."""
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                content=content,
+                embed=embed,
+                embeds=embeds,
+                ephemeral=ephemeral,
+            )
+        else:
+            await interaction.response.send_message(
+                content=content,
+                embed=embed,
+                embeds=embeds,
+                ephemeral=ephemeral,
+            )
+    except discord.HTTPException as exc:
+        logger.exception("Discord response send failed for command=%s: %s", interaction.command, exc)
+
+
+def _error_text(prefix: str, exc: Exception) -> str:
+    if isinstance(exc, httpx.TimeoutException):
+        return (
+            f"{prefix}: SignalForge backend did not answer within "
+            f"{REQUEST_TIMEOUT:.0f}s. Check `SIGNALFORGE_API_URL` and backend health."
+        )
+    if isinstance(exc, httpx.ConnectError):
+        return (
+            f"{prefix}: could not connect to SignalForge backend at `{_api_base()}`. "
+            "Check `SIGNALFORGE_API_URL`."
+        )
+    return f"{prefix}: `{type(exc).__name__}: {exc}`"
 
 
 def _money(value: Any) -> str:
@@ -222,11 +284,12 @@ bot = SignalForgeBot()
 
 @bot.tree.command(name="sf_status", description="Check SignalForge backend, scanner, and alert status.")
 async def sf_status(interaction: discord.Interaction) -> None:
-    await interaction.response.defer(thinking=True, ephemeral=True)
+    if not await _defer(interaction, ephemeral=True):
+        return
     try:
         status = await _get_json("/bot/status")
     except httpx.HTTPError as exc:
-        await interaction.followup.send(f"SignalForge status check failed: `{type(exc).__name__}: {exc}`")
+        await _send(interaction, _error_text("SignalForge status check failed", exc), ephemeral=True)
         return
 
     falcon = status.get("falcon", {})
@@ -250,7 +313,7 @@ async def sf_status(interaction: discord.Interaction) -> None:
         )[:1024],
         inline=False,
     )
-    await interaction.followup.send(embed=embed)
+    await _send(interaction, embed=embed, ephemeral=True)
 
 
 @bot.tree.command(
@@ -268,13 +331,14 @@ async def sf_high_conviction(
     hours: app_commands.Range[int, 1, 168] = 24,
     event_date_from: str | None = None,
 ) -> None:
-    await interaction.response.defer(thinking=True)
+    if not await _defer(interaction):
+        return
     parsed_event_date: str | None = None
     if event_date_from:
         try:
             parsed_event_date = date.fromisoformat(event_date_from).isoformat()
         except ValueError:
-            await interaction.followup.send("`event_date_from` must be in `YYYY-MM-DD` format.")
+            await _send(interaction, "`event_date_from` must be in `YYYY-MM-DD` format.")
             return
 
     try:
@@ -283,20 +347,22 @@ async def sf_high_conviction(
             params["event_date_from"] = parsed_event_date
         payload = await _get_json("/bot/high-conviction", params=params)
     except httpx.HTTPError as exc:
-        await interaction.followup.send(f"High-conviction lookup failed: `{type(exc).__name__}: {exc}`")
+        await _send(interaction, _error_text("High-conviction lookup failed", exc))
         return
 
     signals = payload.get("signals", [])
     if not signals:
         near_misses = payload.get("near_misses", [])
         if not near_misses:
-            await interaction.followup.send(
+            await _send(
+                interaction,
                 f"No high-conviction or near-miss signals found in the last {hours}h."
             )
             return
         embeds = [_near_miss_embed(signal) for signal in near_misses[:3]]
         event_text = f" since event date {parsed_event_date}" if parsed_event_date else ""
-        await interaction.followup.send(
+        await _send(
+            interaction,
             content=(
                 f"No high-conviction or possible-entry signals found in the last {hours}h"
                 f"{event_text}. Top near-misses:"
@@ -306,7 +372,8 @@ async def sf_high_conviction(
         return
 
     embeds = [_signal_embed(signal) for signal in signals[:10]]
-    await interaction.followup.send(
+    await _send(
+        interaction,
         content=f"Found {len(embeds)} SignalForge candidate(s) in the last {hours}h.",
         embeds=embeds,
     )
@@ -325,31 +392,51 @@ async def search(
     market_url: str,
     limit: app_commands.Range[int, 1, 10] = 10,
 ) -> None:
-    await interaction.response.defer(thinking=True)
+    if not await _defer(interaction):
+        return
     try:
         payload = await _get_json("/bot/search", params={"market_url": market_url, "limit": limit})
     except httpx.HTTPStatusError as exc:
         detail = exc.response.text[:500]
-        await interaction.followup.send(f"Market search failed: HTTP {exc.response.status_code} `{detail}`")
+        await _send(interaction, f"Market search failed: HTTP {exc.response.status_code} `{detail}`")
         return
     except httpx.HTTPError as exc:
-        await interaction.followup.send(f"Market search failed: `{type(exc).__name__}: {exc}`")
+        await _send(interaction, _error_text("Market search failed", exc))
         return
 
     positions = payload.get("positions", [])
     if not positions:
-        await interaction.followup.send(
+        await _send(
+            interaction,
             f"No tracked-wallet positions found for `{payload.get('market_slug') or market_url}`."
         )
         return
 
     embeds = [_position_embed(position) for position in positions[:10]]
-    await interaction.followup.send(
+    await _send(
+        interaction,
         content=(
             f"Found {len(embeds)} tracked-wallet position(s) for "
             f"{payload.get('market') or payload.get('market_slug')}."
         ),
         embeds=embeds,
+    )
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+) -> None:
+    logger.exception(
+        "Discord command failed: command=%s error=%s",
+        interaction.command,
+        error,
+    )
+    await _send(
+        interaction,
+        f"SignalForge command failed: `{type(error).__name__}: {error}`",
+        ephemeral=True,
     )
 
 
