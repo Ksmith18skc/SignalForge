@@ -182,8 +182,17 @@ def build_wallet_context(
 
     # Candidate markets: same league/teams/date/market_type, line within tolerance.
     # Narrow with a cheap SQL LIKE, then apply the precise resolver match.
+    #
+    # Moneyline markets are slugged at the bare matchup level
+    # (``mlb-min-cws-2026-05-26``) with NO ``-moneyline`` suffix, so a
+    # ``...-moneyline%`` LIKE matches zero rows and every game_moneyline edge
+    # falls through to "could not map". Total/spread markets DO carry the type
+    # token. Branch the pattern on market_type so each shape is reachable.
     date_iso = key.event_date or card_date
-    like = f"{key.league}-%-{date_iso}-{key.market_type}%"
+    if key.market_type == "moneyline":
+        like = f"{key.league}-%-{date_iso}"
+    else:
+        like = f"{key.league}-%-{date_iso}-{key.market_type}%"
     candidates = list(db.scalars(select(Market).where(Market.slug.like(like))))
     debug["candidate_markets_considered"] = len(candidates)
 

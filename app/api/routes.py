@@ -3106,6 +3106,24 @@ def dashboard_debug(
     }
 
 
+@router.get("/dashboard/pipeline-debug")
+def dashboard_pipeline_debug(
+    date: str | None = None,
+    db: Session = Depends(get_db),
+) -> dict[str, object]:
+    """Full wallet-trades -> signals -> alignment -> high-conviction funnel.
+
+    Returns a per-stage count for ``date`` (default: Arizona today) plus a
+    ``drop_stage`` naming the earliest stage that hit zero. This is the
+    "where did my data go?" panel: when scans succeed but the dashboard is
+    empty, this pinpoints the exact stage records disappear.
+    """
+    from app.services.pipeline_diagnostics import pipeline_funnel
+
+    target = date or arizona_today()
+    return pipeline_funnel(db, card_date=target)
+
+
 @router.post("/pnl/sync")
 def pnl_sync(db: Session = Depends(get_db)) -> dict[str, object]:
     try:

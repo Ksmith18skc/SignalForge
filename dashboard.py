@@ -3341,6 +3341,61 @@ def fetch_tracked_wallet_debug(card_date: str = CARD_DATE) -> dict[str, Any]:
     )
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_pipeline_debug(card_date: str = CARD_DATE) -> dict[str, Any]:
+    """End-to-end funnel: wallet trades -> signals -> alignment -> high conv.
+
+    Powers the Pipeline Diagnostics panel. Surfaces the exact stage where
+    records disappear when scans succeed but the dashboard is empty.
+    """
+    return safe_get(
+        "/dashboard/pipeline-debug",
+        default={"drop_stage": "backend unreachable", "funnel": {}},
+        params={"date": card_date},
+    )
+
+
+def render_pipeline_diagnostics(card_date: str) -> None:
+    """Temporary diagnostics block: one number per pipeline stage so the
+    operator can see at a glance where wallet trades stop becoming signals,
+    aligned cards, and high-conviction plays."""
+    data = fetch_pipeline_debug(card_date)
+    funnel = data.get("funnel") or {}
+    drop = data.get("drop_stage") or "unknown"
+
+    st.markdown("#### 🔎 Pipeline Diagnostics")
+    st.caption(
+        f"Where the data stops between wallet trades and the cards on this "
+        f"page. Card date **{data.get('card_date', card_date)}** · "
+        f"Arizona today **{data.get('arizona_today', '?')}**."
+    )
+    stages = [
+        ("Wallet Trades Today", funnel.get("wallet_trades_today")),
+        ("In Signal Window", funnel.get("recent_trades_on_card_date")),
+        ("Signal Candidates", funnel.get("signal_candidates")),
+        ("Signals Generated", funnel.get("signals_generated")),
+        ("Aligned Wallet Cards", funnel.get("aligned_wallet_cards")),
+        ("High Conviction", funnel.get("high_conviction_cards")),
+    ]
+    cols = st.columns(len(stages))
+    prev: int | None = None
+    for col, (label, value) in zip(cols, stages):
+        v = value if isinstance(value, (int, float)) else None
+        delta = None
+        if prev is not None and v is not None and v < prev:
+            delta = f"-{prev - v}"
+        col.metric(label, "—" if v is None else int(v), delta=delta, delta_color="inverse")
+        if v is not None:
+            prev = v
+    # The headline: which stage zeroed out.
+    if "none:" in drop:
+        st.success(f"Pipeline healthy at every stage. ({drop})")
+    else:
+        st.error(f"**Records disappear here →** {drop}")
+    with st.expander("Full funnel JSON (ingestion · signals · alignment · mapping · duplicates)"):
+        st.json(data)
+
+
 @st.cache_data(ttl=10, show_spinner=False)
 def fetch_alerts(limit: int = 200, card_date: str = CARD_DATE) -> list[dict[str, Any]]:
     return safe_get("/alerts", default=[], params={"limit": limit, "date": card_date})
@@ -5098,6 +5153,13 @@ def _positions_dataframe(positions: list[dict[str, Any]]) -> "pd.DataFrame":
 
 
 with tab_wallet:
+    # --- Pipeline diagnostics (temporary) -------------------------------
+    # Renders FIRST so that when the tab looks empty, the operator sees the
+    # exact stage where wallet trades stopped becoming aligned cards before
+    # scrolling into the (empty) card sections below.
+    render_pipeline_diagnostics(selected_card_date)
+    st.markdown("<div class='sf-divider'></div>", unsafe_allow_html=True)
+
     # --- Source toggle: current card vs all dates -----------------------
     # ``filtered_positions`` is card-date-scoped, which is what the rest
     # of the dashboard wants. Wallet Flow defaults to *all-date* tracked

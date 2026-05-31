@@ -26,13 +26,16 @@ from sqlalchemy.orm import Session
 from app.config import get_settings
 from app.models import Market, MarketSnapshot, Signal, Trade, Trader
 from app.providers.base import BaseProvider, ProviderSource
-from app.services.card_date import market_card_date
+from app.services.card_date import arizona_today, market_card_date
 from app.services import scoring
 
 logger = logging.getLogger(__name__)
 
-# Recent = last 24h for the multi-wallet / size rules.
-_RECENT_WINDOW = timedelta(hours=24)
+# Default recency window for the multi-wallet / size rules. The effective
+# window is ``settings.signal_recent_trade_window_hours`` (see _recent_window);
+# this constant is only the fallback when settings are unavailable.
+_DEFAULT_RECENT_WINDOW_HOURS = 48
+_RECENT_WINDOW = timedelta(hours=_DEFAULT_RECENT_WINDOW_HOURS)
 # A single position counts as "large" above this USD value.
 _LARGE_POSITION_USD = 5_000.0
 # Post-entry price move that qualifies as "validated".
@@ -69,13 +72,26 @@ class SignalCandidate:
             reason=self.reason,
             source=self.source,
             score_breakdown=self.score_breakdown,
-            generated_for_date=self.generated_for_date,
+            # Never persist a NULL card date: an explicit None passed here
+            # overrides the column's ``default=arizona_today`` and makes the
+            # signal invisible to every date-scoped query when its market has
+            # no parseable slug date. Fall back to today's Arizona card date.
+            generated_for_date=self.generated_for_date or arizona_today(),
             created_at=datetime.utcnow(),
         )
 
 
+def _recent_window() -> timedelta:
+    """Configured trade-recency window (hours), with a safe fallback."""
+    try:
+        hours = int(get_settings().signal_recent_trade_window_hours)
+    except Exception:  # noqa: BLE001 — settings must never break signal gen
+        hours = _DEFAULT_RECENT_WINDOW_HOURS
+    return timedelta(hours=max(hours, 1))
+
+
 def _recent_trades(db: Session) -> list[Trade]:
-    since = datetime.utcnow() - _RECENT_WINDOW
+    since = datetime.utcnow() - _recent_window()
     return list(
         db.scalars(
             select(Trade).where(Trade.timestamp >= since).order_by(Trade.timestamp.desc())
@@ -141,7 +157,7 @@ def _candidate_key(candidate: SignalCandidate) -> tuple[Any, ...]:
 
 
 def _existing_signal_keys(db: Session) -> set[tuple[Any, ...]]:
-    since = datetime.utcnow() - _RECENT_WINDOW
+    since = datetime.utcnow() - _recent_window()
     signals = db.scalars(select(Signal).where(Signal.created_at >= since))
     return {
         _signal_key(

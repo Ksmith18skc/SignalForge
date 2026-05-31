@@ -75,6 +75,12 @@ class Settings(BaseSettings):
     # --- scanner ---
     scan_interval_seconds: int = 60
     signal_score_threshold: float = 50.0  # only persist/alert above this
+    # How far back (hours) the signal engine looks for trades to evaluate.
+    # Prediction-market wallets open positions well before first pitch, so a
+    # 24h window silently drops valid same-card positions opened the prior
+    # evening. 48h covers the typical "opened last night, game tonight" case
+    # while the market_card_date filter still pins signals to the right slate.
+    signal_recent_trade_window_hours: int = 48
 
     # --- provider credentials (optional — missing = MockProvider) ---
     falcon_api_key: str | None = None
