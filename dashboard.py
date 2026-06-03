@@ -279,13 +279,26 @@ with tab_watchlist:
         st.info("No tracked wallets. Seed the watchlist: `python -m scripts.seed`.")
     else:
         tdf = pd.DataFrame(traders)
+        if "wallet_address" in tdf.columns:
+            tdf["profile"] = tdf["wallet_address"].map(
+                lambda w: f"https://polymarketanalytics.com/traders/{w}#trades" if w else None
+            )
         cols = [
-            "nickname", "trust_score", "win_rate", "total_pnl",
+            "nickname", "profile", "trust_score", "win_rate", "total_pnl",
             "trader_rank", "total_positions", "copy_mode", "wallet_address",
         ]
         cols = [c for c in cols if c in tdf.columns]
         tdf = tdf[cols].sort_values("trust_score", ascending=False) if "trust_score" in tdf else tdf[cols]
-        st.dataframe(tdf, use_container_width=True, hide_index=True)
+        st.dataframe(
+            tdf,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "profile": st.column_config.LinkColumn(
+                    "Profile", display_text="View ↗"
+                ),
+            },
+        )
 
 
 # --------------------------------------------------------------------------- #
