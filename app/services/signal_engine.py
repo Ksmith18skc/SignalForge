@@ -389,8 +389,6 @@ async def generate_signals(
     # disabled until we wire a real cross-market agent_id.
 
     # --- persist -------------------------------------------------------------
-    from app.services.falcon_learning import capture_signal_attribution
-
     persisted: list[Signal] = []
     persisted_pairs: list[tuple[Signal, SignalCandidate]] = []
     existing_keys = _existing_signal_keys(db)
@@ -405,87 +403,6 @@ async def generate_signals(
         persisted.append(sig)
         persisted_pairs.append((sig, cand))
     db.flush()
-
-    # Capture learning attribution for every freshly persisted signal. We do
-    # this in a separate pass so each Signal already has its primary key.
-    for sig, cand in persisted_pairs:
-        market = markets_by_id.get(sig.market_id)
-        sport = (market.category if market else None) or None
-        score_breakdown = cand.score_breakdown or {}
-        factor_values = {
-            k: float(v) for k, v in score_breakdown.items()
-            if k in {
-                "wallet_quality",
-                "multi_wallet_consensus",
-                "liquidity",
-                "entry_timing",
-                "price_inefficiency",
-            } and isinstance(v, (int, float))
-        }
-        effective = score_breakdown.get("effective_weights") or {}
-        contributing = []
-        if cand.trader_id is not None:
-            trader = traders_by_id.get(cand.trader_id)
-            if trader and trader.wallet_address:
-                contributing.append(
-                    {
-                        "wallet_address": trader.wallet_address,
-                        "contribution_weight": 1.0,
-                        "side": cand.side,
-                        "size_usd": cand.size_usd,
-                        "entry_price": cand.entry_price,
-                    }
-                )
-        try:
-            capture_signal_attribution(
-                db,
-                signal_id=sig.id,
-                factors=factor_values,
-                weights=effective,
-                sport=sport,
-                market_type=cand.signal_type,
-                contributing_wallets=contributing,
-                raw_score=cand.score,
-                regime_payload=score_breakdown.get("regime_payload"),
-                conflict_payload={
-                    "conviction_penalty": score_breakdown.get("conviction_penalty", 0.0),
-                },
-            )
-        except Exception:  # noqa: BLE001
-            # Learning-layer hiccups must never break signal persistence.
-            logger.exception("falcon_learning capture failed for signal=%s", sig.id)
-
-    # Fire-and-forget regime capture for every freshly persisted signal.
-    # The capture task opens its own DB session, retries each Falcon agent
-    # with bounded backoff, and persists an immutable SignalRegimeSnapshot.
-    # Signal persistence must not wait on Falcon latency — by the time this
-    # function returns, signals are already committed and consumable.
-    if persisted_pairs:
-        try:
-            from app.services.falcon_regime_capture import schedule_capture
-
-            capture_requests = []
-            for sig, cand in persisted_pairs:
-                market = markets_by_id.get(sig.market_id)
-                if market is None or not market.slug:
-                    continue
-                capture_requests.append({
-                    "signal_id": sig.id,
-                    "market_slug": market.slug,
-                    "sport": (market.category if market else None) or None,
-                    "market_type": cand.signal_type,
-                    "same_side_wallets": (cand.score_breakdown or {}).get(
-                        "same_side_wallets"
-                    ),
-                    "total_watched": total_watched,
-                    "elite_disagreement_count": (cand.score_breakdown or {}).get(
-                        "elite_disagreement_count", 0,
-                    ),
-                })
-            if capture_requests:
-                schedule_capture(capture_requests)
-        except Exception:  # noqa: BLE001
-            logger.exception("failed to schedule regime capture")
 
     logger.info("signal_engine: produced %d signals", len(persisted))
     return persisted

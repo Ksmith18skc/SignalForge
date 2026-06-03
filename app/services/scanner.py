@@ -229,70 +229,76 @@ async def run_scan_once(
             progress.wallets_loaded = len(traders)
         logger.info("scan.start card_date=%s wallets_loaded=%d", card_date, len(traders))
 
-        # 1. Enrich every watched trader.
-        _phase("enriching_traders")
-        for trader in traders:
-            try:
-                await ingestion.enrich_trader(db, trader, providers)
-            except SQLAlchemyError as exc:
-                ingestion_health.record_failure(f"enrich_trader: {exc}")
-                ingestion_health.safe_rollback(db)
-                _bump(api_errors=1)
-                logger.warning("enrich_trader(%s) DB failure, rolled back: %s", trader.nickname, exc)
-            except Exception as exc:  # noqa: BLE001
-                _bump(api_errors=1)
-                logger.warning("enrich_trader(%s) failed: %s", trader.nickname, exc)
+        # 1+2. Load wallet stats + trades CONCURRENTLY (network), then persist
+        # serially. Wallet enrichment is network-bound — one Falcon/Polymarket
+        # round-trip per wallet — so running 11 wallets sequentially used to
+        # blow the 180s cap and strand the scan in ``enriching_traders``
+        # before signal generation ever ran. Fanning the calls out with a
+        # per-call timeout turns ~33 serial round-trips into a few seconds of
+        # parallel I/O, and the live counter climbs as each wallet lands.
+        _phase("loading_wallet_data")
 
-        # 2. Pull recent trades. One trader's bad data must not abort the rest.
-        _phase("fetching_trades")
-        for trader in traders:
-            wallet_status = "ok"
-            err_str: str | None = None
-            raw_count = 0
-            active_count = 0
-            last_market: str | None = None
-            try:
-                trades = await ingestion.fetch_recent_trades(db, trader, providers)
-                raw_count = len(trades)
-                # "Active" at this layer = the trades that successfully
-                # persisted; deeper filtering (card_date / market-key
-                # match) happens in signal_engine.
-                active_count = raw_count
-                if trades:
-                    last_trade = trades[-1]
-                    if last_trade.market is not None:
-                        last_market = last_trade.market.slug or last_trade.market.title
-            except SQLAlchemyError as exc:
-                wallet_status = "db_error"
-                err_str = f"{type(exc).__name__}: {exc}"
-                ingestion_health.record_failure(f"fetch_recent_trades: {exc}")
-                ingestion_health.safe_rollback(db)
-                _bump(api_errors=1)
-                logger.warning(
-                    "fetch_recent_trades(%s) DB failure, rolled back: %s",
-                    trader.nickname, exc,
-                )
-            except Exception as exc:  # noqa: BLE001
-                wallet_status = "provider_error"
-                err_str = f"{type(exc).__name__}: {exc}"
-                _bump(api_errors=1)
-                if "429" in err_str or "rate" in err_str.lower():
-                    _bump(rate_limited=1)
-                logger.warning("fetch_recent_trades(%s) failed: %s", trader.nickname, exc)
-            _bump(
-                wallets_scanned=1,
-                raw_positions_found=raw_count,
-                active_positions=active_count,
-            )
+        def _on_wallet_done(trader: Trader, trades: list[dict[str, Any]]) -> None:
+            # Fired from the gather as each wallet's network completes, so the
+            # dashboard's "wallets scanned" counter moves in real time.
+            _bump(wallets_scanned=1, raw_positions_found=len(trades))
             if progress is not None:
+                last_market = None
+                if trades:
+                    last_market = trades[-1].get("market_slug") or trades[-1].get("market_title")
                 progress.record_wallet(
                     nickname=trader.nickname or "?",
                     address=trader.wallet_address,
-                    status=wallet_status,
-                    raw_positions=raw_count,
-                    active_positions=active_count,
+                    status="fetched",
+                    raw_positions=len(trades),
+                    active_positions=0,
                     last_market=last_market,
-                    error=err_str,
+                )
+
+        try:
+            payloads = await ingestion.gather_trader_payloads(
+                traders,
+                providers,
+                limit=20,
+                per_call_timeout=float(settings.scan_provider_call_timeout_seconds),
+                concurrency=int(settings.scan_wallet_concurrency),
+                on_wallet_done=_on_wallet_done,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _bump(api_errors=1)
+            logger.exception("wallet data gather failed: %s", exc)
+            payloads = {}
+
+        # Persist serially — fast, no network — so the single scanner Session
+        # is never touched concurrently.
+        _phase("persisting_wallet_data")
+        for trader in traders:
+            payload = payloads.get(trader.id)
+            if payload is None:
+                continue
+            try:
+                new_trades = ingestion.persist_trader_payload(db, trader, payload)
+            except SQLAlchemyError as exc:
+                ingestion_health.record_failure(f"persist_trader_payload: {exc}")
+                ingestion_health.safe_rollback(db)
+                _bump(api_errors=1)
+                logger.warning(
+                    "persist_trader_payload(%s) DB failure, rolled back: %s",
+                    trader.nickname, exc,
+                )
+                continue
+            _bump(active_positions=len(new_trades))
+            if progress is not None:
+                last_market = None
+                if new_trades and new_trades[-1].market is not None:
+                    last_market = new_trades[-1].market.slug or new_trades[-1].market.title
+                progress.record_wallet(
+                    nickname=trader.nickname or "?",
+                    address=trader.wallet_address,
+                    status="ok",
+                    raw_positions=len(payload.get("trades") or []),
+                    active_positions=len(new_trades),
+                    last_market=last_market,
                 )
 
         # 3. Discover + refresh markets.
@@ -312,6 +318,10 @@ async def run_scan_once(
         if progress is not None:
             progress.markets_discovered = len(discovered)
 
+        # Refresh card-date markets with the SAME concurrent pattern: fan the
+        # per-market price pulls out over the network, then snapshot serially.
+        # A 130-market slate used to mean 130 sequential round-trips — the next
+        # timeout waiting to happen once enrichment was no longer the cap.
         _phase("refreshing_markets")
         existing_markets = list(db.scalars(select(Market)))
         refresh_targets = {
@@ -319,18 +329,29 @@ async def run_scan_once(
             for market in [*discovered, *existing_markets]
             if market_card_date(market) == card_date
         }
-        for market in refresh_targets.values():
+        try:
+            market_data = await ingestion.gather_market_data(
+                list(refresh_targets.values()),
+                providers,
+                per_call_timeout=float(settings.scan_provider_call_timeout_seconds),
+                concurrency=int(settings.scan_wallet_concurrency),
+                on_market_done=lambda _m: _bump(markets_checked=1),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _bump(api_errors=1)
+            logger.exception("market data gather failed: %s", exc)
+            market_data = {}
+        for market_id, data in market_data.items():
+            market = refresh_targets.get(market_id)
+            if market is None:
+                continue
             try:
-                await ingestion.refresh_market(db, market, providers)
+                ingestion.persist_market_data(db, market, data)
             except SQLAlchemyError as exc:
-                ingestion_health.record_failure(f"refresh_market: {exc}")
+                ingestion_health.record_failure(f"persist_market_data: {exc}")
                 ingestion_health.safe_rollback(db)
                 _bump(api_errors=1)
-                logger.warning("refresh_market(%s) DB failure, rolled back: %s", market.slug, exc)
-            except Exception as exc:  # noqa: BLE001
-                _bump(api_errors=1)
-                logger.warning("refresh_market(%s) failed: %s", market.slug, exc)
-            _bump(markets_checked=1)
+                logger.warning("persist_market_data(%s) DB failure, rolled back: %s", market.slug, exc)
 
         existing_markets = list(db.scalars(select(Market)))
         scanned_markets = len(existing_markets)

@@ -165,6 +165,116 @@ async def enrich_trader(
     return trader
 
 
+async def _call_with_timeout(coro: Any, *, timeout: float, label: str) -> Any:
+    """Await ``coro`` but never block longer than ``timeout`` seconds.
+
+    A single hung provider call used to consume the entire scan budget and
+    leave the scan stuck in ``enriching_traders`` until the 180s watchdog.
+    Bounding each call means one slow wallet degrades to "no data for that
+    wallet" instead of stalling the whole scan.
+    """
+    import asyncio
+
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout)
+    except asyncio.TimeoutError:
+        logger.warning("%s timed out after %.1fs", label, timeout)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("%s failed: %s", label, exc)
+        return None
+
+
+async def gather_trader_payloads(
+    traders: list[Trader],
+    providers: dict[str, BaseProvider],
+    *,
+    limit: int = 20,
+    per_call_timeout: float = 8.0,
+    concurrency: int = 8,
+    on_wallet_done: Any = None,
+) -> dict[int, dict[str, Any]]:
+    """Concurrently fetch stats + trades for every trader. **Network only —
+    no DB access**, so it is safe to fan out across asyncio tasks while the
+    SQLAlchemy Session stays untouched (the caller persists serially).
+
+    Returns ``{trader_id: {"stats": ..., "poly": ..., "trades": [...]}}``.
+    ``on_wallet_done(trader)`` is invoked as each wallet's network completes
+    so the scanner can update live progress counters.
+    """
+    import asyncio
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(trader: Trader) -> tuple[int, dict[str, Any]]:
+        key = trader.wallet_address or trader.nickname
+        async with sem:
+            stats, poly, trades = await asyncio.gather(
+                _call_with_timeout(
+                    providers["primary"].get_trader_stats(key),
+                    timeout=per_call_timeout, label=f"primary.stats({key})",
+                ),
+                _call_with_timeout(
+                    providers["polymarket"].get_trader_stats(key),
+                    timeout=per_call_timeout, label=f"poly.stats({key})",
+                ),
+                _call_with_timeout(
+                    providers["primary"].get_trader_trades(key, limit=limit),
+                    timeout=per_call_timeout, label=f"primary.trades({key})",
+                ),
+            )
+        if on_wallet_done is not None:
+            try:
+                on_wallet_done(trader, trades or [])
+            except Exception:  # noqa: BLE001 — progress must never break the scan
+                logger.debug("on_wallet_done callback failed", exc_info=True)
+        return trader.id, {"stats": stats, "poly": poly, "trades": trades or []}
+
+    results = await asyncio.gather(*[_one(t) for t in traders])
+    return dict(results)
+
+
+def persist_trader_payload(
+    db: Session,
+    trader: Trader,
+    payload: dict[str, Any],
+) -> list[Trade]:
+    """Apply a payload from :func:`gather_trader_payloads` to the DB.
+
+    Serial + synchronous on purpose — all the slow network work already
+    happened concurrently upstream, so this is pure (fast) DB work that is
+    safe on the single scanner Session.
+    """
+    stats = payload.get("stats")
+    if isinstance(stats, dict):
+        _apply_stats(trader, stats)
+    poly = payload.get("poly")
+    if isinstance(poly, dict):
+        _apply_stats(trader, poly)
+    trader.updated_at = datetime.utcnow()
+    db.add(trader)
+    db.flush()
+
+    new_trades: list[Trade] = []
+    for entry in payload.get("trades") or []:
+        try:
+            trade = _ingest_one_trade(db, trader, entry)
+        except SQLAlchemyError as exc:
+            ingestion_health.record_failure(f"{type(exc).__name__}: {exc}")
+            ingestion_health.record_rollback()
+            logger.warning("trade insert failed for trader=%s: %s", trader.nickname, exc)
+            continue
+        except Exception as exc:  # noqa: BLE001
+            ingestion_health.record_failure(f"{type(exc).__name__}: {exc}")
+            ingestion_health.record_rollback()
+            logger.exception("unexpected error ingesting trade for trader=%s", trader.nickname)
+            continue
+        if trade is not None:
+            new_trades.append(trade)
+            ingestion_health.record_trade_inserted()
+    return new_trades
+
+
 async def fetch_recent_trades(
     db: Session,
     trader: Trader,
@@ -319,6 +429,60 @@ async def refresh_market(
     data = await primary.get_market_data(market.slug)
     upsert_market_from_dict(db, {**data, "slug": market.slug})
 
+    snap = MarketSnapshot(
+        market_id=market.id,
+        yes_price=data.get("yes_price"),
+        no_price=data.get("no_price"),
+        liquidity_usd=data.get("liquidity_usd"),
+        volume_24h_usd=data.get("volume_24h_usd"),
+        captured_at=datetime.utcnow(),
+    )
+    db.add(snap)
+    db.flush()
+    return snap
+
+
+async def gather_market_data(
+    markets: list[Market],
+    providers: dict[str, BaseProvider],
+    *,
+    per_call_timeout: float = 8.0,
+    concurrency: int = 8,
+    on_market_done: Any = None,
+) -> dict[int, dict[str, Any]]:
+    """Concurrently fetch ``get_market_data`` for each market. **Network only**
+    — the caller persists serially. Mirrors :func:`gather_trader_payloads` so
+    the market-refresh phase can't become the new sequential bottleneck once
+    wallet enrichment is parallelised. Returns ``{market_id: data}``.
+    """
+    import asyncio
+
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def _one(market: Market) -> tuple[int, dict[str, Any] | None]:
+        async with sem:
+            data = await _call_with_timeout(
+                providers["primary"].get_market_data(market.slug),
+                timeout=per_call_timeout, label=f"primary.market({market.slug})",
+            )
+        if on_market_done is not None:
+            try:
+                on_market_done(market)
+            except Exception:  # noqa: BLE001
+                logger.debug("on_market_done callback failed", exc_info=True)
+        return market.id, data
+
+    results = await asyncio.gather(*[_one(m) for m in markets])
+    return {mid: data for mid, data in results if isinstance(data, dict)}
+
+
+def persist_market_data(
+    db: Session,
+    market: Market,
+    data: dict[str, Any],
+) -> MarketSnapshot:
+    """Serial DB write for one market's freshly-fetched data + snapshot."""
+    upsert_market_from_dict(db, {**data, "slug": market.slug})
     snap = MarketSnapshot(
         market_id=market.id,
         yes_price=data.get("yes_price"),

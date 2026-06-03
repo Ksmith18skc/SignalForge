@@ -124,10 +124,8 @@ def score_signal(
 ) -> ScoreBreakdown:
     """Compute the weighted score. Returns a breakdown and total on 0-100.
 
-    When ``db`` is provided, per-factor weights are looked up via
-    ``falcon_retraining.adaptive_weight_for`` and applied multiplicatively
-    against the static prior. Below the per-scope sample threshold the
-    static prior is used unchanged.
+    ``db``/``sport``/``market_type`` are accepted for call-site compatibility
+    but no longer alter the weights — static priors are always used.
 
     ``conviction_penalty`` (0..0.5) is subtracted from the final score after
     weighting — used by the contrarian-conflict regime to mark crowded /
@@ -151,15 +149,9 @@ def score_signal(
         "entry_timing": w.entry_timing,
         "price_inefficiency": w.price_inefficiency,
     }
-    if db is not None:
-        from app.services.falcon_retraining import adaptive_weight_for
-
-        effective_weights = {
-            name: adaptive_weight_for(db, name, sport=sport, market_type=market_type)
-            for name in static_weights
-        }
-    else:
-        effective_weights = static_weights
+    # Static priors only — the adaptive per-scope weight learning layer was
+    # removed when the project refocused on wallet consensus.
+    effective_weights = static_weights
 
     total = sum(components[name] * effective_weights[name] for name in components) * 100.0
     if conviction_penalty:

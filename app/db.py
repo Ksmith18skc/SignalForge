@@ -113,7 +113,6 @@ def init_db() -> None:
     """Create all tables. Safe to call repeatedly."""
     # Import models so they register on Base.metadata before create_all.
     from app import models  # noqa: F401
-    from app import storage  # noqa: F401  — registers personal P&L tables.
 
     Base.metadata.create_all(bind=engine)
     if _is_sqlite:
@@ -121,27 +120,8 @@ def init_db() -> None:
         _add_sqlite_column_if_missing("signals", "outcome", "VARCHAR(64)")
         _add_sqlite_column_if_missing("signals", "generated_for_date", "VARCHAR(10)")
         _add_sqlite_column_if_missing("alerts", "generated_for_date", "VARCHAR(10)")
-        _add_sqlite_column_if_missing("mlb_edges", "opening_line", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "current_line", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "recommended_line", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "closing_line", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "closing_price", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "result", "VARCHAR(64)")
-        _add_sqlite_column_if_missing("mlb_edges", "win_loss_push", "VARCHAR(8)")
-        _add_sqlite_column_if_missing("mlb_edges", "implied_probability_at_entry", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "implied_probability_at_close", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "clv_points", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "clv_percent", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "roi_units", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "graded_at", "DATETIME")
-        # Research-upgrade fields: nullable so legacy rows keep working.
-        _add_sqlite_column_if_missing("mlb_edges", "model_projected_total", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "closing_snapshot_at", "DATETIME")
-        _add_sqlite_column_if_missing("mlb_edges", "actual_total", "FLOAT")
-        _ensure_mlb_edge_validation_columns()
     if _is_postgres:
         _ensure_signal_date_columns()
-        _ensure_mlb_edge_validation_columns()
         _ensure_postgres_trades_external_id_is_text()
 
 
@@ -159,63 +139,6 @@ def _add_sqlite_column_if_missing(table: str, column: str, ddl: str) -> None:
             logger.info("Column %s.%s already exists; skipping migration", table, column)
             return
         raise
-
-
-def _ensure_mlb_edge_validation_columns() -> None:
-    """Backfill MLB validation columns on existing deployments.
-
-    SQLAlchemy's create_all creates missing tables only; it does not alter an
-    existing mlb_edges table. Render Postgres deployments created before the
-    validation fields need these ALTER TABLE statements at startup.
-    """
-    inspector = inspect(engine)
-    if "mlb_edges" not in inspector.get_table_names():
-        return
-    dialect = engine.dialect.name
-    if dialect == "sqlite":
-        _add_sqlite_column_if_missing("mlb_edges", "normalized_market_name", "TEXT")
-        _add_sqlite_column_if_missing("mlb_edges", "market_scope", "VARCHAR(64)")
-        _add_sqlite_column_if_missing("mlb_edges", "is_valid", "BOOLEAN DEFAULT 1")
-        _add_sqlite_column_if_missing("mlb_edges", "validation_reason", "TEXT")
-        _add_sqlite_column_if_missing("mlb_edges", "wallet_context", "JSON")
-        _add_sqlite_column_if_missing("mlb_edges", "score_contributions", "JSON")
-        _add_sqlite_column_if_missing("mlb_edges", "model_projected_total", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "closing_snapshot_at", "DATETIME")
-        _add_sqlite_column_if_missing("mlb_edges", "actual_total", "FLOAT")
-        # Dual-score refactor columns.
-        _add_sqlite_column_if_missing("mlb_edges", "prediction_score", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "execution_score", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "legacy_score", "FLOAT")
-        _add_sqlite_column_if_missing("mlb_edges", "prediction_breakdown", "JSON")
-        _add_sqlite_column_if_missing("mlb_edges", "execution_breakdown", "JSON")
-        _add_sqlite_column_if_missing("mlb_edges", "cheap_price_trap", "BOOLEAN")
-        return
-    if dialect.startswith("postgres"):
-        statements = [
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS normalized_market_name TEXT",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS market_scope VARCHAR(64)",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS is_valid BOOLEAN DEFAULT TRUE",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS validation_reason TEXT",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS wallet_context JSONB",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS score_contributions JSONB",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS model_projected_total DOUBLE PRECISION",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS closing_snapshot_at TIMESTAMP",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS actual_total DOUBLE PRECISION",
-            # Dual-score refactor columns.
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS prediction_score DOUBLE PRECISION",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS execution_score DOUBLE PRECISION",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS legacy_score DOUBLE PRECISION",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS prediction_breakdown JSONB",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS execution_breakdown JSONB",
-            "ALTER TABLE mlb_edges ADD COLUMN IF NOT EXISTS cheap_price_trap BOOLEAN",
-        ]
-        try:
-            with engine.begin() as conn:
-                for statement in statements:
-                    conn.execute(text(statement))
-        except SQLAlchemyError as exc:
-            logger.exception("mlb_edges validation-column migration failed: %s", exc)
-            raise
 
 
 def _ensure_signal_date_columns() -> None:
