@@ -176,6 +176,36 @@ def _market_url(pos: dict) -> str | None:
         return None
 
 
+def _aggregate_wallets(members: list[dict]) -> list[dict]:
+    """Collapse per-fill rows into one row per wallet.
+
+    A wallet usually fills a single position across many small trades; without
+    this the roster repeats the same wallet dozens of times. We sum size and
+    compute a size-weighted average entry so each wallet shows one true line.
+    """
+    by_wallet: dict[str, dict] = {}
+    for m in members:
+        name = (
+            m.get("wallet_nickname")
+            or m.get("trader_nickname")
+            or short_addr(m.get("wallet_address") or m.get("wallet"))
+        )
+        key = (m.get("wallet_address") or m.get("wallet") or name or "").strip().lower()
+        size = float(m.get("size_usd") or 0.0)
+        price = m.get("entry_price")
+        agg = by_wallet.setdefault(key, {"name": name, "size": 0.0, "notional": 0.0, "fills": 0})
+        agg["size"] += size
+        agg["fills"] += 1
+        if price is not None:
+            agg["notional"] += float(price) * size
+    rows = []
+    for agg in by_wallet.values():
+        avg_entry = (agg["notional"] / agg["size"]) if agg["size"] > 0 and agg["notional"] else None
+        rows.append({**agg, "avg_entry": avg_entry})
+    rows.sort(key=lambda r: r["size"], reverse=True)
+    return rows
+
+
 with tab_consensus:
     if not consensus:
         st.info(
@@ -190,38 +220,34 @@ with tab_consensus:
         total = format_money_short(g.get("consensus_total_size", 0.0))
         url = _market_url(g)
         link = f"<a class='sf-link' href='{url}' target='_blank'>open market ↗</a>" if url else ""
+        wallets = _aggregate_wallets(g.get("consensus_members", []))
 
-        wallets_html = ""
-        for m in sorted(
-            g.get("consensus_members", []),
-            key=lambda x: x.get("size_usd") or 0.0,
-            reverse=True,
-        ):
-            name = m.get("wallet_nickname") or m.get("trader_nickname") or short_addr(
-                m.get("wallet_address") or m.get("wallet")
+        with st.container(border=True):
+            st.markdown(
+                f"""
+                <div class='sf-card-head'>
+                  <div><span class='sf-mkt'>{title}</span> &nbsp;
+                       <span class='sf-side'>{side}</span></div>
+                  <div><span class='sf-count'>{n} wallets aligned</span></div>
+                </div>
+                <div class='sf-dim' style='margin:6px 0 2px'>Total aligned size: {total} &nbsp; {link}</div>
+                """,
+                unsafe_allow_html=True,
             )
-            size = format_money_short(m.get("size_usd"))
-            entry = m.get("entry_price")
-            entry_s = f" @ {float(entry):.2f}" if entry is not None else ""
-            wallets_html += (
-                f"<div class='sf-wallet'>• <span class='sf-wname'>{name}</span>"
-                f" — {size}{entry_s}</div>"
-            )
-
-        st.markdown(
-            f"""
-            <div class='sf-card'>
-              <div class='sf-card-head'>
-                <div><span class='sf-mkt'>{title}</span> &nbsp;
-                     <span class='sf-side'>{side}</span></div>
-                <div><span class='sf-count'>{n} wallets aligned</span></div>
-              </div>
-              <div class='sf-dim' style='margin:6px 0 8px'>Total aligned size: {total} &nbsp; {link}</div>
-              {wallets_html}
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+            with st.expander(f"Show {n} aligned wallets", expanded=n <= 4):
+                rows_html = ""
+                for w in wallets:
+                    size = format_money_short(w["size"])
+                    entry_s = f" @ {w['avg_entry']:.2f}" if w["avg_entry"] is not None else ""
+                    fills_s = (
+                        f" <span class='sf-dim'>({w['fills']} fills)</span>"
+                        if w["fills"] > 1 else ""
+                    )
+                    rows_html += (
+                        f"<div class='sf-wallet'>• <span class='sf-wname'>{w['name']}</span>"
+                        f" — {size}{entry_s}{fills_s}</div>"
+                    )
+                st.markdown(rows_html, unsafe_allow_html=True)
 
 
 # --------------------------------------------------------------------------- #
