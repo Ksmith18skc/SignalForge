@@ -14,13 +14,15 @@ Launch: `streamlit run dashboard.py`.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+import re
+from datetime import date, datetime, timezone
 
 import httpx
 import pandas as pd
 import streamlit as st
 
 from app.services import wallet_market_resolver as wmr
+from app.services.card_date import arizona_today
 from app.utils.dashboard_format import (
     compact_time_ago,
     format_money_short,
@@ -141,20 +143,91 @@ st.divider()
 
 
 # --------------------------------------------------------------------------- #
-# Data
+# Filters (sidebar) + Data
 # --------------------------------------------------------------------------- #
 
-positions = safe_get("/tracked-wallet-positions", default=[]) or []
-consensus = wallet_consensus_groups(positions, min_wallets=2)
+
+def _opts(rows: list[dict], key: str) -> list[str]:
+    return sorted({str(r.get(key)) for r in rows if r.get(key)})
+
+
+try:
+    _today = date.fromisoformat(arizona_today())
+except Exception:  # noqa: BLE001
+    _today = datetime.now(timezone.utc).date()
+
+st.sidebar.header("Filters")
+
+# A search tag like 'mlb-det-tb-2026-06-02' carries its own date — honor it so
+# searching another slate "just works" without first changing the date picker.
+search = st.sidebar.text_input(
+    "Search event / wallet",
+    placeholder="e.g. mlb-det-tb-2026-06-02 or HomeRunHazard",
+    help="Substring match on market slug, title, normalized key, or wallet name.",
+    key="f_search",
+).strip()
+_date_in_search = re.search(r"\d{4}-\d{2}-\d{2}", search)
+search_date = _date_in_search.group(0) if _date_in_search else None
+
+picked_date = st.sidebar.date_input("Card date", value=_today, key="f_date")
+effective_date = search_date or picked_date.isoformat()
+if search_date and search_date != picked_date.isoformat():
+    st.sidebar.caption(f"📌 Using date **{search_date}** from your search tag.")
+
+positions = safe_get("/tracked-wallet-positions", params={"date": effective_date}, default=[]) or []
+
+sport_sel = st.sidebar.multiselect("Sport", _opts(positions, "sport"), key="f_sport")
+type_sel = st.sidebar.multiselect(
+    "Market type",
+    _opts(positions, "market_subtype") or _opts(positions, "market_category"),
+    key="f_type",
+)
+platform_sel = st.sidebar.multiselect("Platform", _opts(positions, "market_platform"), key="f_platform")
+min_wallets = st.sidebar.slider("Min wallets aligned", 2, 8, 2, key="f_minw")
+min_size = st.sidebar.number_input("Min total aligned size ($)", min_value=0, value=0, step=500, key="f_minsize")
+
+
+def _passes(pos: dict) -> bool:
+    if sport_sel and str(pos.get("sport")) not in sport_sel:
+        return False
+    mtype = pos.get("market_subtype") or pos.get("market_category")
+    if type_sel and str(mtype) not in type_sel:
+        return False
+    if platform_sel and str(pos.get("market_platform")) not in platform_sel:
+        return False
+    if search:
+        hay = " ".join(
+            str(pos.get(k) or "")
+            for k in (
+                "market_slug", "market_title", "normalized_market_key",
+                "matchup_date_key", "sport_date_key", "wallet_nickname",
+            )
+        ).lower()
+        if search.lower() not in hay:
+            return False
+    return True
+
+
+filtered = [p for p in positions if _passes(p)]
+consensus = wallet_consensus_groups(filtered, min_wallets=min_wallets)
+if min_size:
+    consensus = [g for g in consensus if (g.get("consensus_total_size") or 0.0) >= min_size]
+
+active_filters = bool(sport_sel or type_sel or platform_sel or search or min_size or min_wallets != 2)
+if st.sidebar.button("Reset filters", use_container_width=True):
+    for _k in ("f_search", "f_date", "f_sport", "f_type", "f_platform", "f_minw", "f_minsize"):
+        st.session_state.pop(_k, None)
+    st.rerun()
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Tracked positions today", len(positions))
+m1.metric("Tracked positions", len(filtered), delta=f"of {len(positions)}" if active_filters else None)
 m2.metric("Aligned consensus markets", len(consensus))
 m3.metric("Wallets in consensus", sum(g.get("consensus_wallets", 0) for g in consensus))
 m4.metric(
     "Consensus size",
     format_money_short(sum(g.get("consensus_total_size", 0.0) for g in consensus)),
 )
+st.caption(f"Showing card date **{effective_date}**" + ("  ·  filters active" if active_filters else ""))
 
 tab_consensus, tab_positions, tab_watchlist, tab_alerts, tab_diag = st.tabs(
     ["🤝 Aligned Consensus", "📋 All Positions", "👛 Watchlist", "🔔 Alerts", "🔎 Diagnostics"]
@@ -255,10 +328,13 @@ with tab_consensus:
 # --------------------------------------------------------------------------- #
 
 with tab_positions:
-    if not positions:
-        st.info("No tracked-wallet positions for today's card yet. Try **Run scan now**.")
+    if not filtered:
+        st.info(
+            "No tracked-wallet positions match the current filters / date. "
+            "Adjust the sidebar or try **Run scan now**."
+        )
     else:
-        df = pd.DataFrame(positions)
+        df = pd.DataFrame(filtered)
         cols = [
             "wallet_nickname", "market_title", "side", "outcome",
             "entry_price", "size_usd", "current_yes_price", "current_no_price",
